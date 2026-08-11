@@ -1,0 +1,3 @@
+[submodule "Aegisub"]
+	path = Aegisub
+	url = https://github.com/TypesettingTools/Aegisub.git

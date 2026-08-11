@@ -1,6 +1,3 @@
-# vendored Aegisub reference source (nested git clone) — excluded from lint/format/typecheck
-# 前导 / 锚定到仓库根目录：不加 / 会匹配任意层级的同名目录（曾误伤 public/icons/aegisub/）
-/Aegisub/
 # native WASM core build artifacts
 native/build/
 native/third_party/
