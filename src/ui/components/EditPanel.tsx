@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import type { SubtitleCue, SubtitleStyle } from '../../core/types';
 import { formatEditorTime, parseEditorTime } from '../../core/time';
 import { ASS_SYNTAX_COLORS, tokenizeAss } from '../assHighlight';
+import { aegisubIconUrl } from '../aegisubIcons';
 
-const EDIT_ICON = (name: string) => `/icons/aegisub/${name}_16.png`;
+const EDIT_ICON = (name: string) => aegisubIconUrl(name, 16);
 
 function longestVisibleLine(text: string) {
   const visibleText = text.replace(/\{[^}]*\}/g, '');

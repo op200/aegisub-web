@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { SubtitleCue } from '../../core/types';
 import type { MediaSource } from '../../platform/types';
 import type { AudioOptions } from '../commandRegistry';
-import { commandIcon } from '../aegisubIcons';
+import { aegisubIconUrl, commandIcon } from '../aegisubIcons';
 import { AEGISUB_TOOLBARS } from '../aegisubToolbar';
 import { COMMANDS } from '../commands';
 import { Waveform } from './Waveform';
@@ -385,7 +385,7 @@ export function AudioPane(props: AudioPaneProps) {
               aria-label="Link vertical zoom"
               aria-pressed={linked}
             >
-              <img src="/icons/aegisub/toggle_audio_link_16.png" alt="" width={16} height={16} draggable={false} />
+              <img src={aegisubIconUrl('toggle_audio_link', 16)} alt="" width={16} height={16} draggable={false} />
             </button>
           </div>
         </div>

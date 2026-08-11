@@ -169,7 +169,7 @@ async function loadWasmRuntime(): Promise<CoreRuntime | null> {
     };
     const createCore = mod.default ?? mod.createAegisubCore;
     if (!createCore) return null;
-    const module = await createCore({ locateFile: (path: string) => `/wasm/${path}` });
+    const module = await createCore({ locateFile: (path: string) => `${baseUrl}wasm/${path}` });
     if (module._aegisub_core_abi_version() < 1) return null;
     return new WasmCoreRuntime(module);
   } catch (error) {

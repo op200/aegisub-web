@@ -3,6 +3,7 @@ import { X } from 'lucide-react';
 import type { CoreCommand, SubtitleCue, SubtitleStyle } from '../../core/types';
 import type { DummyVideoOptions, MediaSource } from '../../platform/types';
 import { formatEditorTime } from '../../core/time';
+import { aegisubIconUrl } from '../aegisubIcons';
 
 interface DialogProps {
   title: string;
@@ -527,7 +528,7 @@ export function AboutDialog({ onClose }: { onClose: () => void }) {
   return (
     <Dialog title="About Aegisub Web" onClose={onClose}>
       <div className="about-content">
-        <img src="/icons/aegisub/app_icon.png" alt="Aegisub" width={64} height={64} />
+        <img src={aegisubIconUrl('app_icon')} alt="Aegisub" width={64} height={64} />
         <h2>Aegisub Web</h2>
         <p>A browser port of Aegisub running on WebAssembly.</p>
         <dl className="about-details">

@@ -127,8 +127,17 @@ export const COMMAND_ICONS: Record<string, string> = {
   'help/irc': 'irc_button',
 };
 
+/**
+ * 按 Vite base（兼容 GitHub Pages 子路径部署）拼出图标 URL。
+ * size 省略时返回不带尺寸后缀的文件（如 app_icon.png）。
+ */
+export function aegisubIconUrl(basename: string, size?: 16 | 24): string {
+  const base = import.meta.env.BASE_URL ?? '/';
+  return size ? `${base}icons/aegisub/${basename}_${size}.png` : `${base}icons/aegisub/${basename}.png`;
+}
+
 /** 返回指定命令在给定尺寸下的图标 URL（无图标时返回 undefined） */
 export function commandIcon(command: string, size: 16 | 24 = 16): string | undefined {
   const basename = COMMAND_ICONS[command];
-  return basename ? `/icons/aegisub/${basename}_${size}.png` : undefined;
+  return basename ? aegisubIconUrl(basename, size) : undefined;
 }

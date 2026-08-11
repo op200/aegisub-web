@@ -1,5 +1,6 @@
 import { Video } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import { aegisubIconUrl } from '../aegisubIcons';
 import type { MediaSource } from '../../platform/types';
 import type { SubtitleCue, SubtitleDocument, SubtitleStyle } from '../../core/types';
 import { formatVideoTime } from '../../core/time';
@@ -28,7 +29,7 @@ interface PreviewPaneProps {
   style?: CSSProperties;
 }
 
-const VICON = (name: string) => `/icons/aegisub/${name}_16.png`;
+const VICON = (name: string) => aegisubIconUrl(name, 16);
 
 /** 对 hex 颜色做明暗调整（棋盘格用） */
 function shadeColor(hex: string, percent: number): string {
