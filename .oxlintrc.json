@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "react-hooks", "typescript"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "rules": {
+    "react/react-in-jsx-scope": "off",
+    "react/no-array-index-key": "off"
+  },
+  "ignorePatterns": ["Aegisub/**", "dist/**", "test-results/**", "platforms/**/bin/**", "platforms/**/obj/**", "native/**", "public/wasm/**", "public/icons/**"]
+}

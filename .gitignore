@@ -1,0 +1,21 @@
+# vendored Aegisub reference source (nested git clone) — excluded from lint/format/typecheck
+Aegisub/
+# native WASM core build artifacts
+native/build/
+native/third_party/
+public/wasm/
+node_modules/
+dist/
+.npm-cache/
+test-results/
+playwright-report/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+playwright.config.js
+playwright.config.d.ts
+platforms/android/.gradle/
+platforms/android/build/
+platforms/android/app/build/
+platforms/windows/**/bin/
+platforms/windows/**/obj/
