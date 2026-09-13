@@ -20,6 +20,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # po 本地化（i18n.ts 的 LINGUAS?raw 与 vite poLocalesPlugin）直接引用
+      # 源码目录 Aegisub/po（仓库内零副本），CI 需一并克隆上游源码
+      - name: Checkout Aegisub source (po reference)
+        uses: actions/checkout@v7
+        with:
+          repository: TypesettingTools/Aegisub
+          ref: master
+          path: Aegisub
+
       - name: Install pnpm
         uses: pnpm/action-setup@v6
         with:
