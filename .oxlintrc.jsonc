@@ -1,0 +1,34 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn",
+  },
+  "rules": {
+    "react/react-in-jsx-scope": "off",
+    "react/no-array-index-key": "off",
+    "no-unused-vars": "warn",
+  },
+  "overrides": [
+    {
+      // 音视频解码管线本质为顺序消费：chunk 必须按序读取、背压靠 sleep 等待，
+      // Promise.all 并行化语义错误，故关闭 no-await-in-loop
+      "files": ["src/media/**"],
+      "rules": {
+        "no-await-in-loop": "off",
+      },
+    },
+  ],
+  "ignorePatterns": [
+    "Aegisub/**",
+    "dist/**",
+    "test-results/**",
+    "platforms/**/bin/**",
+    "platforms/**/obj/**",
+    "native/**",
+    "public/wasm/**",
+    "public/icons/**",
+  ],
+}

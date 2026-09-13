@@ -1,46 +1,62 @@
-import { Bold, Italic, Plus, Trash2, Underline } from 'lucide-react';
-import { useEffect, useState } from 'react';
-import type { SubtitleStyle } from '../../core/types';
-import { assColorToHex, hexToAssColor } from '../color';
+import { Bold, Italic, Plus, Trash2, Underline } from 'lucide-react'
+import { useState } from 'react'
+
+import type { SubtitleStyle } from '../../core/types'
+import { assColorToHex, hexToAssColor } from '../color'
+import { tPlain } from '../i18n'
 
 interface StyleInspectorProps {
-  styles: SubtitleStyle[];
-  activeStyleName: string;
-  onUpdate: (id: string, patch: Partial<Omit<SubtitleStyle, 'id'>>) => void;
-  onAdd: () => void;
-  onDelete: (id: string) => void;
+  styles: SubtitleStyle[]
+  activeStyleName: string
+  onUpdate: (id: string, patch: Partial<Omit<SubtitleStyle, 'id'>>) => void
+  onAdd: () => void
+  onDelete: (id: string) => void
 }
 
-export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDelete }: StyleInspectorProps) {
-  const initial = styles.find((style) => style.name === activeStyleName) ?? styles[0];
-  const [selectedId, setSelectedId] = useState(initial?.id ?? '');
-  const selected = styles.find((style) => style.id === selectedId) ?? initial;
-  useEffect(() => {
-    if (initial) setSelectedId(initial.id);
-  }, [initial]);
-  if (!selected) return null;
+export function StyleInspector({
+  styles,
+  activeStyleName,
+  onUpdate,
+  onAdd,
+  onDelete,
+}: StyleInspectorProps) {
+  const initial = styles.find((style) => style.name === activeStyleName) ?? styles[0]
+  const [selectedId, setSelectedId] = useState(initial?.id ?? '')
+  // activeStyleName 变化时跟随（React 官方"props 变化调整 state"模式：渲染期更新）
+  const [prevInitialId, setPrevInitialId] = useState(initial?.id ?? null)
+  if ((initial?.id ?? null) !== prevInitialId) {
+    setPrevInitialId(initial?.id ?? null)
+    if (initial) setSelectedId(initial.id)
+  }
+  const selected = styles.find((style) => style.id === selectedId) ?? initial
+  if (!selected) return null
 
   return (
-    <aside className="style-inspector" aria-label="Style inspector">
+    <aside className="style-inspector" aria-label={tPlain('Style inspector')}>
       <div className="inspector-heading">
-        <h2>Style</h2>
+        <h2>{tPlain('Style')}</h2>
         <div>
-          <button className="icon-button" onClick={onAdd} title="Add style" aria-label="Add style">
+          <button
+            className="icon-button"
+            onClick={onAdd}
+            title={tPlain('Add style')}
+            aria-label={tPlain('Add style')}
+          >
             <Plus size={16} />
           </button>
           <button
             className="icon-button"
             onClick={() => onDelete(selected.id)}
             disabled={styles.length <= 1}
-            title="Delete style"
-            aria-label="Delete style"
+            title={tPlain('Delete style')}
+            aria-label={tPlain('Delete style')}
           >
             <Trash2 size={16} />
           </button>
         </div>
       </div>
       <label>
-        Preset
+        {tPlain('Preset')}
         <select value={selected.id} onChange={(event) => setSelectedId(event.target.value)}>
           {styles.map((style) => (
             <option value={style.id} key={style.id}>
@@ -51,18 +67,21 @@ export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDel
       </label>
       <div className="inspector-grid">
         <label>
-          Name
-          <input value={selected.name} onChange={(event) => onUpdate(selected.id, { name: event.target.value })} />
+          {tPlain('Name')}
+          <input
+            value={selected.name}
+            onChange={(event) => onUpdate(selected.id, { name: event.target.value })}
+          />
         </label>
         <label>
-          Font
+          {tPlain('Font')}
           <input
             value={selected.fontName}
             onChange={(event) => onUpdate(selected.id, { fontName: event.target.value })}
           />
         </label>
         <label>
-          Size
+          {tPlain('Size')}
           <input
             type="number"
             min="6"
@@ -72,7 +91,7 @@ export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDel
           />
         </label>
         <label>
-          Alignment
+          {tPlain('Alignment')}
           <select
             value={selected.alignment}
             onChange={(event) => onUpdate(selected.id, { alignment: Number(event.target.value) })}
@@ -83,7 +102,7 @@ export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDel
           </select>
         </label>
         <label>
-          Outline
+          {tPlain('Outline')}
           <input
             type="number"
             min="0"
@@ -94,7 +113,7 @@ export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDel
           />
         </label>
         <label>
-          Shadow
+          {tPlain('Shadow')}
           <input
             type="number"
             min="0"
@@ -105,12 +124,12 @@ export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDel
           />
         </label>
       </div>
-      <div className="text-toggles" role="group" aria-label="Text style">
+      <div className="text-toggles" role="group" aria-label={tPlain('Text style')}>
         <button
           className={selected.bold ? 'pressed' : ''}
           onClick={() => onUpdate(selected.id, { bold: !selected.bold })}
-          title="Bold"
-          aria-label="Bold"
+          title={tPlain('Bold')}
+          aria-label={tPlain('Bold')}
           aria-pressed={selected.bold}
         >
           <Bold size={16} />
@@ -118,8 +137,8 @@ export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDel
         <button
           className={selected.italic ? 'pressed' : ''}
           onClick={() => onUpdate(selected.id, { italic: !selected.italic })}
-          title="Italic"
-          aria-label="Italic"
+          title={tPlain('Italic')}
+          aria-label={tPlain('Italic')}
           aria-pressed={selected.italic}
         >
           <Italic size={16} />
@@ -127,8 +146,8 @@ export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDel
         <button
           className={selected.underline ? 'pressed' : ''}
           onClick={() => onUpdate(selected.id, { underline: !selected.underline })}
-          title="Underline"
-          aria-label="Underline"
+          title={tPlain('Underline')}
+          aria-label={tPlain('Underline')}
           aria-pressed={selected.underline}
         >
           <Underline size={16} />
@@ -136,39 +155,54 @@ export function StyleInspector({ styles, activeStyleName, onUpdate, onAdd, onDel
       </div>
       <div className="color-controls">
         <label>
-          <span className="color-swatch" style={{ background: assColorToHex(selected.primaryColor) }} />
-          Primary
+          <span
+            className="color-swatch"
+            style={{ background: assColorToHex(selected.primaryColor) }}
+          />
+          {tPlain('Primary')}
           <input
             type="color"
             value={assColorToHex(selected.primaryColor)}
             onChange={(event) =>
-              onUpdate(selected.id, { primaryColor: hexToAssColor(event.target.value, selected.primaryColor) })
+              onUpdate(selected.id, {
+                primaryColor: hexToAssColor(event.target.value, selected.primaryColor),
+              })
             }
           />
         </label>
         <label>
-          <span className="color-swatch" style={{ background: assColorToHex(selected.outlineColor) }} />
-          Outline
+          <span
+            className="color-swatch"
+            style={{ background: assColorToHex(selected.outlineColor) }}
+          />
+          {tPlain('Outline')}
           <input
             type="color"
             value={assColorToHex(selected.outlineColor)}
             onChange={(event) =>
-              onUpdate(selected.id, { outlineColor: hexToAssColor(event.target.value, selected.outlineColor) })
+              onUpdate(selected.id, {
+                outlineColor: hexToAssColor(event.target.value, selected.outlineColor),
+              })
             }
           />
         </label>
         <label>
-          <span className="color-swatch" style={{ background: assColorToHex(selected.backColor) }} />
-          Shadow
+          <span
+            className="color-swatch"
+            style={{ background: assColorToHex(selected.backColor) }}
+          />
+          {tPlain('Shadow')}
           <input
             type="color"
             value={assColorToHex(selected.backColor)}
             onChange={(event) =>
-              onUpdate(selected.id, { backColor: hexToAssColor(event.target.value, selected.backColor) })
+              onUpdate(selected.id, {
+                backColor: hexToAssColor(event.target.value, selected.backColor),
+              })
             }
           />
         </label>
       </div>
     </aside>
-  );
+  )
 }

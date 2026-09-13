@@ -1,7 +1,0 @@
-Aegisub
-dist
-node_modules
-test-results
-platforms/android/.gradle
-platforms/windows/AegisubWebView/bin
-platforms/windows/AegisubWebView/obj

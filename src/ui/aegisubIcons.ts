@@ -83,6 +83,15 @@ export const COMMAND_ICONS: Record<string, string> = {
   'video/tool/scale': 'visual_scale',
   'video/tool/clip': 'visual_clip',
   'video/tool/vector_clip': 'visual_vector_clip',
+  // 矢量裁剪子工具（vis_tool.cpp）
+  'video/tool/vclip/drag': 'visual_vector_clip_drag',
+  'video/tool/vclip/line': 'visual_vector_clip_line',
+  'video/tool/vclip/bicubic': 'visual_vector_clip_bicubic',
+  'video/tool/vclip/convert': 'visual_vector_clip_convert',
+  'video/tool/vclip/insert': 'visual_vector_clip_insert',
+  'video/tool/vclip/remove': 'visual_vector_clip_remove',
+  'video/tool/vclip/freehand': 'visual_vector_clip_freehand',
+  'video/tool/vclip/freehand_smooth': 'visual_vector_clip_freehand_smooth',
   'help/video': 'visual_help',
   // 音频
   'audio/open': 'open_audio_menu',
@@ -125,19 +134,21 @@ export const COMMAND_ICONS: Record<string, string> = {
   'help/website': 'website_button',
   'help/bugs': 'bugtracker_button',
   'help/irc': 'irc_button',
-};
+}
 
 /**
  * 按 Vite base（兼容 GitHub Pages 子路径部署）拼出图标 URL。
  * size 省略时返回不带尺寸后缀的文件（如 app_icon.png）。
  */
 export function aegisubIconUrl(basename: string, size?: 16 | 24): string {
-  const base = import.meta.env.BASE_URL ?? '/';
-  return size ? `${base}icons/aegisub/${basename}_${size}.png` : `${base}icons/aegisub/${basename}.png`;
+  const base = import.meta.env.BASE_URL ?? '/'
+  return size
+    ? `${base}icons/aegisub/${basename}_${size}.png`
+    : `${base}icons/aegisub/${basename}.png`
 }
 
 /** 返回指定命令在给定尺寸下的图标 URL（无图标时返回 undefined） */
 export function commandIcon(command: string, size: 16 | 24 = 16): string | undefined {
-  const basename = COMMAND_ICONS[command];
-  return basename ? aegisubIconUrl(basename, size) : undefined;
+  const basename = COMMAND_ICONS[command]
+  return basename ? aegisubIconUrl(basename, size) : undefined
 }

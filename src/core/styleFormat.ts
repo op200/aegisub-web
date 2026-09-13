@@ -1,5 +1,5 @@
-import type { SubtitleStyle } from './types';
-import { createDefaultStyle, makeId } from './defaults';
+import { createDefaultStyle, makeId } from './defaults'
+import type { SubtitleStyle } from './types'
 
 const STYLE_COLUMNS = [
   'Name',
@@ -25,21 +25,21 @@ const STYLE_COLUMNS = [
   'MarginR',
   'MarginV',
   'Encoding',
-];
+]
 
 function bool(value: string) {
-  return value === '-1' || value === '1' || value.toLowerCase() === 'true';
+  return value === '-1' || value === '1' || value.toLowerCase() === 'true'
 }
 
 export function parseStyleCatalog(text: string): SubtitleStyle[] {
-  const result: SubtitleStyle[] = [];
+  const result: SubtitleStyle[] = []
   for (const line of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
-    if (!line.trim() || !line.trimStart().startsWith('Style:')) continue;
+    if (!line.trim() || !line.trimStart().startsWith('Style:')) continue
     const values = line
       .slice(line.indexOf(':') + 1)
       .split(',')
-      .map((value) => value.trim());
-    const value = (key: string, fallback = '') => values[STYLE_COLUMNS.indexOf(key)] ?? fallback;
+      .map((value) => value.trim())
+    const value = (key: string, fallback = '') => values[STYLE_COLUMNS.indexOf(key)] ?? fallback
     result.push({
       ...createDefaultStyle(value('Name', 'Default')),
       id: makeId('style'),
@@ -67,9 +67,9 @@ export function parseStyleCatalog(text: string): SubtitleStyle[] {
       marginV: Number(value('MarginV')),
       encoding: Number(value('Encoding', '1')),
       values: Object.fromEntries(STYLE_COLUMNS.map((key, index) => [key, values[index] ?? ''])),
-    });
+    })
   }
-  return result;
+  return result
 }
 
 export function exportStyleCatalog(styles: SubtitleStyle[]): string {
@@ -99,8 +99,8 @@ export function exportStyleCatalog(styles: SubtitleStyle[]): string {
         style.marginR,
         style.marginV,
         style.encoding,
-      ];
-      return `Style: ${values.join(',')}`;
+      ]
+      return `Style: ${values.join(',')}`
     })
-    .join('\n')}\n`;
+    .join('\n')}\n`
 }

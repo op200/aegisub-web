@@ -1,6 +1,6 @@
-import { createCue, createDefaultStyle, createDocument, makeId } from './defaults';
-import { formatAssTime, formatSrtTime, parseAssTime, parseSrtTime } from './time';
-import type { SubtitleCue, SubtitleDocument, SubtitleFormat, SubtitleStyle } from './types';
+import { createCue, createDefaultStyle, createDocument, makeId } from './defaults'
+import { formatAssTime, formatSrtTime, parseAssTime, parseSrtTime } from './time'
+import type { SubtitleCue, SubtitleDocument, SubtitleFormat, SubtitleStyle } from './types'
 
 const STYLE_COLUMNS = [
   'Name',
@@ -26,29 +26,40 @@ const STYLE_COLUMNS = [
   'MarginR',
   'MarginV',
   'Encoding',
-];
-const EVENT_COLUMNS = ['Layer', 'Start', 'End', 'Style', 'Name', 'MarginL', 'MarginR', 'MarginV', 'Effect', 'Text'];
+]
+const EVENT_COLUMNS = [
+  'Layer',
+  'Start',
+  'End',
+  'Style',
+  'Name',
+  'MarginL',
+  'MarginR',
+  'MarginV',
+  'Effect',
+  'Text',
+]
 
 function splitFields(value: string, count: number): string[] {
-  const fields: string[] = [];
-  let start = 0;
+  const fields: string[] = []
+  let start = 0
   for (let index = 0; index < count - 1; index += 1) {
-    const comma = value.indexOf(',', start);
-    if (comma < 0) break;
-    fields.push(value.slice(start, comma).trim());
-    start = comma + 1;
+    const comma = value.indexOf(',', start)
+    if (comma < 0) break
+    fields.push(value.slice(start, comma).trim())
+    start = comma + 1
   }
-  fields.push(value.slice(start).trim());
-  while (fields.length < count) fields.push('');
-  return fields;
+  fields.push(value.slice(start).trim())
+  while (fields.length < count) fields.push('')
+  return fields
 }
 
 function mapFields(columns: string[], values: string[]): Record<string, string> {
-  return Object.fromEntries(columns.map((column, index) => [column, values[index] ?? '']));
+  return Object.fromEntries(columns.map((column, index) => [column, values[index] ?? '']))
 }
 
 function boolField(value: string): boolean {
-  return value === '-1' || value === '1' || value.toLowerCase() === 'true';
+  return value === '-1' || value === '1' || value.toLowerCase() === 'true'
 }
 
 function styleFromValues(values: Record<string, string>): SubtitleStyle {
@@ -78,7 +89,7 @@ function styleFromValues(values: Record<string, string>): SubtitleStyle {
     marginV: Number(values.MarginV) || 0,
     encoding: Number(values.Encoding) || 1,
     values,
-  };
+  }
 }
 
 function cueFromValues(values: Record<string, string>, comment: boolean): SubtitleCue {
@@ -96,97 +107,107 @@ function cueFromValues(values: Record<string, string>, comment: boolean): Subtit
     text: values.Text ?? '',
     comment,
     extra: values,
-  };
+  }
 }
 
 export function detectFormat(name: string, text: string): SubtitleFormat {
-  if (name.toLowerCase().endsWith('.srt') || /-->/.test(text.slice(0, 500))) return 'srt';
-  return 'ass';
+  if (name.toLowerCase().endsWith('.srt') || /-->/.test(text.slice(0, 500))) return 'srt'
+  return 'ass'
 }
 
 export function parseSubtitle(text: string, sourceName: string): SubtitleDocument {
-  return detectFormat(sourceName, text) === 'srt' ? parseSrt(text, sourceName) : parseAss(text, sourceName);
+  return detectFormat(sourceName, text) === 'srt'
+    ? parseSrt(text, sourceName)
+    : parseAss(text, sourceName)
 }
 
 export function parseAss(text: string, sourceName = 'untitled.ass'): SubtitleDocument {
-  const document = createDocument(sourceName);
-  document.cues = [];
-  document.styles = [];
-  document.scriptInfo = {};
-  document.passthroughSections = [];
+  const document = createDocument(sourceName)
+  document.cues = []
+  document.styles = []
+  document.scriptInfo = {}
+  document.passthroughSections = []
 
-  let section = '';
-  let styleColumns = STYLE_COLUMNS;
-  let eventColumns = EVENT_COLUMNS;
-  let passthrough: { name: string; lines: string[] } | null = null;
+  let section = ''
+  let styleColumns = STYLE_COLUMNS
+  let eventColumns = EVENT_COLUMNS
+  let passthrough: { name: string; lines: string[] } | null = null
 
   for (const rawLine of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
-    const sectionMatch = rawLine.match(/^\s*\[([^\]]+)]\s*$/);
+    const sectionMatch = rawLine.match(/^\s*\[([^\]]+)]\s*$/)
     if (sectionMatch) {
-      section = sectionMatch[1];
+      section = sectionMatch[1]
       passthrough = ['Script Info', 'V4+ Styles', 'V4 Styles', 'Events'].includes(section)
         ? null
-        : { name: section, lines: [] };
-      if (passthrough) document.passthroughSections.push(passthrough);
-      continue;
+        : { name: section, lines: [] }
+      if (passthrough) document.passthroughSections.push(passthrough)
+      continue
     }
     if (passthrough) {
-      passthrough.lines.push(rawLine);
-      continue;
+      passthrough.lines.push(rawLine)
+      continue
     }
-    if (!rawLine.trim() || rawLine.trimStart().startsWith(';')) continue;
-    const colon = rawLine.indexOf(':');
-    if (colon < 0) continue;
-    const key = rawLine.slice(0, colon).trim();
-    const value = rawLine.slice(colon + 1).trim();
+    if (!rawLine.trim() || rawLine.trimStart().startsWith(';')) continue
+    const colon = rawLine.indexOf(':')
+    if (colon < 0) continue
+    const key = rawLine.slice(0, colon).trim()
+    const value = rawLine.slice(colon + 1).trim()
     if (section === 'Script Info') {
-      document.scriptInfo[key] = value;
+      document.scriptInfo[key] = value
     } else if (section === 'V4+ Styles' || section === 'V4 Styles') {
-      if (key === 'Format') styleColumns = value.split(',').map((item) => item.trim());
+      if (key === 'Format') styleColumns = value.split(',').map((item) => item.trim())
       if (key === 'Style')
-        document.styles.push(styleFromValues(mapFields(styleColumns, splitFields(value, styleColumns.length))));
+        document.styles.push(
+          styleFromValues(mapFields(styleColumns, splitFields(value, styleColumns.length))),
+        )
     } else if (section === 'Events') {
-      if (key === 'Format') eventColumns = value.split(',').map((item) => item.trim());
+      if (key === 'Format') eventColumns = value.split(',').map((item) => item.trim())
       if (key === 'Dialogue' || key === 'Comment') {
         document.cues.push(
-          cueFromValues(mapFields(eventColumns, splitFields(value, eventColumns.length)), key === 'Comment'),
-        );
+          cueFromValues(
+            mapFields(eventColumns, splitFields(value, eventColumns.length)),
+            key === 'Comment',
+          ),
+        )
       }
     }
   }
-  if (!document.styles.length) document.styles.push(createDefaultStyle());
-  if (!document.cues.length) document.cues.push(createCue());
-  document.format = 'ass';
-  return document;
+  if (!document.styles.length) document.styles.push(createDefaultStyle())
+  if (!document.cues.length) document.cues.push(createCue())
+  document.format = 'ass'
+  return document
 }
 
 export function parseSrt(text: string, sourceName = 'untitled.srt'): SubtitleDocument {
-  const document = createDocument(sourceName);
-  document.format = 'srt';
-  document.cues = [];
+  const document = createDocument(sourceName)
+  document.format = 'srt'
+  document.cues = []
   const blocks = text
     .replace(/^\uFEFF/, '')
     .trim()
-    .split(/\r?\n\s*\r?\n/);
+    .split(/\r?\n\s*\r?\n/)
   for (const block of blocks) {
-    const lines = block.split(/\r?\n/);
-    const timeIndex = lines.findIndex((line) => line.includes('-->'));
-    if (timeIndex < 0) continue;
-    const [start, end] = lines[timeIndex].split('-->').map(parseSrtTime);
-    const cue = createCue(start, end);
-    cue.text = lines.slice(timeIndex + 1).join('\\N');
-    document.cues.push(cue);
+    const lines = block.split(/\r?\n/)
+    const timeIndex = lines.findIndex((line) => line.includes('-->'))
+    if (timeIndex < 0) continue
+    const [start, end] = lines[timeIndex].split('-->').map(parseSrtTime)
+    const cue = createCue(start, end)
+    cue.text = lines.slice(timeIndex + 1).join('\\N')
+    document.cues.push(cue)
   }
-  if (!document.cues.length) document.cues.push(createCue());
-  return document;
+  if (!document.cues.length) document.cues.push(createCue())
+  return document
 }
 
 function styleValues(style: SubtitleStyle): Record<string, string> {
+  // 数字字段兜底 ASS 默认值：上游（如旧版 WASM 核心投影）缺字段时不得产出 "undefined"，
+  // 否则 libass 解析为 0（如 ScaleX=0 → 字形不可见）
+  const num = (value: number | undefined, fallback: number) => String(value ?? fallback)
   return {
     ...style.values,
     Name: style.name,
     Fontname: style.fontName,
-    Fontsize: String(style.fontSize),
+    Fontsize: num(style.fontSize, 48),
     PrimaryColour: style.primaryColor,
     SecondaryColour: style.secondaryColor,
     OutlineColour: style.outlineColor,
@@ -195,19 +216,19 @@ function styleValues(style: SubtitleStyle): Record<string, string> {
     Italic: style.italic ? '-1' : '0',
     Underline: style.underline ? '-1' : '0',
     StrikeOut: style.strikeout ? '-1' : '0',
-    ScaleX: String(style.scaleX),
-    ScaleY: String(style.scaleY),
-    Spacing: String(style.spacing),
-    Angle: String(style.angle),
-    BorderStyle: String(style.borderStyle),
-    Outline: String(style.outline),
-    Shadow: String(style.shadow),
-    Alignment: String(style.alignment),
-    MarginL: String(style.marginL).padStart(4, '0'),
-    MarginR: String(style.marginR).padStart(4, '0'),
-    MarginV: String(style.marginV).padStart(4, '0'),
-    Encoding: String(style.encoding),
-  };
+    ScaleX: num(style.scaleX, 100),
+    ScaleY: num(style.scaleY, 100),
+    Spacing: num(style.spacing, 0),
+    Angle: num(style.angle, 0),
+    BorderStyle: num(style.borderStyle, 1),
+    Outline: num(style.outline, 2),
+    Shadow: num(style.shadow, 0),
+    Alignment: num(style.alignment, 2),
+    MarginL: num(style.marginL, 10).padStart(4, '0'),
+    MarginR: num(style.marginR, 10).padStart(4, '0'),
+    MarginV: num(style.marginV, 10).padStart(4, '0'),
+    Encoding: num(style.encoding, 1),
+  }
 }
 
 function cueValues(cue: SubtitleCue): Record<string, string> {
@@ -223,31 +244,32 @@ function cueValues(cue: SubtitleCue): Record<string, string> {
     MarginV: String(cue.marginV).padStart(4, '0'),
     Effect: cue.effect,
     Text: cue.text,
-  };
+  }
 }
 
 export function exportAss(document: SubtitleDocument): string {
-  const info = { ScriptType: 'v4.00+', ...document.scriptInfo };
+  const info = { ScriptType: 'v4.00+', ...document.scriptInfo }
   const lines = [
     '[Script Info]',
     ...Object.entries(info).map(([key, value]) => `${key}: ${value}`),
     '',
     '[V4+ Styles]',
     `Format: ${STYLE_COLUMNS.join(', ')}`,
-  ];
+  ]
   for (const style of document.styles) {
-    const values = styleValues(style);
-    lines.push(`Style: ${STYLE_COLUMNS.map((column) => values[column] ?? '').join(',')}`);
+    const values = styleValues(style)
+    lines.push(`Style: ${STYLE_COLUMNS.map((column) => values[column] ?? '').join(',')}`)
   }
-  lines.push('', '[Events]', `Format: ${EVENT_COLUMNS.join(', ')}`);
+  lines.push('', '[Events]', `Format: ${EVENT_COLUMNS.join(', ')}`)
   for (const cue of document.cues) {
-    const values = cueValues(cue);
+    const values = cueValues(cue)
     lines.push(
       `${cue.comment ? 'Comment' : 'Dialogue'}: ${EVENT_COLUMNS.map((column) => values[column] ?? '').join(',')}`,
-    );
+    )
   }
-  for (const section of document.passthroughSections) lines.push('', `[${section.name}]`, ...section.lines);
-  return `\uFEFF${lines.join('\r\n')}\r\n`;
+  for (const section of document.passthroughSections)
+    lines.push('', `[${section.name}]`, ...section.lines)
+  return `\uFEFF${lines.join('\r\n')}\r\n`
 }
 
 export function exportSrt(document: SubtitleDocument): string {
@@ -257,9 +279,9 @@ export function exportSrt(document: SubtitleDocument): string {
       (cue, index) =>
         `${index + 1}\r\n${formatSrtTime(cue.startMs)} --> ${formatSrtTime(cue.endMs)}\r\n${cue.text.replaceAll('\\N', '\r\n').replace(/\{[^}]*}/g, '')}`,
     )
-    .join('\r\n\r\n');
+    .join('\r\n\r\n')
 }
 
 export function exportSubtitle(document: SubtitleDocument, format = document.format): string {
-  return format === 'srt' ? exportSrt(document) : exportAss(document);
+  return format === 'srt' ? exportSrt(document) : exportAss(document)
 }

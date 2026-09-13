@@ -7,6 +7,9 @@
 //   - state_json 返回的结构 == TS 的 CoreState（document/canUndo/canRedo/undoLabel/redoLabel/runtime）
 //   - apply_json 接受的命令 == TS 的 CoreCommand[]
 //   - 撤销为整文件快照（与 Aegisub AssFile::Commit 的 push 语义一致，也便于 Worker 用）
+//
+// 隔离验证 C ABI：用 node 直接加载 wasm 产物（-sENVIRONMENT 含 node）调
+// _aegisub_document_state_json，可跳过 UI 层快速定位问题在前端还是核心。
 
 #include "../../wasm/aegisub_core_api.h"
 
@@ -49,6 +52,13 @@ struct AegisubDocument {
 	int revision = 0;
 	std::string format = "ass";
 	std::string source_name = "untitled.ass";
+	// --- 撤销栈语义对齐 subs_controller.cpp ---
+	// 栈结构：栈底为初始状态、栈顶为当前状态（源码 OnCommit 在提交后快照入栈）；
+	// Undo 要求栈内 >1 个条目（subs_controller.cpp:undo_stack.size() <= 1 直接返回）。
+	bool coalescable = false;      // 相邻提交合并资格（commit_id 邻接 + redo 空 + 保存后失效）
+	std::string amend_label;       // 上一次入栈提交的描述（subs_edit_box：desc 相同才允许 amend）
+	std::string amend_target;      // 单条 updateCue 的行 id（编辑框切行 OnActiveLineChanged 重置 commit_id）
+	int undo_depth = 50;           // Limits/Undo Levels（下限 2 在入栈时钳制）
 };
 
 std::string g_last_error;
@@ -122,7 +132,13 @@ void create_default_document(AssFile& file) {
 	file.Info.emplace_back("PlayResX", "1920");
 	file.Info.emplace_back("PlayResY", "1080");
 	file.Styles.push_back(*new AssStyle);
-	file.Events.push_back(*new AssDialogue);
+	// 默认行带演示文本（对齐 TS 侧 defaults.ts createDocument，上游 AssDialogue 默认为空）。
+	// Events 是 boost::intrusive::list（auto_unlink hook）：必须堆分配入链，
+	// 栈对象函数返回即析构，链表钩子悬空 → Events 遍历为 UB（表现为无行）。
+	// 调试特征：悬空后表现为"遍历为空"而非崩溃，别被"列表为什么空了"误导
+	auto* line = new AssDialogue;
+	line->Text = "Welcome to Aegisub Web";
+	file.Events.push_back(*line);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +326,8 @@ json::Object document_to_json(AegisubDocument const& doc) {
 
 	json::Object state;
 	state["document"] = std::move(document);
-	state["canUndo"] = !doc.undo_stack.empty();
+	// 栈底为初始状态：只有存在可撤销提交（>1 条目）时才可撤销
+	state["canUndo"] = doc.undo_stack.size() > 1;
 	state["canRedo"] = !doc.redo_stack.empty();
 	state["undoLabel"] = doc.undo_labels.empty() ? "" : doc.undo_labels.back();
 	state["redoLabel"] = doc.redo_labels.empty() ? "" : doc.redo_labels.back();
@@ -607,6 +624,45 @@ void apply_sort_cues_by(AegisubDocument& doc, json::UnknownElement const& cmd) {
 	});
 }
 
+// Automation 整表重放：以 Lua subtitles 表最终对白重建 Events（与 TS runtime 一致）
+void apply_replace_cues(AegisubDocument& doc, json::UnknownElement const& cmd) {
+	try {
+		json::Object const& cmd_obj = static_cast<json::Object const&>(cmd);
+		auto cues_it = cmd_obj.find("cues");
+		if (cues_it == cmd_obj.end()) return;
+		json::Array const& cues = static_cast<json::Array const&>(cues_it->second);
+		while (!doc.file->Events.empty())
+			doc.file->Events.erase_and_dispose(doc.file->Events.begin(), [](AssDialogue* e) { delete e; });
+		for (auto const& cue_el : cues) {
+			json::Object const& c = static_cast<json::Object const&>(cue_el);
+			auto sget = [&](char const* k) -> std::string {
+				auto it = c.find(k);
+				return it == c.end() ? std::string() : json_str(it->second);
+			};
+			auto iget = [&](char const* k) -> int {
+				auto it = c.find(k);
+				return it == c.end() ? 0 : json_int(it->second);
+			};
+			auto* entry = new AssDialogue;
+			entry->Layer = iget("layer");
+			entry->Start = agi::Time(iget("startMs"));
+			entry->End = agi::Time(iget("endMs"));
+			std::string style = sget("style");
+			if (!style.empty()) entry->Style = boost::flyweight<std::string>(style);
+			entry->Actor = boost::flyweight<std::string>(sget("actor"));
+			entry->Margin[0] = iget("marginL");
+			entry->Margin[1] = iget("marginR");
+			entry->Margin[2] = iget("marginV");
+			entry->Effect = boost::flyweight<std::string>(sget("effect"));
+			entry->Text = boost::flyweight<std::string>(sget("text"));
+			auto comment_it = c.find("comment");
+			entry->Comment = comment_it == c.end() ? false : json_bool(comment_it->second);
+			doc.file->Events.push_back(*entry);
+		}
+		if (doc.file->Events.empty()) doc.file->Events.push_back(*new AssDialogue);
+	} catch (...) {}
+}
+
 void apply_commands(AegisubDocument& doc, json::Array const& commands) {
 	for (auto const& cmd : commands) {
 		std::string type = obj_get(cmd, "type");
@@ -622,6 +678,7 @@ void apply_commands(AegisubDocument& doc, json::Array const& commands) {
 		else if (type == "updateScriptInfo") apply_update_script_info(doc, cmd);
 		else if (type == "sortCues") apply_sort_cues(doc);
 		else if (type == "sortCuesBy") apply_sort_cues_by(doc, cmd);
+		else if (type == "replaceCues") apply_replace_cues(doc, cmd);
 	}
 }
 
@@ -828,7 +885,7 @@ std::string export_srt(AegisubDocument const& doc) {
 
 extern "C" {
 
-uint32_t aegisub_core_abi_version(void) { return 1; }
+uint32_t aegisub_core_abi_version(void) { return 2; }
 
 aegisub_document_t aegisub_document_create(void) {
 	try {
@@ -871,6 +928,12 @@ int32_t aegisub_document_open(aegisub_document_t document, const uint8_t* data, 
 		doc->redo_stack.clear();
 		doc->undo_labels.clear();
 		doc->redo_labels.clear();
+		// 栈底压入初始状态（源码加载路径 Commit("", COMMIT_NEW) 建立首个撤销点）
+		doc->undo_stack.push_back(clone_file(*doc->file));
+		doc->undo_labels.push_back("");
+		doc->coalescable = false;
+		doc->amend_label.clear();
+		doc->amend_target.clear();
 		doc->revision = 0;
 		return 0;
 	} catch (std::exception const& e) {
@@ -911,13 +974,36 @@ int32_t aegisub_document_apply_json(aegisub_document_t document, const char* com
 		json::Array const& commands = static_cast<json::Array const&>(parsed);
 		if (commands.empty()) return 0;
 
-		doc->undo_stack.push_back(clone_file(*doc->file));
-		doc->undo_labels.push_back(label ? label : "");
-		doc->redo_stack.clear();
-		doc->redo_labels.clear();
+		std::string label_str = label ? label : "";
+		// 空描述提交：数据改变但不建立撤销点（subs_controller.cpp:OnCommit 空消息早退）
+		if (label_str.empty() && !doc->undo_stack.empty()) {
+			apply_commands(*doc, commands);
+			++doc->revision;
+			return 0;
+		}
+		// 相邻提交合并（subs_controller.cpp:OnCommit）：同描述 + 同目标行 + redo 空 + 保存后失效。
+		// 源码 single_line 原位更新/弹栈重推两种合并路径对外都表现为"一个撤销点"，此处统一弹栈重推。
+		std::string target = commands.size() == 1 ? obj_get(commands.front(), "id") : std::string();
+		bool coalesce = doc->coalescable && doc->redo_stack.empty() && !doc->undo_stack.empty() &&
+		                label_str == doc->amend_label && target == doc->amend_target;
+		if (coalesce) {
+			doc->undo_stack.pop_back();
+			if (!doc->undo_labels.empty()) doc->undo_labels.pop_back();
+		}
 
 		apply_commands(*doc, commands);
 		++doc->revision;
+		// 提交后快照入栈：栈顶始终是当前状态
+		doc->undo_stack.push_back(clone_file(*doc->file));
+		doc->undo_labels.push_back(label_str);
+		doc->amend_label = label_str;
+		doc->amend_target = target;
+		doc->coalescable = true;
+		int depth = std::max(doc->undo_depth, 2);
+		while (static_cast<int>(doc->undo_stack.size()) > depth) {
+			doc->undo_stack.erase(doc->undo_stack.begin());
+			doc->undo_labels.erase(doc->undo_labels.begin());
+		}
 		return 0;
 	} catch (std::exception const& e) {
 		set_error(e.what());
@@ -927,23 +1013,48 @@ int32_t aegisub_document_apply_json(aegisub_document_t document, const char* com
 
 int32_t aegisub_document_undo(aegisub_document_t document) {
 	auto* doc = reinterpret_cast<AegisubDocument*>(document);
-	if (!doc || doc->undo_stack.empty()) return -1;
-	doc->redo_stack.push_back(clone_file(*doc->file));
-	doc->redo_labels.push_back(doc->undo_labels.empty() ? "" : doc->undo_labels.back());
-	doc->file = std::move(doc->undo_stack.back());
+	// 栈底为初始状态，不可撤销过初始点（subs_controller.cpp:undo_stack.size() <= 1 返回）
+	if (!doc || doc->undo_stack.size() <= 1) return -1;
+	// 栈顶（当前状态）移入 redo 栈，然后应用新的栈顶（上一个状态）
+	doc->redo_stack.push_back(std::move(doc->undo_stack.back()));
 	doc->undo_stack.pop_back();
-	if (!doc->undo_labels.empty()) doc->undo_labels.pop_back();
+	doc->redo_labels.push_back(doc->undo_labels.back());
+	doc->undo_labels.pop_back();
+	doc->file = clone_file(*doc->undo_stack.back());
+	doc->coalescable = false;
 	return 0;
 }
 
 int32_t aegisub_document_redo(aegisub_document_t document) {
 	auto* doc = reinterpret_cast<AegisubDocument*>(document);
 	if (!doc || doc->redo_stack.empty()) return -1;
-	doc->undo_stack.push_back(clone_file(*doc->file));
-	doc->undo_labels.push_back(doc->redo_labels.empty() ? "" : doc->redo_labels.back());
-	doc->file = std::move(doc->redo_stack.back());
+	doc->undo_stack.push_back(std::move(doc->redo_stack.back()));
 	doc->redo_stack.pop_back();
-	if (!doc->redo_labels.empty()) doc->redo_labels.pop_back();
+	doc->undo_labels.push_back(doc->redo_labels.back());
+	doc->redo_labels.pop_back();
+	doc->file = clone_file(*doc->undo_stack.back());
+	doc->coalescable = false;
+	return 0;
+}
+
+int32_t aegisub_document_mark_saved(aegisub_document_t document) {
+	auto* doc = reinterpret_cast<AegisubDocument*>(document);
+	if (!doc) {
+		set_error("null document");
+		return -1;
+	}
+	// 保存后下一次提交不再与保存前合并（subs_controller.cpp:saved_commit_id+1 != commit_id）
+	doc->coalescable = false;
+	return 0;
+}
+
+int32_t aegisub_document_configure(aegisub_document_t document, int32_t undo_levels) {
+	auto* doc = reinterpret_cast<AegisubDocument*>(document);
+	if (!doc) {
+		set_error("null document");
+		return -1;
+	}
+	doc->undo_depth = undo_levels;
 	return 0;
 }
 
@@ -1025,7 +1136,22 @@ int32_t aegisub_document_replace_all(aegisub_document_t document, const char* se
 			set_line_field(cue, settings.field, value);
 			replaced += static_cast<int>(matches.size());
 		}
-		++doc->revision;
+		if (replaced > 0) {
+			// 替换成功才算一次提交（search_replace_engine.cpp:Commit(_("replace"))）
+			doc->undo_stack.push_back(clone_file(*doc->file));
+			doc->undo_labels.push_back("Replace all");
+			doc->amend_label = "Replace all";
+			doc->amend_target.clear();
+			doc->coalescable = true;
+			doc->redo_stack.clear();
+			doc->redo_labels.clear();
+			++doc->revision;
+			int depth = std::max(doc->undo_depth, 2);
+			while (static_cast<int>(doc->undo_stack.size()) > depth) {
+				doc->undo_stack.erase(doc->undo_stack.begin());
+				doc->undo_labels.erase(doc->undo_labels.begin());
+			}
+		}
 		return replaced;
 	} catch (std::exception const& e) {
 		set_error(e.what());

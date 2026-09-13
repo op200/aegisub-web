@@ -17,3 +17,5 @@ platforms/android/build/
 platforms/android/app/build/
 platforms/windows/**/bin/
 platforms/windows/**/obj/
+
+/.test_data/

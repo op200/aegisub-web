@@ -1,7 +1,7 @@
-import type { SubtitleCue, SubtitleDocument, SubtitleStyle } from './types';
+import type { SubtitleCue, SubtitleDocument, SubtitleStyle } from './types'
 
 export function makeId(prefix: string): string {
-  return `${prefix}-${crypto.randomUUID()}`;
+  return `${prefix}-${crypto.randomUUID()}`
 }
 
 export function createDefaultStyle(name = 'Default'): SubtitleStyle {
@@ -31,7 +31,7 @@ export function createDefaultStyle(name = 'Default'): SubtitleStyle {
     marginV: 24,
     encoding: 1,
     values: {},
-  };
+  }
 }
 
 export function createCue(startMs = 0, endMs = 5000): SubtitleCue {
@@ -49,20 +49,27 @@ export function createCue(startMs = 0, endMs = 5000): SubtitleCue {
     text: '',
     comment: false,
     extra: {},
-  };
+  }
 }
 
-export function createDocument(sourceName = 'untitled.ass'): SubtitleDocument {
-  const cue = createCue();
-  cue.text = 'Welcome to Aegisub Web';
+/**
+ * 新建文档（subtitle.cpp NewSubtitles）。
+ * 分辨率来自 Preferences 的 Subtitle/Default Resolution（Auto 时由 App 传入视频分辨率）。
+ */
+export function createDocument(
+  sourceName = 'untitled.ass',
+  resolution: { width: number; height: number } = { width: 1280, height: 720 },
+): SubtitleDocument {
+  const cue = createCue()
+  cue.text = 'Welcome to Aegisub Web'
   return {
     format: 'ass',
     sourceName,
     revision: 0,
     scriptInfo: {
       ScriptType: 'v4.00+',
-      PlayResX: '1920',
-      PlayResY: '1080',
+      PlayResX: String(Math.max(1, Math.round(resolution.width))),
+      PlayResY: String(Math.max(1, Math.round(resolution.height))),
       WrapStyle: '0',
       ScaledBorderAndShadow: 'yes',
       'YCbCr Matrix': 'TV.709',
@@ -70,5 +77,5 @@ export function createDocument(sourceName = 'untitled.ass'): SubtitleDocument {
     styles: [createDefaultStyle()],
     cues: [cue],
     passthroughSections: [],
-  };
+  }
 }

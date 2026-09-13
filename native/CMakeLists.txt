@@ -11,7 +11,9 @@
 # 构建：
 #   emcmake cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build
-#   产物：build/aegisub_core.js + build/aegisub_core.wasm
+#   注意：AI 沙箱内 emcc 会因写 C:\emsdk cache lock 被拦，需在沙箱外跑 ninja。
+#   产物：SINGLE_FILE=1 下 wasm 内嵌进单个 build/aegisub_core_wasm.js，
+#   需手动复制到 public/wasm/aegisub_core.js（worker 按 baseUrl+wasm/ 路径加载）。
 #
 # 说明：
 #   - 源文件直接引用工作区内的 Aegisub 克隆（../Aegisub），不复制源码。
@@ -34,7 +36,7 @@ if(DEFINED EMSCRIPTEN)
     -sEXPORT_ES6=1
     -sSINGLE_FILE=1
     -sALLOW_MEMORY_GROWTH=1
-    -sEXPORTED_FUNCTIONS=_aegisub_core_abi_version,_aegisub_document_create,_aegisub_document_destroy,_aegisub_document_open,_aegisub_document_state_json,_aegisub_document_apply_json,_aegisub_document_undo,_aegisub_document_redo,_aegisub_document_export,_aegisub_document_search,_aegisub_document_replace_all,_aegisub_core_free,_aegisub_core_last_error,_malloc,_free
+    -sEXPORTED_FUNCTIONS=_aegisub_core_abi_version,_aegisub_document_create,_aegisub_document_destroy,_aegisub_document_open,_aegisub_document_state_json,_aegisub_document_apply_json,_aegisub_document_undo,_aegisub_document_redo,_aegisub_document_export,_aegisub_document_search,_aegisub_document_replace_all,_aegisub_document_mark_saved,_aegisub_document_configure,_aegisub_core_free,_aegisub_core_last_error,_malloc,_free
     -sEXPORTED_RUNTIME_METHODS=allocateUTF8,UTF8ToString,lengthBytesUTF8,stringToUTF8,HEAPU8,HEAP32,HEAP8,getValue,writeArrayToMemory
     -sENVIRONMENT=web,worker,node
   )

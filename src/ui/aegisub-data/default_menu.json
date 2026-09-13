@@ -70,7 +70,10 @@
     {},
     { "submenu": "main/timing/make times continuous", "text": "Make Times Continuous" }
   ],
-  "main/timing/make times continuous": [{ "command": "time/continuous/start" }, { "command": "time/continuous/end" }],
+  "main/timing/make times continuous": [
+    { "command": "time/continuous/start" },
+    { "command": "time/continuous/end" }
+  ],
   "main/video": [
     { "command": "video/open" },
     { "command": "video/close" },

@@ -19,23 +19,32 @@
     "check": "pnpm fmt:check && pnpm lint && pnpm typecheck && pnpm test"
   },
   "dependencies": {
-    "lucide-react": "^1.30.0",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "fengari": "^0.1.5",
+    "jassub": "^2.5.16",
+    "lucide-react": "^1.45.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "web-demuxer": "^4.0.0"
   },
   "devDependencies": {
-    "@playwright/test": "1.62.1",
-    "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.4",
-    "@vitejs/plugin-react": "6.0.5",
-    "oxfmt": "0.62.0",
-    "oxlint": "1.77.0",
+    "@playwright/test": "1.63.0",
+    "@types/node": "^26.5.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "oxfmt": "0.67.0",
+    "oxlint": "1.82.0",
     "typescript": "7.0.2",
-    "vite": "8.2.1",
-    "vitest": "4.1.10"
+    "vite": "8.3.0",
+    "vitest": "5.0.0"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=26.8.1"
   },
-  "packageManager": "pnpm@11.20.0"
+  "packageManager": "pnpm@12.4.1",
+  "pnpm": {
+    "ignoredBuiltDependencies": [
+      "lfa-ponyfill"
+    ]
+  }
 }

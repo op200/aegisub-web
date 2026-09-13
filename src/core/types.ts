@@ -1,65 +1,65 @@
-export type SubtitleFormat = 'ass' | 'srt';
+export type SubtitleFormat = 'ass' | 'srt'
 
 export interface SubtitleStyle {
-  id: string;
-  name: string;
-  fontName: string;
-  fontSize: number;
-  primaryColor: string;
-  secondaryColor: string;
-  outlineColor: string;
-  backColor: string;
-  bold: boolean;
-  italic: boolean;
-  underline: boolean;
-  strikeout: boolean;
-  scaleX: number;
-  scaleY: number;
-  spacing: number;
-  angle: number;
-  borderStyle: number;
-  outline: number;
-  shadow: number;
-  alignment: number;
-  marginL: number;
-  marginR: number;
-  marginV: number;
-  encoding: number;
-  values: Record<string, string>;
+  id: string
+  name: string
+  fontName: string
+  fontSize: number
+  primaryColor: string
+  secondaryColor: string
+  outlineColor: string
+  backColor: string
+  bold: boolean
+  italic: boolean
+  underline: boolean
+  strikeout: boolean
+  scaleX: number
+  scaleY: number
+  spacing: number
+  angle: number
+  borderStyle: number
+  outline: number
+  shadow: number
+  alignment: number
+  marginL: number
+  marginR: number
+  marginV: number
+  encoding: number
+  values: Record<string, string>
 }
 
 export interface SubtitleCue {
-  id: string;
-  layer: number;
-  startMs: number;
-  endMs: number;
-  style: string;
-  actor: string;
-  marginL: number;
-  marginR: number;
-  marginV: number;
-  effect: string;
-  text: string;
-  comment: boolean;
-  extra: Record<string, string>;
+  id: string
+  layer: number
+  startMs: number
+  endMs: number
+  style: string
+  actor: string
+  marginL: number
+  marginR: number
+  marginV: number
+  effect: string
+  text: string
+  comment: boolean
+  extra: Record<string, string>
 }
 
 export interface RawSection {
-  name: string;
-  lines: string[];
+  name: string
+  lines: string[]
 }
 
 export interface SubtitleDocument {
-  format: SubtitleFormat;
-  sourceName: string;
-  revision: number;
-  scriptInfo: Record<string, string>;
-  styles: SubtitleStyle[];
-  cues: SubtitleCue[];
-  passthroughSections: RawSection[];
+  format: SubtitleFormat
+  sourceName: string
+  revision: number
+  scriptInfo: Record<string, string>
+  styles: SubtitleStyle[]
+  cues: SubtitleCue[]
+  passthroughSections: RawSection[]
 }
 
-export type SortColumn = 'start' | 'end' | 'style' | 'actor' | 'effect' | 'layer';
+export type SortColumn = 'start' | 'end' | 'style' | 'actor' | 'effect' | 'layer'
 
 export type CoreCommand =
   | { type: 'updateCue'; id: string; patch: Partial<Omit<SubtitleCue, 'id'>> }
@@ -73,19 +73,21 @@ export type CoreCommand =
   | { type: 'reorderStyles'; ids: string[] }
   | { type: 'updateScriptInfo'; patch: Record<string, string> }
   | { type: 'sortCues' }
-  | { type: 'sortCuesBy'; column: SortColumn };
+  | { type: 'sortCuesBy'; column: SortColumn }
+  /** Automation 整表重放（auto4_lua_assfile.cpp 的 modification 模型）：单步 undo */
+  | { type: 'replaceCues'; cues: Array<Partial<Omit<SubtitleCue, 'id'>>> }
 
 export interface CoreState {
-  document: SubtitleDocument;
-  canUndo: boolean;
-  canRedo: boolean;
-  undoLabel: string;
-  redoLabel: string;
-  runtime: 'typescript' | 'wasm';
+  document: SubtitleDocument
+  canUndo: boolean
+  canRedo: boolean
+  undoLabel: string
+  redoLabel: string
+  runtime: 'typescript' | 'wasm'
 }
 
 export interface StoredProject {
-  version: 1;
-  updatedAt: number;
-  document: SubtitleDocument;
+  version: 1
+  updatedAt: number
+  document: SubtitleDocument
 }
