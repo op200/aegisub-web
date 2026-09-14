@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   getOption,
@@ -29,6 +29,8 @@ interface WaveformProps {
   /** 播放状态（Audio/Lock Scroll on Cursor 跟随光标） */
   playing: boolean
   autoScroll: boolean
+  /** 双击网格行的 ScrollToActiveLine 请求（App 侧 nonce 递增，0=无） */
+  scrollToActiveLine: number
   view: 'waveform' | 'spectrum'
   /** AudioDisplay::zoom_level（= -HorizontalZoom 滑块值），约 -30..50 */
   zoomLevel?: number
@@ -243,6 +245,7 @@ export function Waveform({
   karaokeMode,
   playing,
   autoScroll,
+  scrollToActiveLine,
   view,
   zoomLevel = 0,
   amplitude = 1,
@@ -325,35 +328,54 @@ export function Waveform({
     setScrollLeft((current) => Math.min(Math.max(0, current), maxScroll))
   }, [maxScroll])
 
+  // ScrollTimeRangeInView（audio_display.cpp）：5% 边距，完全可见不动，可容纳则居中
+  const scrollRangeInView = useCallback(
+    (cue: SubtitleCue) => {
+      if (durationMs <= 0) return
+      const clientWidth = Math.max(1, size.w)
+      const begin = cue.startMs / msPerPixel
+      const end = cue.endMs / msPerPixel
+      const rangeLen = end - begin
+      const leftAdjust = clientWidth / 20
+      const clientLeft = clampedScroll + leftAdjust
+      const visibleWidth = (clientWidth * 9) / 10
+      let target = clampedScroll
+      if (!(begin >= clientLeft && end <= clientLeft + visibleWidth)) {
+        if (rangeLen < visibleWidth) {
+          target = begin - (visibleWidth - rangeLen) / 2 - leftAdjust
+        } else if (!(begin < clientLeft && end > clientLeft + visibleWidth)) {
+          if (end >= clientLeft && end < clientLeft + visibleWidth) {
+            target = end - clientWidth - leftAdjust
+          } else {
+            target = begin - leftAdjust
+          }
+        }
+      }
+      setScrollLeft(Math.min(Math.max(0, target), maxScroll))
+    },
+    [durationMs, size.w, msPerPixel, clampedScroll, maxScroll],
+  )
+
   // 选中行变化时滚动到可见（Audio/Auto/Scroll，ScrollTimeRangeInView）
   const lastSelKeyRef = useRef('')
   useEffect(() => {
-    if (!autoScroll || !selectedCue || durationMs <= 0) return
+    if (!autoScroll || !selectedCue) return
     const key = `${selectedCue.id}|${selectedCue.startMs}|${selectedCue.endMs}`
     if (lastSelKeyRef.current === key) return
     lastSelKeyRef.current = key
-    const clientWidth = Math.max(1, size.w)
-    const begin = selectedCue.startMs / msPerPixel
-    const end = selectedCue.endMs / msPerPixel
-    const rangeLen = end - begin
-    const leftAdjust = clientWidth / 20
-    const clientLeft = clampedScroll + leftAdjust
-    const visibleWidth = (clientWidth * 9) / 10
-    let target = clampedScroll
-    if (!(begin >= clientLeft && end <= clientLeft + visibleWidth)) {
-      if (rangeLen < visibleWidth) {
-        target = begin - (visibleWidth - rangeLen) / 2 - leftAdjust
-      } else if (!(begin < clientLeft && end > clientLeft + visibleWidth)) {
-        if (end >= clientLeft && end < clientLeft + visibleWidth) {
-          target = end - clientWidth - leftAdjust
-        } else {
-          target = begin - leftAdjust
-        }
-      }
-    }
-    setScrollLeft(Math.min(Math.max(0, target), maxScroll))
+    scrollRangeInView(selectedCue)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoScroll, selectedCue?.id])
+
+  // 双击网格行的 ScrollToActiveLine（audio_box.cpp，base_grid.cpp 双击调用）：不受
+  // Audio/Auto/Scroll 开关限制且无去重——重复双击当前行也要保证行范围可见
+  const lastScrollNonceRef = useRef(0)
+  useEffect(() => {
+    if (scrollToActiveLine === lastScrollNonceRef.current) return
+    lastScrollNonceRef.current = scrollToActiveLine
+    if (selectedCue) scrollRangeInView(selectedCue)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollToActiveLine])
 
   // 播放光标不自动滚动（Audio/Lock Scroll on Cursor 默认关闭）
 

@@ -71,9 +71,11 @@ import {
   SelectLinesDialog,
   ShiftTimesDialog,
   StylingAssistantDialog,
+  TimingProcessorDialog,
   ToolInfoDialog,
   TranslationDialog,
   VideoDetailsDialog,
+  useEscapeClose,
   type ExportOptions,
   type SelectLinesSettings,
 } from './components/dialogs'
@@ -239,6 +241,21 @@ function selectedOrActive(
   return document.cues[0] ? [document.cues[0].id] : []
 }
 
+/**
+ * 设备像素比跟踪（video_display.cpp 的 GetContentScaleFactor）：
+ * 监听 (resolution: Xdppx)，DPR 变化（跨显示器拖动/浏览器缩放）时更新。
+ */
+function useDevicePixelRatio(): number {
+  const [dpr, setDpr] = useState(() => window.devicePixelRatio || 1)
+  useEffect(() => {
+    const query = window.matchMedia(`(resolution: ${dpr}dppx)`)
+    const update = () => setDpr(window.devicePixelRatio || 1)
+    query.addEventListener('change', update)
+    return () => query.removeEventListener('change', update)
+  }, [dpr])
+  return dpr
+}
+
 /** 音频工具栏开关 → 持久化选项（AudioOptions 中 karaoke 为会话状态不持久化） */
 const AUDIO_TOGGLE_OPTIONS: Record<string, string> = {
   autoCommit: 'Audio/Auto/Commit',
@@ -264,7 +281,29 @@ export function App() {
   const [videoWindowZoom, setVideoWindowZoom] = useState(
     () => (getOptionInt('Video/Default Zoom') + 1) / 8,
   )
+  // 设备像素比（源码 GetContentScaleFactor）：视频缩放按物理设备像素计
+  const devicePixelRatioValue = useDevicePixelRatio()
+  const prevDprRef = useRef(devicePixelRatioValue)
+  useEffect(() => {
+    // wxEVT_DPI_CHANGED：new_zoom = zoom × 新scale/旧scale，保持视频表观尺寸不跳变
+    const prev = prevDprRef.current
+    if (prev === devicePixelRatioValue) return
+    prevDprRef.current = devicePixelRatioValue
+    if (prev > 0)
+      setVideoWindowZoom((zoom) =>
+        Math.max(0.125, Math.min(3, (zoom * devicePixelRatioValue) / prev)),
+      )
+  }, [devicePixelRatioValue])
   const [videoIntrinsicSize, setVideoIntrinsicSize] = useState({ width: 1280, height: 720 })
+  // AudioBox（wxSashWindow）底边 sash：SetSashVisible(wxSASH_BOTTOM) + OnSashDrag 改变
+  // 音频栏高度（SetMinSize → 父 Layout），OPT_SET("Audio/Display Height") 持久化
+  const [audioBoxHeight, setAudioBoxHeight] = useState(() => getOptionInt('Audio/Display Height'))
+  const audioSashDragRef = useRef<{
+    startY: number
+    startHeight: number
+    maxHeight: number
+    current: number
+  } | null>(null)
   // 稳定标识 + 值不变时返回原对象，避免 PreviewPane 的媒体 effect 依赖抖动造成重渲染循环。
   // 注意：源码 FitClientSizeToVideo 只按 video×windowZoom 定住显示框（SetMin/MaxClientSize），
   // 从不因窗口放不下而降档缩放；放不下时由窗口裁剪，与原版一致
@@ -286,6 +325,8 @@ export function App() {
   const [videoDecoderOverride, setVideoDecoderOverride] = useState<boolean | null>(null)
   const [videoAction, setVideoAction] = useState({ sequence: 0, type: '' })
   const [audioAction, setAudioAction] = useState({ sequence: 0, type: '' })
+  // 双击网格行的音频 ScrollToActiveLine 请求（audio_box.cpp，nonce 递增触发 Waveform 滚动）
+  const [audioScrollRequest, setAudioScrollRequest] = useState(0)
   // 状态栏消息（CreateStatusBar(2) 右字段 = field 1）。Aegisub 所有临时消息都走
   // FrameMain::StatusTimeout(text, ms=10000)：显示后由 ID_APP_TIMER_STATUSCLEAR 定时器
   // 清空（OnStatusClear → SetStatusText("", 1)）；左字段（field 0）源码从不写入
@@ -300,6 +341,8 @@ export function App() {
   const [toolbarVisible, setToolbarVisible] = useState(() => getOptionBool('App/Show Toolbar'))
   const [showStyleManager, setShowStyleManager] = useState(false)
   const [findMode, setFindMode] = useState<'find' | 'replace' | null>(null)
+  // 查找/替换弹窗 ESC 关闭（不响应点击外部关闭）
+  useEscapeClose(() => setFindMode(null), findMode !== null)
   const [findQuery, setFindQuery] = useState('')
   const [replaceQuery, setReplaceQuery] = useState('')
   // Audio/Spectrum 选项决定音频默认显示模式
@@ -490,22 +533,51 @@ export function App() {
     [activeId, core],
   )
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds])
+  // subs_edit_box.cpp PopulateList：全文档 Actor/Effect 去重排序，供编辑框 datalist
+  const actorValues = useMemo(() => {
+    if (!core) return []
+    return [...new Set(core.document.cues.map((cue) => cue.actor).filter(Boolean))].sort((a, b) =>
+      a.localeCompare(b),
+    )
+  }, [core])
+  const effectValues = useMemo(() => {
+    if (!core) return []
+    return [...new Set(core.document.cues.map((cue) => cue.effect).filter(Boolean))].sort((a, b) =>
+      a.localeCompare(b),
+    )
+  }, [core])
+  // 视觉工具 SetSelectedOverride 的目标集合：选中行（无选中时回退活动行）
+  const selectedCues = useMemo(() => {
+    if (!core) return []
+    return selectedOrActive(core.document, selectedSet, activeId)
+      .map((id) => core.document.cues.find((cue) => cue.id === id))
+      .filter((cue) => cue !== undefined)
+  }, [core, selectedSet, activeId])
   const videoLayout = useMemo(
     () =>
       calculateAttachedVideoLayout(
         videoIntrinsicSize,
         videoWindowZoom,
         aspectOverride ?? videoIntrinsicSize.width / Math.max(1, videoIntrinsicSize.height),
+        devicePixelRatioValue,
       ),
-    [aspectOverride, videoIntrinsicSize, videoWindowZoom],
+    [aspectOverride, videoIntrinsicSize, videoWindowZoom, devicePixelRatioValue],
   )
+
+  // JumpToTime(ms, START)（video_controller.cpp）：FrameAtTime(start, START) 定帧后
+  // 落到该帧 EXACT 时间。直接用原始行首 ms 会落到"包含行首的那一帧"（≤ 行首），
+  // 与源码"第一个 ≥ 行首的帧"差一帧，且时间框相对值符号相反（对不上字幕时间戳）
+  const seekVideoToLineStart = (startMs: number) => {
+    if (!videoMedia || !frameRate.isLoaded()) return
+    setVideoTimeMs(frameRate.timeAtFrame(frameRate.frameAtTime(startMs, 'start'), 'exact'))
+  }
 
   useEffect(() => {
     // 视频自动跟随选中行（video_controller.cpp OnActiveLineChanged：Stop() + JumpToTime）
     // oxlint-disable-next-line react/set-state-in-effect
     if (videoAutoScroll && videoMedia && selectedCue) {
       sendVideoAction('stop')
-      setVideoTimeMs(selectedCue.startMs)
+      seekVideoToLineStart(selectedCue.startMs)
     }
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedCue, videoAutoScroll, videoMedia])
@@ -746,6 +818,10 @@ export function App() {
     if (inserted) selectOnly(inserted.id)
   }
 
+  // base_grid.cpp OnMouseEvent 对齐：
+  // - ctrl+单击 = 切换勾选（若该行是唯一选中行则不动，避免空选），锚点行随活动行更新
+  // - shift+单击 = 块选 anchor..row（活动行移到点击行，锚点保持）
+  // - ctrl+shift = 现有选中 ∪ 块选
   const selectCue = (id: string, modifiers: { toggle: boolean; range: boolean }) => {
     if (!core) return
     if (modifiers.range && anchorRef.current) {
@@ -753,18 +829,44 @@ export function App() {
       const to = core.document.cues.findIndex((cue) => cue.id === id)
       if (from >= 0 && to >= 0) {
         const [start, end] = from < to ? [from, to] : [to, from]
-        setSelectedIds(new Set(core.document.cues.slice(start, end + 1).map((cue) => cue.id)))
+        const block = core.document.cues.slice(start, end + 1).map((cue) => cue.id)
+        setSelectedIds((current) => {
+          if (!modifiers.toggle) return new Set(block)
+          const next = new Set(current)
+          for (const cueId of block) next.add(cueId)
+          return next
+        })
       }
       setActiveId(id)
     } else if (modifiers.toggle) {
       setSelectedIds((current) => {
+        if (current.has(id) && current.size === 1) return current
         const next = new Set(current)
         if (next.has(id)) next.delete(id)
         else next.add(id)
         return next
       })
       setActiveId(id)
+      anchorRef.current = id
     } else selectOnly(id)
+  }
+
+  // 块选（拖动/shift 范围）：同 base_grid.cpp 块选分支——SetActiveLine 后把锚点恢复为 fromId
+  const selectRange = (fromId: string, toId: string, union: boolean) => {
+    if (!core) return
+    const from = core.document.cues.findIndex((cue) => cue.id === fromId)
+    const to = core.document.cues.findIndex((cue) => cue.id === toId)
+    if (from < 0 || to < 0) return
+    const [start, end] = from < to ? [from, to] : [to, from]
+    const block = core.document.cues.slice(start, end + 1).map((cue) => cue.id)
+    setSelectedIds((current) => {
+      if (!union) return new Set(block)
+      const next = new Set(current)
+      for (const cueId of block) next.add(cueId)
+      return next
+    })
+    setActiveId(toId)
+    anchorRef.current = fromId
   }
 
   // ---- 最近文件（mru.cpp：打开即记录，可从 Recent 子菜单重新打开）----
@@ -1027,8 +1129,10 @@ export function App() {
 
   const saveTimecodes = async () => {
     const base = core?.document.sourceName.replace(/\.(ass|ssa|srt)$/i, '') || 'timecodes'
-    const hasDummyFrameCount = videoMedia?.dummy ? frameCount : -1
-    const data = new TextEncoder().encode(serializeTimecodes(frameRate, hasDummyFrameCount))
+    // 源码 timecode.cpp：provider ? provider->GetFrameCount() : -1——有视频就传帧数
+    // （CFR 时 timecodes 表仅 [0] 哨兵，缺帧数会导出只含 1 行的废文件）
+    const providerFrameCount = videoMedia ? frameCount : -1
+    const data = new TextEncoder().encode(serializeTimecodes(frameRate, providerFrameCount))
     await host.saveFile(`${base}.timecodes.txt`, data, {
       description: 'Timecodes',
       accept: { 'text/plain': ['.txt'] },
@@ -1547,12 +1651,20 @@ export function App() {
               onPatchCue={(id, patch, label) =>
                 void apply([{ type: 'updateCue', id, patch }], label)
               }
+              onPatchCues={(patches, label) =>
+                void apply(
+                  patches.map(({ id, patch }) => ({ type: 'updateCue', id, patch })),
+                  label,
+                )
+              }
+              selectedCues={selectedCues}
               onPatchStyle={(id, patch, label) =>
                 void apply([{ type: 'updateStyle', id, patch }], label)
               }
               isCommandEnabled={isCommandEnabled}
               isCommandChecked={isCommandChecked}
               windowZoom={videoWindowZoom}
+              devicePixelRatio={devicePixelRatioValue}
               onWindowZoomChange={setVideoWindowZoom}
               onIntrinsicSizeChange={setIntrinsicSizeStable}
               localFontsEpoch={localFontsEpoch}
@@ -1589,7 +1701,14 @@ export function App() {
               }
             />
           )}
-          <div className="right-workspace">
+          <div
+            className="right-workspace"
+            style={
+              !isNarrowViewport && audioMedia && displayMode !== 'video_subs'
+                ? { gridTemplateRows: `${audioBoxHeight}px 4px minmax(0, 1fr)` }
+                : undefined
+            }
+          >
             {(displayMode === 'full' || displayMode === 'audio_subs') && (
               <AudioPane
                 media={audioMedia}
@@ -1611,6 +1730,7 @@ export function App() {
                 onSeek={setAudioTimeMs}
                 onVideoSeek={setVideoTimeMs}
                 mediaAction={audioAction}
+                scrollToActiveLine={audioScrollRequest}
                 onDurationChange={setAudioDurationMs}
                 onCommand={executeCommand}
                 onPatchCue={(id, patch, label) =>
@@ -1618,9 +1738,54 @@ export function App() {
                 }
               />
             )}
+            {!isNarrowViewport && audioMedia && displayMode !== 'video_subs' && (
+              <div
+                className="audio-sash"
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label={tPlain('Audio box resize sash')}
+                onPointerDown={(event) => {
+                  if (event.button !== 0) return
+                  // OnSashDrag：new_height = min(dragRect.height, 父窗口高 - 1)；
+                  // 上限按 EditPanel 保留 150px（源码 sizer min size 防挤没）
+                  const workspace = event.currentTarget.parentElement
+                  audioSashDragRef.current = {
+                    startY: event.clientY,
+                    startHeight: audioBoxHeight,
+                    maxHeight: Math.max(120, (workspace?.clientHeight ?? 600) - 154),
+                    current: audioBoxHeight,
+                  }
+                  event.currentTarget.setPointerCapture(event.pointerId)
+                }}
+                onPointerMove={(event) => {
+                  const drag = audioSashDragRef.current
+                  if (!drag) return
+                  const height = Math.round(
+                    Math.max(
+                      80,
+                      Math.min(drag.startHeight + event.clientY - drag.startY, drag.maxHeight),
+                    ),
+                  )
+                  drag.current = height
+                  setAudioBoxHeight(height)
+                }}
+                onPointerUp={() => {
+                  const drag = audioSashDragRef.current
+                  if (!drag) return
+                  audioSashDragRef.current = null
+                  // OPT_SET("Audio/Display Height")：拖动结束后持久化
+                  setOption('Audio/Display Height', drag.current)
+                }}
+                onPointerCancel={() => {
+                  audioSashDragRef.current = null
+                }}
+              />
+            )}
             <EditPanel
               cue={selectedCue}
               styles={core.document.styles}
+              actors={actorValues}
+              effects={effectValues}
               frameRate={frameRate}
               frameMode={frameMode && frameRate.isLoaded()}
               onFrameModeChange={setFrameMode}
@@ -1630,7 +1795,6 @@ export function App() {
               }}
               onCommand={executeCommand}
               isCommandEnabled={isCommandEnabled}
-              onInsertLine={() => void executeCommand('subtitle/insert/after')}
             />
           </div>
         </div>
@@ -1642,9 +1806,23 @@ export function App() {
           textMode={gridTags}
           frameRate={frameRate}
           frameMode={frameMode && frameRate.isLoaded()}
+          hasVideo={!!videoMedia}
           onSelect={selectCue}
-          onActivate={(cue) => selectOnly(cue.id)}
-          onSetActive={setActiveId}
+          onSelectRange={selectRange}
+          getAnchorId={() => anchorRef.current}
+          onActivate={(cue) => {
+            selectOnly(cue.id)
+            // base_grid.cpp 双击：audioBox->ScrollToActiveLine()（无条件，不受
+            // Audio/Auto/Scroll 开关限制）+ videoController->JumpToTime(dlg->Start)
+            // （START 帧语义）
+            setAudioScrollRequest((n) => n + 1)
+            seekVideoToLineStart(cue.startMs)
+          }}
+          // alt+方向键仅移活动行：锚点行随活动行更新（OnActiveLineChanged → extendRow）
+          onSetActive={(id) => {
+            setActiveId(id)
+            anchorRef.current = id
+          }}
           onCommand={executeCommand}
           isCommandEnabled={isCommandEnabled}
         />
@@ -1690,13 +1868,7 @@ export function App() {
       )}
 
       {findMode && (
-        <div
-          className="dialog-backdrop"
-          role="presentation"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setFindMode(null)
-          }}
-        >
+        <div className="dialog-backdrop" role="presentation">
           <form
             className="app-dialog find-dialog"
             role="dialog"
@@ -1872,13 +2044,17 @@ export function App() {
           onClose={() => setDialog(null)}
         />
       )}
-      {dialog === 'timing-postprocess' && (
-        <ToolInfoDialog
-          title={tPlain('Timing Post-Processor')}
-          message={tPlain(
-            'Lead-in/out controls are available in the audio toolbar. Keyframe processing requires loaded timecodes and keyframe data.',
-          )}
+      {dialog === 'timing-postprocess' && core && (
+        <TimingProcessorDialog
+          cues={core.document.cues}
+          styles={core.document.styles.map((style) => style.name)}
+          selectedIds={[...selectedSet]}
+          keyframes={activeKeyframes}
+          frameCount={frameCount}
+          hasVideo={!!videoMedia}
+          frameRate={frameRate}
           onClose={() => setDialog(null)}
+          onApply={(commands, label) => void apply(commands, label)}
         />
       )}
       {dialog === 'kanji-timer' && (

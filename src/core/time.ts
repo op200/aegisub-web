@@ -40,9 +40,10 @@ export function formatSrtTime(milliseconds: number): string {
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')},${String(millis).padStart(3, '0')}`
 }
 
-/** 视频位置框格式：与 Aegisub Time::GetAssFormatted(true) 一致（H:MM:SS.mmm，毫秒） */
+/** 视频位置框格式：与 Aegisub Time::GetAssFormatted(true) 一致（H:MM:SS.mmm，毫秒截断）
+ *  Time(int) 构造钳制 [0, 10h-6ms]，位数提取为整数截断（非四舍五入） */
 export function formatVideoTime(milliseconds: number): string {
-  const value = Math.max(0, Math.round(milliseconds))
+  const value = Math.max(0, Math.min(Math.trunc(milliseconds), 10 * 60 * 60 * 1000 - 6))
   const hours = Math.floor(value / 3_600_000)
   const minutes = Math.floor((value % 3_600_000) / 60_000)
   const seconds = Math.floor((value % 60_000) / 1000)

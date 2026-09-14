@@ -9,6 +9,9 @@ import {
   useOptionsVersion,
 } from '../../config/options'
 import {
+  defaultLinePosition,
+  floatToString,
+  formatG4,
   readVisualOverrides,
   setOverride,
   setPosition,
@@ -44,10 +47,19 @@ interface PreviewPaneProps {
   mediaAction: { sequence: number; type: string }
   onCommand: (id: string) => void
   onPatchCue: (id: string, patch: Partial<Omit<SubtitleCue, 'id'>>, label: string) => void
+  /** 批量补丁（一次 apply = 一条 undo 记录）：SetSelectedOverride 多行同改语义 */
+  onPatchCues: (
+    patches: { id: string; patch: Partial<Omit<SubtitleCue, 'id'>> }[],
+    label: string,
+  ) => void
+  /** 当前选中行（含活动行）：视觉工具 SetSelectedOverride 的目标集合 */
+  selectedCues: SubtitleCue[]
   onPatchStyle: (id: string, patch: Partial<Omit<SubtitleStyle, 'id'>>, label: string) => void
   isCommandEnabled: (id: string) => boolean
   isCommandChecked: (id: string) => boolean
   windowZoom: number
+  /** 设备像素比（源码 GetContentScaleFactor）：视频显示尺寸按物理设备像素换算 */
+  devicePixelRatio: number
   onWindowZoomChange: (zoom: number) => void
   onIntrinsicSizeChange: (width: number, height: number) => void
   intrinsicWidth: number
@@ -263,6 +275,141 @@ function visualToolColors() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// GL 变换复刻（gl_wrap.cpp）：视觉工具参考线的精确 3D 数学
+// ---------------------------------------------------------------------------
+// 源码经 OpenGL 变换链绘制参考线：glOrtho(0,W,H,0) 的 y 向下视口 + SetRotation 的
+// 透视矩阵（w=2500(z+1)，点按 1/(1+z) 收缩）。顶点依次经过：
+//   shear(\fax/\fay) → fsc 缩放 → Rz(绕 -z) → Rx(绕 -x) → Ry(绕 -y) →
+//   z×(8/zScale) → 透视除法 → baseScale(脚本→显示像素) → 平移 origin
+// 3D 直线变换后仍是直线（端点即可）；圆/环/弧需在 3D 空间采样成折线。
+interface GlMapperOptions {
+  /** gl.SetOrigin（显示像素） */
+  origin: [number, number]
+  /** 旋转前的 SetScale（rotatexy：100·video/script，即脚本像素→显示像素） */
+  baseScale?: { x: number; y: number }
+  /** 角度（度） */
+  rotX?: number
+  rotY?: number
+  rotZ?: number
+  /** SetRotation 第 4 参（默认 1；web 不建模 layout res） */
+  zScale?: number
+  /** 旋转后的 SetScale（\fscx/\fscy 百分比） */
+  fsc?: { x: number; y: number }
+  /** SetShear（\fax/\fay） */
+  shear?: { x: number; y: number }
+}
+
+function makeGlMapper(o: GlMapperOptions): (x: number, y: number, z?: number) => [number, number] {
+  const rad = Math.PI / 180
+  const cx = Math.cos((o.rotX ?? 0) * rad)
+  const sx = Math.sin((o.rotX ?? 0) * rad)
+  const cy = Math.cos((o.rotY ?? 0) * rad)
+  const sy = Math.sin((o.rotY ?? 0) * rad)
+  const cz = Math.cos((o.rotZ ?? 0) * rad)
+  const sz = Math.sin((o.rotZ ?? 0) * rad)
+  const zScale = o.zScale ?? 1
+  const fscX = (o.fsc?.x ?? 100) / 100
+  const fscY = (o.fsc?.y ?? 100) / 100
+  const fax = o.shear?.x ?? 0
+  const fay = o.shear?.y ?? 0
+  const bsx = o.baseScale?.x ?? 1
+  const bsy = o.baseScale?.y ?? 1
+  return (px, py, pz = 0) => {
+    // SetShear(fax, fay) 列主序矩阵 {1,fay,0,0 | fax,1,0,0}：x' = x + fax·y；y' = fay·x + y
+    let x = px + fax * py
+    let y = fay * px + py
+    let z = pz
+    // SetScale(fsc)
+    x *= fscX
+    y *= fscY
+    // glRotatef(rz, 0,0,-1)
+    const x1 = cz * x + sz * y
+    const y1 = -sz * x + cz * y
+    x = x1
+    y = y1
+    // glRotatef(rx, -1,0,0)
+    const y2 = cx * y + sx * z
+    const z2 = -sx * y + cx * z
+    y = y2
+    z = z2
+    // glRotatef(ry, 0,-1,0)
+    const x3 = cy * x - sy * z
+    z = sy * x + cy * z
+    x = x3
+    // glScalef(1,1,8/zScale) + P 矩阵（w 行 = z+2500）→ 屏幕偏移按
+    // 2500/(2500 + z·8/zScale) 收缩（z 为脚本像素单位）
+    const w = 1 + (z * 8) / (zScale * 2500)
+    x /= w
+    y /= w
+    // baseScale + SetOrigin 平移
+    return [x * bsx + o.origin[0], y * bsy + o.origin[1]]
+  }
+}
+
+/** 3D 变换后的圆（透视下为椭圆）：采样成折线，fill+stroke */
+function drawGlCircle(
+  context: CanvasRenderingContext2D,
+  map: (x: number, y: number, z?: number) => [number, number],
+  cx: number,
+  cy: number,
+  r: number,
+  fill: string,
+  stroke: string,
+): void {
+  context.beginPath()
+  for (let i = 0; i <= 32; i++) {
+    const a = (i / 32) * Math.PI * 2
+    const [px, py] = map(cx + Math.cos(a) * r, cy + Math.sin(a) * r)
+    if (i === 0) context.moveTo(px, py)
+    else context.lineTo(px, py)
+  }
+  context.closePath()
+  context.fillStyle = fill
+  context.fill()
+  context.strokeStyle = stroke
+  context.lineWidth = 1
+  context.stroke()
+}
+
+/** 3D 变换后的圆环/环带扇区（DrawRing）：外弧正向 + 内弧反向闭合，evenodd 填充 + 描边 */
+function drawGlRing(
+  context: CanvasRenderingContext2D,
+  map: (x: number, y: number, z?: number) => [number, number],
+  r1: number,
+  r2: number,
+  startDeg: number,
+  endDeg: number,
+  fill: string,
+  stroke: string,
+): void {
+  const rad = Math.PI / 180
+  const a0 = startDeg * rad
+  const a1 = endDeg * rad
+  const steps = Math.max(12, Math.round(((r1 * (a1 - a0)) / (2 * Math.PI)) * 8))
+  const outer: [number, number][] = []
+  const inner: [number, number][] = []
+  for (let i = 0; i <= steps; i++) {
+    const a = a0 + ((a1 - a0) * i) / steps
+    // 源码用 Vector2D::FromAngle(angle) = (cos(-a), sin(-a))：屏幕 Y 向下，弧朝向需翻转
+    outer.push(map(Math.cos(a) * r1, -Math.sin(a) * r1))
+    inner.push(map(Math.cos(a) * r2, -Math.sin(a) * r2))
+  }
+  context.beginPath()
+  outer.forEach(([px, py], i) => (i === 0 ? context.moveTo(px, py) : context.lineTo(px, py)))
+  for (let i = steps; i >= 0; i--) context.lineTo(inner[i][0], inner[i][1])
+  context.closePath()
+  if (fill) {
+    context.fillStyle = fill
+    context.fill('evenodd')
+  }
+  if (stroke) {
+    context.strokeStyle = stroke
+    context.lineWidth = 1
+    context.stroke()
+  }
+}
+
 interface VClipFeature {
   key: string
   index: number
@@ -301,6 +448,11 @@ function makeFeatures(spline: Spline): VClipFeature[] {
     }
   })
   return features
+}
+
+/** UpdateHold：矩形角点/位置钳制在脚本分辨率区域内（visual_tool_clip.cpp ClampToVideo） */
+function clampToScript(value: number, max: number): number {
+  return Math.max(0, Math.min(max, value))
 }
 
 /** 子路径折线（POINT 分割，贝塞尔按采样） */
@@ -698,9 +850,12 @@ export function PreviewPane({
   mediaAction,
   onCommand,
   onPatchCue,
+  onPatchCues,
+  selectedCues,
   isCommandEnabled,
   isCommandChecked,
   windowZoom,
+  devicePixelRatio: displayDpr,
   onWindowZoomChange,
   onIntrinsicSizeChange,
   intrinsicWidth,
@@ -805,6 +960,40 @@ export function PreviewPane({
   const currentRef = useRef(currentTimeMs)
   // video/copy_coordinates：鼠标在视频上的最近位置（视频分辨率坐标）
   const mousePosRef = useRef<{ x: number; y: number } | null>(null)
+  // 视觉工具实时反馈：鼠标相对 overlay 画布的像素位置、Shift 状态、是否悬停在舞台上
+  const mouseStagePxRef = useRef<{ x: number; y: number } | null>(null)
+  const mouseShiftRef = useRef(false)
+  const mouseOnStageRef = useRef(false)
+  // 视觉工具拖拽进行中 → 文档同步走 flushNow 即时渲染（源码每次鼠标事件 Commit+Render）
+  const visualDragRef = useRef(false)
+  // 拖拽刚结束的时间戳：pointerup 冲刷的最终提交在 effect 运行时拖拽态已复位，
+  // 用短时间窗让最终提交仍走 flushNow（否则落入 250ms 防抖，最终帧有延迟感）
+  const dragEndedAtRef = useRef(0)
+  // 拖拽提交合流：源码 UpdateDrag 每次鼠标事件 Commit（C++ 信号廉价），web 的
+  // apply → 全文档序列化 + React 重渲染昂贵，高频 pointermove（可达数百 Hz）按
+  // 帧节拍合流只提交最后一帧（源码异步渲染同样丢弃中间结果，最终位置为准）。
+  // pointerup 同步冲刷，保证最终位置立即落盘
+  const dragCommitRafRef = useRef(0)
+  const dragCommitRef = useRef<(() => void) | null>(null)
+  const scheduleDragCommit = (commit: () => void) => {
+    dragCommitRef.current = commit
+    if (dragCommitRafRef.current) return
+    dragCommitRafRef.current = requestAnimationFrame(() => {
+      dragCommitRafRef.current = 0
+      const fn = dragCommitRef.current
+      dragCommitRef.current = null
+      fn?.()
+    })
+  }
+  const flushDragCommit = () => {
+    if (dragCommitRafRef.current) {
+      cancelAnimationFrame(dragCommitRafRef.current)
+      dragCommitRafRef.current = 0
+    }
+    const fn = dragCommitRef.current
+    dragCommitRef.current = null
+    fn?.()
+  }
   // ---- 矢量裁剪工具状态 ----
   const [vclip, setVclip] = useState<VClipState | null>(null)
   const vclipRef = useRef<VClipState | null>(null)
@@ -899,6 +1088,8 @@ export function PreviewPane({
     baseRotationX: number
     baseRotationY: number
     baseRotationZ: number
+    /** 行原点（\org 或 \pos）的屏幕像素位置：rotate/z 绕原点旋转（InitializeHold 用 org->pos） */
+    originPx: { x: number; y: number }
   } | null>(null)
 
   useEffect(() => {
@@ -916,6 +1107,12 @@ export function PreviewPane({
     panRef.current = pan
     contentZoomRef.current = contentZoom
   }, [pan, contentZoom])
+
+  /** video_display.cpp：viewport = video × windowZoom、content ×= contentZoomValue 都是物理
+   *  设备像素，客户区逻辑像素 = 物理 / scale_factor。Web 的 CSS 尺寸 = 物理 / devicePixelRatio：
+   *  zoom 100% 时 1 视频像素 : 1 物理屏幕像素（点对点），不在此取整以免破坏设备像素对齐 */
+  const mediaCssSize = (intrinsic: number) =>
+    Math.max(1, (intrinsic * windowZoom * contentZoom) / (displayDpr > 0 ? displayDpr : 1))
 
   /** 媒体显示框（video / WebCodecs 包裹层 / dummy 框）相对舞台的矩形，含平移与缩放后的实际位置 */
   const mediaRect = () => {
@@ -1130,6 +1327,48 @@ export function PreviewPane({
       hitBoxesRef.current = boxes
     }
 
+    // ---- 十字工具（visual_tool_cross.cpp Draw：全屏十字线 + 鼠标处脚本坐标读数）----
+    if (hasVideo && visualTool === 'video/tool/cross' && mouseOnStageRef.current) {
+      const rect = mediaRect()
+      const mousePx = mouseStagePxRef.current
+      const mouseScript = mousePosRef.current
+      if (rect.width > 0 && rect.height > 0 && mousePx && mouseScript) {
+        const playResY = Number(document.scriptInfo.PlayResY) || 1080
+        const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
+        const drawCross = (color: string, width: number) => {
+          context.strokeStyle = color
+          context.lineWidth = width
+          context.beginPath()
+          context.moveTo(rect.left, mousePx.y)
+          context.lineTo(rect.left + rect.width, mousePx.y)
+          context.moveTo(mousePx.x, rect.top)
+          context.lineTo(mousePx.x, rect.top + rect.height)
+          context.stroke()
+        }
+        // 源码用 SetInvert 反色保证任意背景可见；Web 画布无法反色视频层，用暗晕 + 白线近似
+        drawCross('rgba(0,0,0,.5)', 3)
+        drawCross('white', 1)
+        // Shift = 显示对称点坐标（源码 2*video_pos+video_size-mouse_pos 的脚本系等价）
+        const sx = mouseShiftRef.current ? playResX - mouseScript.x : mouseScript.x
+        const sy = mouseShiftRef.current ? playResY - mouseScript.y : mouseScript.y
+        // video_size.X() > script_res.X() 时 3 位小数，否则整数（VisualToolCross::Text）
+        const text =
+          rect.width > playResX
+            ? `${floatToString(sx, 3)},${floatToString(sy, 3)}`
+            : `${Math.trunc(sx)},${Math.trunc(sy)}`
+        context.font = 'bold 12px Verdana, sans-serif'
+        const textWidth = context.measureText(text).width
+        let dx = mousePx.x
+        let dy = mousePx.y
+        if (dx > rect.left + rect.width / 2) dx -= textWidth + 4
+        else dx += 4
+        if (dy < rect.top + rect.height / 2) dy += 3
+        else dy -= 15
+        context.fillStyle = 'white'
+        context.fillText(text, dx, dy)
+      }
+    }
+
     // ---- 视觉工具参考线（visual_tool*.cpp Draw()；颜色 = Colour/Visual Tools）----
     if (hasVideo && visualTool !== 'video/tool/cross') {
       const colors = visualToolColors()
@@ -1139,20 +1378,14 @@ export function PreviewPane({
       const rect = mediaRect()
       const mapX = (x: number) => rect.left + (x / playResX) * rect.width
       const mapY = (y: number) => rect.top + (y / playResY) * rect.height
-      const pxScale = rect.width / playResX
       const rad = Math.PI / 180
-      // 行位置（脚本坐标）：\pos / \move 起点；无则用 hitbox 中心近似对齐推算位置
+      // 行位置（脚本坐标）：\pos / \move 起点；无则按样式对齐与 Margin 推导（GetLinePosition）
       const linePos = (cue: SubtitleCue): { x: number; y: number } => {
         const o = readVisualOverrides(cue.text)
         if (o.pos) return o.pos
         if (o.move) return { x: o.move.x1, y: o.move.y1 }
-        const box = hitBoxesRef.current.find((item) => item.cue.id === cue.id)
-        if (box)
-          return {
-            x: (((box.left + box.right) / 2 - rect.left) / rect.width) * playResX,
-            y: (((box.top + box.bottom) / 2 - rect.top) / rect.height) * playResY,
-          }
-        return { x: playResX / 2, y: playResY / 2 }
+        const style = document.styles.find((item) => item.name === cue.style)
+        return defaultLinePosition(cue, style, { x: playResX, y: playResY })
       }
       // 特征点（visual_feature.cpp Draw；线 = Lines Secondary 1px，填充由调用方给）
       const drawFeature = (
@@ -1202,14 +1435,16 @@ export function PreviewPane({
 
       if (visualTool === 'video/tool/drag') {
         // visual_tool_drag.cpp Draw：位置方框 + \move 终点圆（箭头连线）+ \org 三角（虚线）
+        // DrawAllFeatures 填充：选中行的起点方框 = Lines Primary 0.3（alt_fill），其余 = Highlight Primary 0.3
+        const selectedIds = new Set(selectedCues.map((cue) => cue.id))
         for (const cue of active) {
           const o = readVisualOverrides(cue.text)
-          const fill = cue.id === activeCue?.id ? colors.selFill : colors.baseFill
+          const selected = selectedIds.has(cue.id)
           const start = startOf(o)
           if (!start && !o.org) continue
           const sx = mapX(start?.x ?? 0)
           const sy = mapY(start?.y ?? 0)
-          if (start) drawFeature(sx, sy, 'square', fill)
+          if (start) drawFeature(sx, sy, 'square', selected ? colors.selFill : colors.baseFill)
           if (start && o.move) {
             const ex = mapX(o.move.x2)
             const ey = mapY(o.move.y2)
@@ -1235,7 +1470,7 @@ export function PreviewPane({
               context.closePath()
               context.fill()
             }
-            drawFeature(ex, ey, 'circle', fill)
+            drawFeature(ex, ey, 'circle', colors.baseFill)
           }
           if (o.org) {
             const ox = mapX(o.org.x)
@@ -1257,7 +1492,7 @@ export function PreviewPane({
                 context.setLineDash([])
               }
             }
-            drawFeature(ox, oy, 'triangle', fill)
+            drawFeature(ox, oy, 'triangle', colors.baseFill)
           }
         }
       } else if (visualTool === 'video/tool/rotate/z' && activeCue) {
@@ -1271,68 +1506,61 @@ export function PreviewPane({
         const py = mapY(pos.y)
         const oRadius = Math.hypot(px - ox, py - oy)
         const radius = Math.max(oRadius, 50)
-        context.save()
-        // 3D 旋转的 2D 正交近似：ry 压缩 X 轴、rx 压缩 Y 轴，fsc 缩放（frz 不参与环绘制）
-        context.translate(ox, oy)
-        context.scale(Math.cos(o.rotationY * rad) || 1, Math.cos(o.rotationX * rad) || 1)
-        context.scale(o.scaleX / 100, o.scaleY / 100)
+        // gl.SetOrigin(org)+SetRotation(rx,ry,0)+SetScale(fsc)：精确 GL 变换链（3D 旋转+透视）
+        const map = makeGlMapper({
+          origin: [ox, oy],
+          rotX: o.rotationX,
+          rotY: o.rotationY,
+          fsc: { x: o.scaleX, y: o.scaleY },
+        })
         // 圆环（r±4）
-        context.beginPath()
-        context.arc(0, 0, radius + 4, 0, Math.PI * 2)
-        context.arc(0, 0, radius - 4, 0, Math.PI * 2, true)
-        context.fillStyle = colors.baseFill
-        context.fill('evenodd')
-        context.strokeStyle = colors.secondary
-        context.lineWidth = 1
-        context.stroke()
+        drawGlRing(context, map, radius + 4, radius - 4, 0, 360, colors.baseFill, colors.secondary)
         // 6 组弧形刻度（r+12..r+30，每 60° ±15°）
-        for (let i = 0; i < 6; i++) {
-          const from = (i * 60 - 15) * rad
-          const to = (i * 60 + 15) * rad
-          context.beginPath()
-          context.arc(0, 0, radius + 12, from, to)
-          context.arc(0, 0, radius + 30, to, from, true)
-          context.closePath()
-          context.fillStyle = colors.baseFill
-          context.fill()
-          context.strokeStyle = colors.secondary
-          context.stroke()
-        }
-        // 当前角度基线（穿过原点）与角度柄圆
+        for (let i = 0; i < 6; i++)
+          drawGlRing(
+            context,
+            map,
+            radius + 30,
+            radius + 12,
+            i * 60 - 15,
+            i * 60 + 15,
+            colors.baseFill,
+            colors.secondary,
+          )
+        // 当前角度基线（穿过原点）与角度柄圆；Vector2D::FromAngle=(cos(-θ),sin(-θ))，Y 分量取负
         const angle = o.rotationZ * rad
         const ax = Math.cos(angle)
-        const ay = Math.sin(angle)
+        const ay = -Math.sin(angle)
         context.strokeStyle = colors.lines
         context.lineWidth = 2
         context.beginPath()
-        context.moveTo(-ax * radius, -ay * radius)
-        context.lineTo(ax * radius, ay * radius)
+        const [blx1, bly1] = map(-ax * radius, -ay * radius)
+        const [blx2, bly2] = map(ax * radius, ay * radius)
+        context.moveTo(blx1, bly1)
+        context.lineTo(blx2, bly2)
         context.stroke()
         if (oRadius > 0) {
           // 原点→文字位置（按当前角度反推）的连线 + 文字下方横线
+          // rotated_pos = FromAngle(angle − (pos−org).Angle())·oRadius，Y 分量取负
           const posAngle = Math.atan2(py - oy, px - ox)
           const rpx = Math.cos(angle - posAngle) * oRadius
-          const rpy = Math.sin(angle - posAngle) * oRadius
+          const rpy = -Math.sin(angle - posAngle) * oRadius
           context.beginPath()
-          context.moveTo(0, 0)
-          context.lineTo(rpx, rpy)
+          const [o0x, o0y] = map(0, 0)
+          const [rpX, rpY] = map(rpx, rpy)
+          context.moveTo(o0x, o0y)
+          context.lineTo(rpX, rpY)
           context.stroke()
+          const [u1x, u1y] = map(rpx - ax * 20, rpy - ay * 20)
+          const [u2x, u2y] = map(rpx + ax * 20, rpy + ay * 20)
           context.beginPath()
-          context.moveTo(rpx - ax * 20, rpy - ay * 20)
-          context.lineTo(rpx + ax * 20, rpy + ay * 20)
-          context.stroke()
-        }
-        context.strokeStyle = colors.secondary
-        context.fillStyle = colors.baseFill
-        context.lineWidth = 1
-        for (const sign of [1, -1]) {
-          context.beginPath()
-          context.arc(ax * radius * sign, ay * radius * sign, 4, 0, Math.PI * 2)
-          context.fill()
+          context.moveTo(u1x, u1y)
+          context.lineTo(u2x, u2y)
           context.stroke()
         }
-        context.restore()
-        drawFeature(ox, oy, 'triangle', colors.selFill)
+        drawGlCircle(context, map, ax * radius, ay * radius, 4, colors.baseFill, colors.secondary)
+        drawGlCircle(context, map, -ax * radius, -ay * radius, 4, colors.baseFill, colors.secondary)
+        drawFeature(ox, oy, 'triangle', colors.baseFill)
         // 鼠标位置连线（距原点 >10px）
         const mouse = mousePosRef.current
         if (mouse) {
@@ -1348,64 +1576,92 @@ export function PreviewPane({
           }
         }
       } else if (visualTool === 'video/tool/rotate/xy' && activeCue) {
-        // visual_tool_rotatexy.cpp Draw：随行 3D 旋转的渐隐变换网格 + 三轴向量箭头
+        // visual_tool_rotatexy.cpp Draw：SetOrigin(org) → SetScale(100·video/script)
+        // → SetRotation(rx,ry,rz) → SetScale(fsc) → SetShear 的完整 GL 变换链
         const o = readVisualOverrides(activeCue.text)
         const pos = linePos(activeCue)
         const org = o.org ?? pos
         const gridRadius = 15 // 每侧线数
         const spacing = 20 // 线距（脚本像素）
         const halfLen = spacing * (gridRadius + 1) // 320
-        context.save()
-        context.translate(mapX(org.x), mapY(org.y))
-        context.scale(pxScale, pxScale)
-        // 2D 近似：面内旋转 rz + ry/rx 压缩 + fsc + fax/fay 剪切（点先经剪切）
-        context.scale(Math.cos(o.rotationY * rad) || 1, Math.cos(o.rotationX * rad) || 1)
-        context.rotate(o.rotationZ * rad)
-        context.scale(o.scaleX / 100, o.scaleY / 100)
-        context.transform(1, o.fay, o.fax, 1, 0, 0)
+        const fade = 0.9 / gridRadius
+        const map = makeGlMapper({
+          origin: [mapX(org.x), mapY(org.y)],
+          baseScale: { x: rect.width / playResX, y: rect.height / playResY },
+          rotX: o.rotationX,
+          rotY: o.rotationY,
+          rotZ: o.rotationZ,
+          fsc: { x: o.scaleX, y: o.scaleY },
+          shear: { x: o.fax, y: o.fay },
+        })
+        // 网格：每行两段（中心→±端），顶点 alpha (i+3)%4>1?0:1−|i/8−15|·fade → 中心到端点渐隐
         context.lineWidth = 2
-        for (let i = -gridRadius; i <= gridRadius; i++) {
-          context.strokeStyle = withAlpha(colors.secondary, 1 - Math.abs(i) * (0.9 / gridRadius))
+        const halves: [number, number, number, number][] = []
+        for (let k = -gridRadius; k <= gridRadius; k++) {
+          const p = k * spacing
+          halves.push(
+            [p, 0, p, -halfLen],
+            [p, 0, p, halfLen],
+            [0, p, -halfLen, p],
+            [0, p, halfLen, p],
+          )
+        }
+        for (const [x1, y1, x2, y2] of halves) {
+          const a = 1 - Math.abs(y2 === 0 ? x2 / spacing : y1 / spacing) * fade
+          const g = context.createLinearGradient(...map(x1, y1), ...map(x2, y2))
+          g.addColorStop(0, withAlpha(colors.secondary, a))
+          g.addColorStop(1, withAlpha(colors.secondary, 0))
+          context.strokeStyle = g
           context.beginPath()
-          context.moveTo(i * spacing, -halfLen)
-          context.lineTo(i * spacing, halfLen)
-          context.moveTo(-halfLen, i * spacing)
-          context.lineTo(halfLen, i * spacing)
+          context.moveTo(...map(x1, y1))
+          context.lineTo(...map(x2, y2))
           context.stroke()
         }
-        context.restore()
-        // 三轴向量（50px + 锥形箭头；Z 轴为进深的正交投影近似）
-        const originX = mapX(org.x)
-        const originY = mapY(org.y)
-        const cosRz = Math.cos(o.rotationZ * rad)
-        const sinRz = Math.sin(o.rotationZ * rad)
-        const cosRx = Math.cos(o.rotationX * rad)
-        const cosRy = Math.cos(o.rotationY * rad)
-        const axes = [
-          [50 * cosRz * cosRy, 50 * sinRz * cosRx],
-          [-50 * sinRz * cosRy, 50 * cosRz * cosRx],
-          [50 * Math.sin(o.rotationY * rad), -50 * Math.sin(o.rotationX * rad)],
-        ]
+        // 三轴向量 (50,0,0)/(0,50,0)/(0,0,50) + 箭头（源码 GL_LINES 顶点对原样连线）
         context.strokeStyle = colors.lines
-        context.fillStyle = colors.lines
         context.lineWidth = 2
-        for (const [ex, ey] of axes) {
-          const gx = originX + ex * pxScale
-          const gy = originY + ey * pxScale
-          const len = Math.hypot(ex, ey) || 1
-          const ux = ex / len
-          const uy = ey / len
+        const drawSeg = (a: [number, number, number], b: [number, number, number]) => {
           context.beginPath()
-          context.moveTo(originX, originY)
-          context.lineTo(gx, gy)
+          context.moveTo(...map(...a))
+          context.lineTo(...map(...b))
           context.stroke()
-          context.beginPath()
-          context.moveTo(gx + ux * 10 * pxScale, gy + uy * 10 * pxScale)
-          context.lineTo(gx - uy * 3 * pxScale, gy + ux * 3 * pxScale)
-          context.lineTo(gx + uy * 3 * pxScale, gy - ux * 3 * pxScale)
-          context.closePath()
-          context.fill()
         }
+        // 源码 6 顶点按 GL_LINES 配对：tip→c1、c2→c3、c4→c1（开放菱形）
+        const arrow = (tip: [number, number, number], c: [number, number, number][]) => {
+          drawSeg(tip, c[0])
+          drawSeg(c[1], c[2])
+          drawSeg(c[3], c[0])
+        }
+        drawSeg([0, 0, 0], [50, 0, 0])
+        drawSeg([0, 0, 0], [0, 50, 0])
+        drawSeg([0, 0, 0], [0, 0, 50])
+        arrow(
+          [60, 0, 0],
+          [
+            [50, -3, -3],
+            [50, 3, -3],
+            [50, 3, 3],
+            [50, -3, 3],
+          ],
+        )
+        arrow(
+          [0, 60, 0],
+          [
+            [-3, 50, -3],
+            [3, 50, -3],
+            [3, 50, 3],
+            [-3, 50, 3],
+          ],
+        )
+        arrow(
+          [0, 0, 60],
+          [
+            [-3, -3, 50],
+            [3, -3, 50],
+            [3, 3, 50],
+            [-3, 3, 50],
+          ],
+        )
       } else if (visualTool === 'video/tool/scale' && activeCue) {
         // visual_tool_scale.cpp Draw：随行旋转的标尺 + 当前缩放指示线 + 端点圆 + 标尺脚
         const o = readVisualOverrides(activeCue.text)
@@ -1588,11 +1844,44 @@ export function PreviewPane({
         context.lineTo(mx(curve.p4), my(curve.p4))
         context.stroke()
       }
+      context.setLineDash([])
 
-      // line/bicubic 追加模式：鼠标到形状起点/末端的闭合提示虚线
+      // convert/insert 模式：高亮最近曲线（visual_tool_vector_clip.cpp Draw highlighted line；
+      // 源码画曲线两端点直线，闭合边不算）
       if (
         vclip.mouse &&
-        vclip.dragStart &&
+        (vclip.mode === 'video/tool/vclip/convert' || vclip.mode === 'video/tool/vclip/insert') &&
+        !vclip.active &&
+        vclip.spline.curves.length > 1
+      ) {
+        const closest = vclip.spline.closestParametric(vclip.mouse, true)
+        const curve = closest ? vclip.spline.curves[closest.index] : null
+        if (curve) {
+          const end = curve.type === 'bicubic' ? curve.p4 : curve.p2
+          context.strokeStyle = vcl.selected
+          context.lineWidth = 2
+          context.beginPath()
+          context.moveTo(mx(curve.p1), my(curve.p1))
+          context.lineTo(mx(end), my(end))
+          context.stroke()
+        }
+      }
+
+      // insert 模式：插入点预览圆（visual_tool_vector_clip.cpp Draw preview of insert point）
+      if (vclip.mode === 'video/tool/vclip/insert' && vclip.mouse) {
+        const closest = vclip.spline.closestParametric(vclip.mouse, true)
+        if (closest) {
+          context.strokeStyle = vcl.lines
+          context.lineWidth = 2
+          context.beginPath()
+          context.arc(mx(closest.point), my(closest.point), 4, 0, Math.PI * 2)
+          context.stroke()
+        }
+      }
+
+      // line/bicubic 模式：鼠标到形状起点/末端的闭合提示虚线（源码 Draw：悬停即画，非按住时也画）
+      if (
+        vclip.mouse &&
         (vclip.mode === 'video/tool/vclip/line' || vclip.mode === 'video/tool/vclip/bicubic')
       ) {
         const first = vclip.spline.curves.find((curve) => curve.type === 'point')
@@ -1684,6 +1973,17 @@ export function PreviewPane({
     return () => observer.disconnect()
   }, [renderOverlay])
 
+  // 十字工具随鼠标移动实时重绘（visual_tool_cross.cpp 每次鼠标事件后 Render），
+  // rAF 合流避免高频 pointermove 全量重绘
+  const overlayRenderRafRef = useRef(0)
+  const scheduleOverlayRender = () => {
+    if (overlayRenderRafRef.current) return
+    overlayRenderRafRef.current = requestAnimationFrame(() => {
+      overlayRenderRafRef.current = 0
+      renderOverlay()
+    })
+  }
+
   // ---- JASSUB（libass WASM）字幕渲染器生命周期（对应原版 SubtitlesProvider）----
   useEffect(() => {
     if (!assEnabled) return
@@ -1714,9 +2014,12 @@ export function PreviewPane({
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [assEnabled, localFontsEpoch])
 
-  // 文档变化 → 防抖替换 libass track（wrapper 内防抖）
+  // 文档变化 → 替换 libass track：视觉工具拖拽中走 flushNow 即时渲染（源码每次
+  // 鼠标事件 Commit+Render），其余（编辑器高频修改）走防抖
   useEffect(() => {
-    assRenderer?.setTrack(exportAss(document))
+    const content = exportAss(document)
+    if (visualDragRef.current) assRenderer?.flushNow(content)
+    else assRenderer?.setTrack(content)
   }, [assRenderer, document])
 
   // 时间/媒体/缩放变化 → 驱动 libass 渲染（storage = 视频分辨率）
@@ -2005,9 +2308,14 @@ export function PreviewPane({
   }
 
   // ---- 矢量裁剪：激活/解析（visual_tool_vector_clip.cpp DoRefresh）----
+  // 工具是否已激活：activeCue 刷新（每次提交后）只重解析样条，子工具模式保留
+  // （源码 mode 仅在 SetToolbar 激活时按 features.empty() 设置），否则第二次点击
+  // 就落入 drag 模式，线/双三次工具永远画不出第二条边
+  const vclipActiveRef = useRef(false)
   useEffect(() => {
     if (visualTool !== 'video/tool/vector_clip') {
       // 工具切换时销毁矢量裁剪会话
+      vclipActiveRef.current = false
       // oxlint-disable-next-line react/set-state-in-effect
       setVclip(null)
       return
@@ -2023,7 +2331,7 @@ export function PreviewPane({
         if (info.scale !== 1) spline.curves = scaleSpline(spline, 1 / 2 ** (info.scale - 1)).curves
       }
     }
-    setVclip({
+    const fresh: VClipState = {
       inverse,
       spline,
       mode: spline.curves.length ? 'video/tool/vclip/drag' : 'video/tool/vclip/line',
@@ -2033,7 +2341,17 @@ export function PreviewPane({
       dragOriginal: new Map(),
       boxStart: null,
       mouse: null,
-    })
+    }
+    if (!vclipActiveRef.current) {
+      vclipActiveRef.current = true
+      setVclip(fresh)
+      return
+    }
+    // DoRefresh：活动行/提交后重解析样条并清空选择与拖拽态，保留当前子工具模式与
+    // 鼠标位置（源码 mouse_pos 是 OnMouseEvent 级状态，不随 DoRefresh 清除）
+    setVclip((current) =>
+      current ? { ...fresh, mode: current.mode, mouse: current.mouse } : fresh,
+    )
   }, [visualTool, activeCue])
 
   const scriptTransform = () => {
@@ -2057,7 +2375,7 @@ export function PreviewPane({
     }
   }
 
-  const commitVclip = (state: VClipState) => {
+  const commitVclip = (state: VClipState, label = 'visual typesetting') => {
     if (!activeCue) return
     const scaled =
       state.spline.scale !== 1
@@ -2065,10 +2383,19 @@ export function PreviewPane({
         : state.spline
     const drawing = scaled.encode()
     if (!drawing.trim()) return
-    onPatchCue(
-      activeCue.id,
-      { text: setVectorClip(activeCue.text, state.inverse, `(${drawing})`) },
-      tPlain('visual typesetting'),
+    // Save()：样条值写入全部选中行；\iclip 行保持 \iclip（源码按各行文本子串判断）
+    onPatchCues(
+      selectedCues.map((cue) => ({
+        id: cue.id,
+        patch: {
+          text: setVectorClip(
+            cue.text,
+            /\\iclip/.test(cue.text) ? true : state.inverse,
+            `(${drawing})`,
+          ),
+        },
+      })),
+      tPlain(label),
     )
   }
 
@@ -2133,7 +2460,7 @@ export function PreviewPane({
         next.selected.clear()
         next.active = null
         setVclip(next)
-        commitVclip(next)
+        commitVclip(next, 'delete control point')
       }
       return
     }
@@ -2311,26 +2638,49 @@ export function PreviewPane({
   const canvasPointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
     // 源码视觉工具只响应左键；中键留给拖动平移，右键留给上下文菜单
     if (event.button !== 0) return
+    visualDragRef.current = true
     if (visualTool === 'video/tool/vector_clip') {
       vclipPointerDown(event)
       event.currentTarget.setPointerCapture(event.pointerId)
       return
     }
     const hit = hitTest(event.clientX, event.clientY)
-    const cue = hit?.cue ?? activeCue
+    // 源码语义：drag 工具点击的是特征（属于其所在行）；hold 工具（scale/rotate/clip）
+    // 无可点击特征，始终以活动行为基准（InitializeHold），改动经 SetSelectedOverride
+    // 应用到全部选中行。无活动行时源码不进入 hold
+    const holdTool =
+      visualTool === 'video/tool/scale' ||
+      visualTool === 'video/tool/rotate/z' ||
+      visualTool === 'video/tool/rotate/xy' ||
+      visualTool === 'video/tool/clip'
+    const cue = holdTool ? activeCue : (hit?.cue ?? activeCue)
     if (!cue) return
     event.currentTarget.setPointerCapture(event.pointerId)
     const stage = stageRef.current
     if (!stage) return
-    const overrides = readVisualOverrides(cue.text)
+    // GetLineScale/GetLineRotation 的缺省值取自行样式（ScaleX/ScaleY/Angle）
+    const cueStyle = document.styles.find((item) => item.name === cue.style)
+    const overrides = readVisualOverrides(cue.text, cueStyle)
     const playResY = Number(document.scriptInfo.PlayResY) || 1080
     const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
     const bounds = stage.getBoundingClientRect()
     const rect = mediaRect()
-    const pointerX = ((event.clientX - bounds.left - rect.left) / rect.width) * playResX
-    const pointerY = ((event.clientY - bounds.top - rect.top) / rect.height) * playResY
-    const baseX = overrides.pos?.x ?? pointerX
-    const baseY = overrides.pos?.y ?? pointerY
+    // UpdateHold：矩形角点钳制在视频区域内
+    const rawX = ((event.clientX - bounds.left - rect.left) / rect.width) * playResX
+    const rawY = ((event.clientY - bounds.top - rect.top) / rect.height) * playResY
+    const pointerX = clampToScript(rawX, playResX)
+    const pointerY = clampToScript(rawY, playResY)
+    // clip 工具：cur_1 基点 = 钳制后的点击点（InitializeHold + UpdateHold 钳制），
+    // 其余工具基点 = 行 \pos（无则点击点）
+    const baseX = visualTool === 'video/tool/clip' ? pointerX : (overrides.pos?.x ?? pointerX)
+    const baseY = visualTool === 'video/tool/clip' ? pointerY : (overrides.pos?.y ?? pointerY)
+    // 行原点（GetLineOrigin > GetLinePosition）：\org > \pos/\move 起点 > 样式对齐默认位置。
+    // rotate/z 的 InitializeHold/UpdateHold 绕该点计算鼠标角度（非按下点）
+    const lineOriginScript =
+      overrides.org ??
+      overrides.pos ??
+      (overrides.move ? { x: overrides.move.x1, y: overrides.move.y1 } : null) ??
+      defaultLinePosition(cue, cueStyle, { x: playResX, y: playResY })
     dragRef.current = {
       cue,
       startX: event.clientX,
@@ -2342,23 +2692,20 @@ export function PreviewPane({
       baseRotationX: overrides.rotationX,
       baseRotationY: overrides.rotationY,
       baseRotationZ: overrides.rotationZ,
-    }
-    if (visualTool === 'video/tool/clip') {
-      onPatchCue(
-        cue.id,
-        {
-          text: setOverride(
-            cue.text,
-            'clip',
-            `(${Math.round(pointerX)},${Math.round(pointerY)},${Math.round(pointerX)},${Math.round(pointerY)})`,
-          ),
-        },
-        tPlain('Set clipping rectangle'),
-      )
+      originPx: {
+        x: bounds.left + rect.left + (lineOriginScript.x / playResX) * rect.width,
+        y: bounds.top + rect.top + (lineOriginScript.y / playResY) * rect.height,
+      },
     }
   }
 
   const canvasPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    // 鼠标状态跟踪（十字工具 Draw 的输入）：相对 overlay 的像素位置、Shift 状态、在台上
+    const bounds = event.currentTarget.getBoundingClientRect()
+    mouseStagePxRef.current = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }
+    mouseShiftRef.current = event.shiftKey
+    mouseOnStageRef.current = true
+    if (visualTool === 'video/tool/cross') scheduleOverlayRender()
     if (vclipRef.current) {
       vclipPointerMove(event)
       return
@@ -2373,13 +2720,23 @@ export function PreviewPane({
       rect.height /
       (media?.dummy ? media.dummy.height : Number(document.scriptInfo.PlayResY) || 1080)
     if (visualTool === 'video/tool/drag') {
-      const dx = Math.round((event.clientX - drag.startX) / scale)
-      const dy = Math.round((event.clientY - drag.startY) / scale)
-      onPatchCue(
-        drag.cue.id,
-        { text: setPosition(drag.cue.text, drag.baseX + dx, drag.baseY + dy) },
-        tPlain('Move subtitle'),
-      )
+      // 源码 Feature::UpdateDrag(mouse_pos - drag_start)：按 mousedown 起的位移量移动
+      const dx = (event.clientX - drag.startX) / scale
+      const dy = (event.clientY - drag.startY) / scale
+      const mo = readVisualOverrides(drag.cue.text)
+      // UpdateDrag：\move 行只更新起点，终点与 t1/t2 原样保留（Str() 两位小数去尾零）
+      const text = mo.move
+        ? setOverride(
+            drag.cue.text,
+            'move',
+            `(${floatToString(mo.move.x1 + dx)},${floatToString(mo.move.y1 + dy)},${floatToString(mo.move.x2)},${floatToString(mo.move.y2)}${
+              mo.move.t1 !== undefined && mo.move.t2 !== undefined
+                ? `,${mo.move.t1},${mo.move.t2}`
+                : ''
+            })`,
+          )
+        : setPosition(drag.cue.text, drag.baseX + dx, drag.baseY + dy)
+      scheduleDragCommit(() => onPatchCue(drag.cue.id, { text }, tPlain('visual typesetting')))
     } else if (visualTool === 'video/tool/scale') {
       let dx = ((event.clientX - drag.startX) / scale) * 1.25
       let dy = ((drag.startY - event.clientY) / scale) * 1.25
@@ -2387,31 +2744,47 @@ export function PreviewPane({
         if (Math.abs(dx) > Math.abs(dy)) dy = 0
         else dx = 0
       }
-      if (event.altKey) dx = dy = Math.abs(dx) > Math.abs(dy) ? dx : dy
+      // UpdateHold：Alt 锁定纵横比——短轴 delta 按初始缩放比换算
+      if (event.altKey) {
+        if (Math.abs(dx) > Math.abs(dy)) dy = dx * (drag.baseScaleY / drag.baseScaleX)
+        else dx = dy * (drag.baseScaleX / drag.baseScaleY)
+      }
       let sx = Math.max(0, drag.baseScaleX + dx)
       let sy = Math.max(0, drag.baseScaleY + dy)
       if (event.ctrlKey) {
         sx = Math.round(sx / 25) * 25
         sy = Math.round(sy / 25) * 25
       }
-      const text = setOverride(
-        setOverride(drag.cue.text, 'fscx', `${Math.round(sx)}`),
-        'fscy',
-        `${Math.round(sy)}`,
+      // UpdateHold：std::to_string((int)...) 截断取整；SetSelectedOverride 应用到全部选中行
+      const valueX = `${Math.trunc(sx)}`
+      const valueY = `${Math.trunc(sy)}`
+      scheduleDragCommit(() =>
+        onPatchCues(
+          selectedCues.map((cue) => ({
+            id: cue.id,
+            patch: { text: setOverride(setOverride(cue.text, 'fscx', valueX), 'fscy', valueY) },
+          })),
+          tPlain('visual typesetting'),
+        ),
       )
-      onPatchCue(drag.cue.id, { text }, tPlain('Scale subtitle'))
     } else if (visualTool === 'video/tool/rotate/z') {
-      const originX = drag.startX
-      const originY = drag.startY
-      let angle =
-        drag.baseRotationZ +
-        (Math.atan2(event.clientY - originY, event.clientX - originX) * 180) / Math.PI
+      // UpdateHold：angle 绕行原点（org->pos）旋转——originPx 在 pointerdown 时算好，
+      // 终值 = 基准角 + (原点→按下点角) − (原点→当前点角)
+      const a0 = Math.atan2(drag.originPx.y - drag.startY, drag.originPx.x - drag.startX)
+      const a1 = Math.atan2(drag.originPx.y - event.clientY, drag.originPx.x - event.clientX)
+      let angle = drag.baseRotationZ + ((a0 - a1) * 180) / Math.PI
       if (event.ctrlKey) angle = Math.round(angle / 30) * 30
       angle = ((angle % 360) + 360) % 360
-      onPatchCue(
-        drag.cue.id,
-        { text: setOverride(drag.cue.text, 'frz', angle.toFixed(2)) },
-        tPlain('Rotate subtitle'),
+      // SetSelectedOverride("\\frz", agi::format("%.4g", ...)) 应用到全部选中行
+      const value = formatG4(angle)
+      scheduleDragCommit(() =>
+        onPatchCues(
+          selectedCues.map((cue) => ({
+            id: cue.id,
+            patch: { text: setOverride(cue.text, 'frz', value) },
+          })),
+          tPlain('visual typesetting'),
+        ),
       )
     } else if (visualTool === 'video/tool/rotate/xy') {
       let rx = drag.baseRotationX - (event.clientY - drag.startY) * 2
@@ -2425,24 +2798,46 @@ export function PreviewPane({
         rx = Math.round(rx / 30) * 30
         ry = Math.round(ry / 30) * 30
       }
-      const text = setOverride(
-        setOverride(drag.cue.text, 'frx', `${((rx % 360) + 360) % 360}`),
-        'fry',
-        `${((ry % 360) + 360) % 360}`,
+      // UpdateHold：fmodf(angle + 360, 360) 后 agi::format("%.4g", ...)；
+      // SetSelectedOverride 应用到全部选中行
+      const valueX = formatG4(((rx % 360) + 360) % 360)
+      const valueY = formatG4(((ry % 360) + 360) % 360)
+      scheduleDragCommit(() =>
+        onPatchCues(
+          selectedCues.map((cue) => ({
+            id: cue.id,
+            patch: { text: setOverride(setOverride(cue.text, 'frx', valueX), 'fry', valueY) },
+          })),
+          tPlain('visual typesetting'),
+        ),
       )
-      onPatchCue(drag.cue.id, { text }, tPlain('Rotate subtitle'))
     } else if (visualTool === 'video/tool/clip') {
-      const bounds = stage.getBoundingClientRect()
+      const stageBounds = stage.getBoundingClientRect()
       const clipRect = mediaRect()
       const playResY = Number(document.scriptInfo.PlayResY) || 1080
       const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
-      const x2 = ((event.clientX - bounds.left - clipRect.left) / clipRect.width) * playResX
-      const y2 = ((event.clientY - bounds.top - clipRect.top) / clipRect.height) * playResY
-      const value = `(${Math.round(Math.min(drag.baseX, x2))},${Math.round(Math.min(drag.baseY, y2))},${Math.round(Math.max(drag.baseX, x2))},${Math.round(Math.max(drag.baseY, y2))})`
-      onPatchCue(
-        drag.cue.id,
-        { text: setOverride(drag.cue.text, 'clip', value) },
-        tPlain('Set clipping rectangle'),
+      // UpdateHold：cur_1/cur_2 都钳制在视频区域内
+      const rawX = ((event.clientX - stageBounds.left - clipRect.left) / clipRect.width) * playResX
+      const rawY = ((event.clientY - stageBounds.top - clipRect.top) / clipRect.height) * playResY
+      const x2 = clampToScript(rawX, playResX)
+      const y2 = clampToScript(rawY, playResY)
+      // CommitHold：ToScriptCoords(...).Str() 两位小数去尾零；\iclip 行保持 \iclip
+      // （源码按各行文本子串判断），提交消息为默认 "visual typesetting"
+      const clipX1 = floatToString(Math.min(drag.baseX, x2))
+      const clipY1 = floatToString(Math.min(drag.baseY, y2))
+      const clipX2 = floatToString(Math.max(drag.baseX, x2))
+      const clipY2 = floatToString(Math.max(drag.baseY, y2))
+      const value = `(${clipX1},${clipY1},${clipX2},${clipY2})`
+      scheduleDragCommit(() =>
+        onPatchCues(
+          selectedCues.map((cue) => ({
+            id: cue.id,
+            patch: {
+              text: setOverride(cue.text, /\\iclip/.test(cue.text) ? 'iclip' : 'clip', value),
+            },
+          })),
+          tPlain('visual typesetting'),
+        ),
       )
     }
   }
@@ -2457,14 +2852,47 @@ export function PreviewPane({
     const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
     const x = ((event.clientX - bounds.left - rect.left) / rect.width) * playResX
     const y = ((event.clientY - bounds.top - rect.top) / rect.height) * playResY
-    onPatchCue(
-      activeCue.id,
-      { text: setPosition(activeCue.text, x, y) },
-      tPlain('Position subtitle'),
-    )
+    // VisualToolCross::OnDoubleClick：d = 点击点 − 当前行位置；\move 行两端点与 \org
+    // 随 d 平移（保 t1/t2），无 \move 时写 \pos(点击点)。Text() = 显示宽 > 脚本宽时
+    // 3 位小数，否则 DStr 整数截断
+    const fmt = (v: number) => (rect.width > playResX ? floatToString(v, 3) : `${Math.trunc(v)}`)
+    const o = readVisualOverrides(activeCue.text)
+    const cur = o.pos ?? (o.move ? { x: o.move.x1, y: o.move.y1 } : null)
+    let dx = 0
+    let dy = 0
+    if (cur) {
+      dx = x - cur.x
+      dy = y - cur.y
+    } else {
+      // 无 \pos/\move 的默认位置近似为 hitbox 中心（\pos 本身仍精确写点击点，仅影响 \org 平移量）
+      const box = hitBoxesRef.current.find((item) => item.cue.id === activeCue.id)
+      if (box) {
+        dx = x - (box.left + box.right) / 2
+        dy = y - (box.top + box.bottom) / 2
+      }
+    }
+    let text = activeCue.text
+    if (o.move) {
+      const points = `${fmt(o.move.x1 + dx)},${fmt(o.move.y1 + dy)},${fmt(o.move.x2 + dx)},${fmt(o.move.y2 + dy)}`
+      text = setOverride(
+        text,
+        'move',
+        o.move.t1 !== undefined && o.move.t2 !== undefined
+          ? `(${points},${o.move.t1},${o.move.t2})`
+          : `(${points})`,
+      )
+    } else {
+      text = setOverride(text, 'pos', `(${fmt(x)},${fmt(y)})`)
+    }
+    if (o.org) text = setOverride(text, 'org', `(${fmt(o.org.x + dx)},${fmt(o.org.y + dy)})`)
+    onPatchCue(activeCue.id, { text }, tPlain('positioning'))
   }
 
   const canvasPointerUp = () => {
+    // 先同步冲刷最后一批拖拽提交（保持 flushNow 即时渲染路径），再退出拖拽态
+    flushDragCommit()
+    dragEndedAtRef.current = performance.now()
+    visualDragRef.current = false
     if (vclipRef.current) {
       vclipPointerUp()
       return
@@ -2757,8 +3185,8 @@ export function PreviewPane({
                 src={media.url}
                 preload="metadata"
                 style={{
-                  width: `${Math.round(intrinsicWidth * windowZoom * contentZoom)}px`,
-                  height: `${Math.round(intrinsicHeight * windowZoom * contentZoom)}px`,
+                  width: `${mediaCssSize(intrinsicWidth)}px`,
+                  height: `${mediaCssSize(intrinsicHeight)}px`,
                 }}
                 onLoadedMetadata={(event) => {
                   const value = Number.isFinite(event.currentTarget.duration)
@@ -2791,8 +3219,8 @@ export function PreviewPane({
                 className="webcodecs-video-wrap"
                 style={{
                   position: 'relative',
-                  width: `${Math.round(intrinsicWidth * windowZoom * contentZoom)}px`,
-                  height: `${Math.round(intrinsicHeight * windowZoom * contentZoom)}px`,
+                  width: `${mediaCssSize(intrinsicWidth)}px`,
+                  height: `${mediaCssSize(intrinsicHeight)}px`,
                 }}
               >
                 <canvas
@@ -2807,11 +3235,14 @@ export function PreviewPane({
                 className="dummy-video-stage"
                 aria-label={tPlain('Dummy video')}
                 style={{
-                  width: `${Math.round(media.dummy.width * windowZoom * contentZoom)}px`,
-                  height: `${Math.round(media.dummy.height * windowZoom * contentZoom)}px`,
+                  width: `${mediaCssSize(media.dummy.width)}px`,
+                  height: `${mediaCssSize(media.dummy.height)}px`,
                   background:
                     assRenderer && !assError
-                      ? dummyBackgroundCss(media.dummy, windowZoom * contentZoom)
+                      ? dummyBackgroundCss(
+                          media.dummy,
+                          (windowZoom * contentZoom) / (displayDpr > 0 ? displayDpr : 1),
+                        )
                       : undefined,
                 }}
               />
@@ -2832,6 +3263,12 @@ export function PreviewPane({
             onPointerMove={canvasPointerMove}
             onPointerUp={canvasPointerUp}
             onPointerCancel={canvasPointerUp}
+            onPointerLeave={() => {
+              // 鼠标离开视频区：清除十字工具状态并重绘擦除
+              mouseOnStageRef.current = false
+              mouseStagePxRef.current = null
+              if (visualTool === 'video/tool/cross') renderOverlay()
+            }}
             onDoubleClick={canvasDoubleClick}
           />
         </div>

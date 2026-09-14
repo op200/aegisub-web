@@ -18,7 +18,13 @@ interface SubtitleGridProps {
   textMode: GridTagsMode
   frameRate: Framerate
   frameMode: boolean
+  /** 视频已加载（IsDisplayed 前置条件：无视频不高亮 in-frame 行） */
+  hasVideo: boolean
   onSelect: (id: string, modifiers: { toggle: boolean; range: boolean }) => void
+  /** 块选（拖动）：anchor..row，union = ctrl 并集；App 端负责把锚点恢复为 fromId */
+  onSelectRange: (fromId: string, toId: string, union: boolean) => void
+  /** 当前锚点行（base_grid.cpp extendRow：shift 扩选/拖动块的起点） */
+  getAnchorId: () => string | null
   onActivate: (cue: SubtitleCue) => void
   onSetActive: (id: string) => void
   onCommand: (id: string) => void
@@ -262,7 +268,10 @@ export function SubtitleGrid({
   textMode,
   frameRate,
   frameMode,
+  hasVideo,
   onSelect,
+  onSelectRange,
+  getAnchorId,
   onActivate,
   onSetActive,
   onCommand,
@@ -275,6 +284,9 @@ export function SubtitleGrid({
   // 表头右键菜单（base_grid.cpp OnContextMenu：表头 → 列显隐菜单）
   const [headerMenu, setHeaderMenu] = useState<{ x: number; y: number } | null>(null)
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set())
+  // 拖动块选（base_grid.cpp holding 状态：锚点行 + 上次停留行）
+  const dragRef = useRef<{ anchorIndex: number; anchorId: string } | null>(null)
+  const dragLastRowRef = useRef(-1)
 
   useEffect(() => {
     const observer = new ResizeObserver(([entry]) => setHeight(entry.contentRect.height))
@@ -335,6 +347,109 @@ export function SubtitleGrid({
       ? { flex: '1 1 0%', minWidth: column.width }
       : { width: isHidden(column, index) ? 0 : widths[index] }
 
+  // ---- 鼠标选择（对齐 base_grid.cpp OnMouseEvent）----
+  const rowFromClientY = (clientY: number): number => {
+    const viewport = viewportRef.current
+    if (!viewport) return -1
+    const rect = viewport.getBoundingClientRect()
+    return Math.floor((clientY - rect.top + viewport.scrollTop) / ROW_HEIGHT)
+  }
+
+  // MakeRowVisible：行不可见时滚动（row-1 / 可见行数-3 边距语义）
+  const makeRowVisible = (row: number) => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const visibleRows = Math.max(1, Math.floor(viewport.clientHeight / ROW_HEIGHT))
+    const first = Math.floor(viewport.scrollTop / ROW_HEIGHT)
+    if (row < first + 1) scrollToRow(row - 1)
+    else if (row > first + visibleRows - 3) scrollToRow(row - visibleRows + 3)
+  }
+
+  const scrollToRow = (row: number) => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const clamped = Math.max(0, Math.min(row, Math.max(0, cues.length - 1)))
+    viewport.scrollTop = clamped * ROW_HEIGHT
+  }
+
+  const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    dragRef.current = null
+    if (!drag) return
+    event.currentTarget.releasePointerCapture(event.pointerId)
+    // 源码 LeftUp：MakeRowVisible(mid(0, row, GetRows()-1))，按释放位置取行
+    const row = Math.max(0, Math.min(rowFromClientY(event.clientY), cues.length - 1))
+    makeRowVisible(row)
+    dragLastRowRef.current = -1
+  }
+
+  // 双击处理挂 viewport 委托：行的 pointerdown 会 setPointerCapture，dblclick 被
+  // 重定向到 capture 元素（行上的监听永远收不到）。base_grid.cpp OnMouseEvent dclick
+  // 分支：无修饰键时 ScrollToActiveLine + JumpToTime(Start) + SelectRow（onActivate）
+  const onViewportDoubleClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return
+    const cue = cues[rowFromClientY(event.clientY)]
+    if (!cue) return
+    onActivate(cue)
+  }
+
+  const onViewportPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    // 只在行上起效（点空白/滚动条不改变选区，同源码 dlg 为空时跳过）
+    const target = event.target as HTMLElement
+    if (!target.closest('.subtitle-row')) return
+    const index = rowFromClientY(event.clientY)
+    const cue = cues[index]
+    if (!cue) return
+    const shift = event.shiftKey
+    const ctrl = event.ctrlKey || event.metaKey
+    const alt = event.altKey
+    // 锚点取当前 extendRow；行已删除或为空时退回点击行
+    const anchorId = getAnchorId()
+    const validAnchor = anchorId && cues.some((c) => c.id === anchorId) ? anchorId : cue.id
+    // 源码 extendRow 在本事件内先设为点击行，仅 shift 块选分支恢复 old_extend：
+    // 拖动块选锚点 = shift+单击 ? 原锚点行 : 点击行（plain/ctrl/alt 都以点击行为锚）
+    const blockAnchorId = shift && !alt ? validAnchor : cue.id
+    const blockAnchorIndex =
+      shift && !alt
+        ? Math.max(
+            0,
+            cues.findIndex((c) => c.id === validAnchor),
+          )
+        : index
+    dragRef.current = { anchorIndex: blockAnchorIndex, anchorId: blockAnchorId }
+    dragLastRowRef.current = index
+    event.currentTarget.setPointerCapture(event.pointerId)
+    if (ctrl && !shift && !alt) onSelect(cue.id, { toggle: true, range: false })
+    else if (shift && !alt) onSelectRange(validAnchor, cue.id, ctrl)
+    else if (alt && !shift && !ctrl) onSetActive(cue.id)
+    else onSelect(cue.id, { toggle: false, range: false })
+  }
+
+  const onViewportPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    if (!drag) return
+    // holding 期间行号钳制到合法范围（源码 mid(0, row, GetRows()-1)）
+    const row = Math.max(0, Math.min(rowFromClientY(event.clientY), cues.length - 1))
+    // 滚动检查每次 move 都执行，与"是否换行"无关（源码 row != extendRow，锚点为比较基准）
+    if (row !== drag.anchorIndex) {
+      const viewport = viewportRef.current
+      if (viewport) {
+        // 边缘自动滚动（源码 ScrollTo(yPos ± 3)）
+        const yPos = Math.floor(viewport.scrollTop / ROW_HEIGHT)
+        const visibleRows = Math.max(1, Math.floor(viewport.clientHeight / ROW_HEIGHT))
+        if (row <= yPos) scrollToRow(yPos - 3)
+        else if (row > yPos + visibleRows - (row > drag.anchorIndex ? 3 : 1)) scrollToRow(yPos + 3)
+      }
+    }
+    if (row === dragLastRowRef.current) return
+    dragLastRowRef.current = row
+    const cue = cues[row]
+    if (!cue) return
+    // 活动行跟随鼠标（源码每次 mouse move SetActiveLine）
+    onSelectRange(drag.anchorId, cue.id, event.ctrlKey || event.metaKey)
+  }
+
   // base_grid.cpp OnKeyDown：方向/翻页/行首行尾移动，Alt 仅移活动行，Shift 扩选
   const moveByKeyboard = (event: React.KeyboardEvent<HTMLDivElement>) => {
     if (event.ctrlKey || event.metaKey || (event.altKey && event.shiftKey)) return
@@ -372,6 +487,7 @@ export function SubtitleGrid({
     }
     if (event.shiftKey && !event.altKey && activeId) {
       onSelect(next.id, { toggle: false, range: true })
+      makeRowVisible(nextIndex)
       return
     }
     onSelect(next.id, { toggle: false, range: false })
@@ -407,9 +523,14 @@ export function SubtitleGrid({
             className="subtitle-grid-viewport"
             tabIndex={0}
             data-shortcut-context="Subtitle Grid"
-            onPointerDown={(event) => {
+            onPointerDown={onViewportPointerDown}
+            onPointerMove={onViewportPointerMove}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+            onDoubleClick={onViewportDoubleClick}
+            onPointerDownCapture={() => {
               // Subtitle/Grid/Focus Allow：关闭时点击不夺取焦点（基_grid FocusGrid）
-              if (getOptionBool('Subtitle/Grid/Focus Allow')) event.currentTarget.focus()
+              if (getOptionBool('Subtitle/Grid/Focus Allow')) viewportRef.current?.focus()
             }}
             onKeyDown={moveByKeyboard}
             onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
@@ -418,84 +539,84 @@ export function SubtitleGrid({
             onContextMenu={(event) => event.preventDefault()}
           >
             <div style={{ height: cues.length * ROW_HEIGHT, position: 'relative' }}>
-              {cues.slice(range.start, range.end).map((cue, offset) => {
-                const index = range.start + offset
-                // Subtitle/Grid/Highlight Subtitles in Frame：当前帧可见行高亮
-                const activeAtTime =
-                  getOptionBool('Subtitle/Grid/Highlight Subtitles in Frame') &&
-                  !cue.comment &&
-                  cue.startMs <= currentTimeMs &&
-                  cue.endMs >= currentTimeMs
-                const cps = cpsOf(cue)
-                return (
-                  <div
-                    key={cue.id}
-                    className={`subtitle-row grid-columns${selectedIds.has(cue.id) ? ' selected' : ''}${cue.id === activeId ? ' active' : ''}${activeAtTime ? ' at-time' : ''}${cue.comment ? ' comment' : ''}`}
-                    style={{ transform: `translateY(${index * ROW_HEIGHT}px)` }}
-                    role="row"
-                    aria-rowindex={index + 1}
-                    onClick={(event) =>
-                      onSelect(cue.id, {
-                        toggle: event.ctrlKey || event.metaKey,
-                        range: event.shiftKey,
-                      })
-                    }
-                    onDoubleClick={() => onActivate(cue)}
-                    onContextMenu={(event) => {
-                      event.preventDefault()
-                      if (!selectedIds.has(cue.id))
-                        onSelect(cue.id, { toggle: false, range: false })
-                      setContext({ x: event.clientX, y: event.clientY })
-                    }}
-                  >
-                    <span className="row-number" style={{ width: widths[0] }}>
-                      {index + 1}
-                    </span>
-                    {GRID_COLUMNS.slice(1).map((column, colOffset) => {
-                      const colIndex = colOffset + 1
-                      const cls = `${column.fill ? 'grid-fill' : ''}${isHidden(column, colIndex) ? ' grid-hidden' : ''}`
-                      if (column.key === 'cps') {
-                        // 超过 CPS Error Threshold 时用 Colour/Subtitle Grid/CPS Error 着色
-                        const cpsError = getOptionInt(
-                          'Subtitle/Character Counter/CPS Error Threshold',
-                        )
-                        const over = cps !== null && cps > cpsError
+              {(() => {
+                // 当前视频帧号（IsDisplayed 按帧号比较，与行无关，提出循环）
+                const frameNow =
+                  hasVideo && frameRate.isLoaded() ? frameRate.frameAtTime(currentTimeMs) : null
+                return cues.slice(range.start, range.end).map((cue, offset) => {
+                  const index = range.start + offset
+                  // Subtitle/Grid/Highlight Subtitles in Frame：当前帧可见行高亮
+                  // IsDisplayed（base_grid.cpp）：按帧号比较 FrameAtTime(Start/End)，
+                  // 不排除注释行，且需要视频已加载
+                  const activeAtTime =
+                    frameNow !== null &&
+                    getOptionBool('Subtitle/Grid/Highlight Subtitles in Frame') &&
+                    frameRate.frameAtTime(cue.startMs, 'start') <= frameNow &&
+                    frameRate.frameAtTime(cue.endMs, 'end') >= frameNow
+                  const cps = cpsOf(cue)
+                  return (
+                    <div
+                      key={cue.id}
+                      className={`subtitle-row grid-columns${selectedIds.has(cue.id) ? ' selected' : ''}${cue.id === activeId ? ' active' : ''}${activeAtTime ? ' at-time' : ''}${cue.comment ? ' comment' : ''}`}
+                      style={{ transform: `translateY(${index * ROW_HEIGHT}px)` }}
+                      role="row"
+                      aria-rowindex={index + 1}
+                      onContextMenu={(event) => {
+                        event.preventDefault()
+                        if (!selectedIds.has(cue.id))
+                          onSelect(cue.id, { toggle: false, range: false })
+                        setContext({ x: event.clientX, y: event.clientY })
+                      }}
+                    >
+                      <span className="row-number" style={{ width: widths[0] }}>
+                        {index + 1}
+                      </span>
+                      {GRID_COLUMNS.slice(1).map((column, colOffset) => {
+                        const colIndex = colOffset + 1
+                        const cls = `${column.fill ? 'grid-fill' : ''}${isHidden(column, colIndex) ? ' grid-hidden' : ''}`
+                        if (column.key === 'cps') {
+                          // 超过 CPS Error Threshold 时用 Colour/Subtitle Grid/CPS Error 着色
+                          const cpsError = getOptionInt(
+                            'Subtitle/Character Counter/CPS Error Threshold',
+                          )
+                          const over = cps !== null && cps > cpsError
+                          return (
+                            <span
+                              className={`grid-cell-centered grid-cps ${cls}${over ? ' cps-error' : ''}`}
+                              style={cellStyle(column, colIndex)}
+                              key={column.key}
+                            >
+                              {cps ?? ''}
+                            </span>
+                          )
+                        }
+                        if (column.key === 'text') {
+                          const shown = displayText(cue.text, textMode)
+                          return (
+                            <span
+                              className={`cue-text ${cls}`}
+                              style={cellStyle(column, colIndex)}
+                              key={column.key}
+                              title={cue.text}
+                            >
+                              {shown || '\u00a0'}
+                            </span>
+                          )
+                        }
                         return (
                           <span
-                            className={`grid-cell-centered grid-cps ${cls}${over ? ' cps-error' : ''}`}
+                            className={`${column.centered ? 'grid-cell-centered' : ''} ${cls}`}
                             style={cellStyle(column, colIndex)}
                             key={column.key}
                           >
-                            {cps ?? ''}
+                            {cellValue(cue, column.key, frameRate, frameMode)}
                           </span>
                         )
-                      }
-                      if (column.key === 'text') {
-                        const shown = displayText(cue.text, textMode)
-                        return (
-                          <span
-                            className={`cue-text ${cls}`}
-                            style={cellStyle(column, colIndex)}
-                            key={column.key}
-                            title={cue.text}
-                          >
-                            {shown || '\u00a0'}
-                          </span>
-                        )
-                      }
-                      return (
-                        <span
-                          className={`${column.centered ? 'grid-cell-centered' : ''} ${cls}`}
-                          style={cellStyle(column, colIndex)}
-                          key={column.key}
-                        >
-                          {cellValue(cue, column.key, frameRate, frameMode)}
-                        </span>
-                      )
-                    })}
-                  </div>
-                )
-              })}
+                      })}
+                    </div>
+                  )
+                })
+              })()}
             </div>
           </div>
         </div>

@@ -2,6 +2,7 @@ import { Check, ChevronRight } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 import type { RecentLists } from '../../storage/recentStore'
+import { commandIcon } from '../aegisubIcons'
 import { getAegisubMenus, groupMacroMenuItems } from '../aegisubMenus'
 import { COMMANDS, primaryShortcut, type MenuItemDefinition } from '../commands'
 import { t, tFmt, tPlain, useLocaleVersion } from '../i18n'
@@ -70,6 +71,12 @@ export function MenuBar({
     setOpenSubmenu(null)
   }
 
+  // 菜单项图标（menu.cpp SetBitmap(co->Icon())：命令带 16px 位图图标；无图标处空占位保持对齐）
+  const renderIcon = (command?: string) => {
+    const icon = command ? commandIcon(command, 16) : undefined
+    return icon ? <img className="menu-icon" src={icon} alt="" /> : <span className="menu-icon" />
+  }
+
   const renderItem = (item: MenuItemDefinition, key: string) => {
     if (item.separator) return <div className="menu-separator" role="separator" key={key} />
 
@@ -94,6 +101,7 @@ export function MenuBar({
           onPointerEnter={() => setOpenSubmenu(submenuId)}
         >
           <span className="menu-check" />
+          {renderIcon()}
           <span className="menu-label">{item.label ?? 'Recent'}</span>
           <span />
           <ChevronRight size={13} />
@@ -122,6 +130,7 @@ export function MenuBar({
           onPointerEnter={() => setOpenSubmenu(item.submenu!.id)}
         >
           <span className="menu-check" />
+          {renderIcon()}
           <span className="menu-label">{item.submenu.label}</span>
           <span />
           <ChevronRight size={13} />
@@ -140,6 +149,7 @@ export function MenuBar({
       return (
         <button className="menu-item" role="menuitem" disabled key={key}>
           <span className="menu-check" />
+          {renderIcon()}
           <span className="menu-label">{item.label}</span>
         </button>
       )
@@ -172,6 +182,7 @@ export function MenuBar({
         }}
       >
         <span className="menu-check">{checked ? <Check size={13} /> : null}</span>
+        {renderIcon(item.command)}
         <span className="menu-label">{label}</span>
         <span className="menu-shortcut">{primaryShortcut(item.command)}</span>
         <span />

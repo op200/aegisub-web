@@ -418,11 +418,18 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     checked: (ctx) => ctx.gridTags === 'simplify',
   },
   'grid/tag/cycle_hiding': {
-    // Aegisub grid.cpp：mode 0 显示 → 1 简化(☀) → 2 隐藏 → 循环
+    // Aegisub grid.cpp：mode 0 显示 → 1 简化(☀) → 2 隐藏 → 循环，并提示当前模式
     run: (ctx, api) => {
       const next: GridTagsMode =
         ctx.gridTags === 'show' ? 'simplify' : ctx.gridTags === 'simplify' ? 'hide' : 'show'
       api.setGridTags(next)
+      api.setStatus(
+        next === 'show'
+          ? 'ASS Override Tag mode set to show full tags.'
+          : next === 'simplify'
+            ? 'ASS Override Tag mode set to simplify tags.'
+            : 'ASS Override Tag mode set to hide tags.',
+      )
     },
   },
   'subtitle/select/all': {
@@ -618,19 +625,34 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     run: (_, api) => api.openDialog('video-details'),
   },
   'video/jump': {
-    run: (_, api) => api.openDialog('jump'),
+    // video.cpp：先停止播放再弹出跳转框
+    run: (_, api) => {
+      api.sendVideoAction('stop')
+      api.openDialog('jump')
+    },
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/jump/start': {
     run: (ctx, api) => {
-      if (ctx.activeCue) api.setVideoTime(ctx.activeCue.startMs)
+      if (ctx.activeCue)
+        // video.cpp：JumpToFrame(FrameAtTime(Start, START))，落帧 EXACT 时间
+        api.setVideoTime(
+          ctx.frameRate.timeAtFrame(
+            ctx.frameRate.frameAtTime(ctx.activeCue.startMs, 'start'),
+            'exact',
+          ),
+        )
     },
     // video.cpp validator_video_loaded：仅要求视频已加载，无活动行时 no-op
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/jump/end': {
     run: (ctx, api) => {
-      if (ctx.activeCue) api.setVideoTime(ctx.activeCue.endMs)
+      if (ctx.activeCue)
+        // video.cpp：JumpToFrame(FrameAtTime(End, END))
+        api.setVideoTime(
+          ctx.frameRate.timeAtFrame(ctx.frameRate.frameAtTime(ctx.activeCue.endMs, 'end'), 'exact'),
+        )
     },
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
@@ -681,20 +703,44 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
       ),
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
-  // video.cpp：跳到相邻的字幕起止边界（全部行的 Start/End 收集排序）
+  // video.cpp video_frame_prev|next_boundary：活动行起止边界定帧跳转
   'video/frame/prev/boundary': {
     run: (ctx, api) => {
-      const times = boundaryTimes(ctx)
-      const prev = times.filter((time) => time < ctx.videoTimeMs).pop()
-      api.setVideoTime(prev ?? 0)
+      // video.cpp video_frame_prev_boundary：仅活动行边界，FrameAtTime 定帧比较
+      const line = ctx.activeCue
+      if (!line) return
+      const jumpToFrame = (frame: number) =>
+        api.setVideoTime(ctx.frameRate.timeAtFrame(frame, 'exact'))
+      const endFrame = ctx.frameRate.frameAtTime(line.endMs, 'end')
+      if (endFrame < ctx.currentFrame) return jumpToFrame(endFrame)
+      const startFrame = ctx.frameRate.frameAtTime(line.startMs, 'start')
+      if (startFrame < ctx.currentFrame) return jumpToFrame(startFrame)
+      // 两边界都不在当前帧之前 → PrevLine 并无条件跳其行尾（JumpToTime(End, END)）
+      const index = ctx.core.document.cues.findIndex((cue) => cue.id === line.id)
+      const prev = ctx.core.document.cues[index - 1]
+      if (!prev) return
+      api.selectLines([prev.id])
+      jumpToFrame(ctx.frameRate.frameAtTime(prev.endMs, 'end'))
     },
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/frame/next/boundary': {
     run: (ctx, api) => {
-      const times = boundaryTimes(ctx)
-      const next = times.find((time) => time > ctx.videoTimeMs)
-      api.setVideoTime(next ?? ctx.videoDurationMs)
+      // video.cpp video_frame_next_boundary：仅活动行边界，FrameAtTime 定帧比较
+      const line = ctx.activeCue
+      if (!line) return
+      const jumpToFrame = (frame: number) =>
+        api.setVideoTime(ctx.frameRate.timeAtFrame(frame, 'exact'))
+      const startFrame = ctx.frameRate.frameAtTime(line.startMs, 'start')
+      if (startFrame > ctx.currentFrame) return jumpToFrame(startFrame)
+      const endFrame = ctx.frameRate.frameAtTime(line.endMs, 'end')
+      if (endFrame > ctx.currentFrame) return jumpToFrame(endFrame)
+      // 两边界都不在当前帧之后 → NextLine 并无条件跳其行首（JumpToTime(Start)）
+      const index = ctx.core.document.cues.findIndex((cue) => cue.id === line.id)
+      const next = ctx.core.document.cues[index + 1]
+      if (!next) return
+      api.selectLines([next.id])
+      jumpToFrame(ctx.frameRate.frameAtTime(next.startMs, 'start'))
     },
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
@@ -1014,10 +1060,13 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
 
   // ---- 工具/附加功能（Web 版提供状态提示，保持按钮可用与 Aegisub 一致）----
   'subtitle/select/visible': {
+    // subtitle.cpp：按帧号比较（FrameAtTime START/END），注释行同样参与选择
     run: (ctx, api) => {
       const visible = ctx.core.document.cues
         .filter(
-          (cue) => !cue.comment && cue.startMs <= ctx.videoTimeMs && cue.endMs >= ctx.videoTimeMs,
+          (cue) =>
+            ctx.frameRate.frameAtTime(cue.startMs, 'start') <= ctx.currentFrame &&
+            ctx.frameRate.frameAtTime(cue.endMs, 'end') >= ctx.currentFrame,
         )
         .map((cue) => cue.id)
       api.selectLines(visible)
@@ -1039,12 +1088,18 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     run: (_, api) => api.openDialog('automation'),
   },
   'tool/style/assistant': {
+    // 源码无 Validate：按钮恒可用（无活动行时 Web 对话框不渲染）
     run: (_, api) => api.openDialog('styling-assistant'),
-    enabled: (ctx) => Boolean(ctx.activeCue),
   },
   'tool/translation_assistant': {
-    run: (_, api) => api.openDialog('translation'),
-    enabled: (ctx) => Boolean(ctx.activeCue),
+    // 源码无 Validate；NothingToTranslate 时提示（Web 版无活动行时同样提示）
+    run: (ctx, api) => {
+      if (!ctx.activeCue) {
+        api.setStatus('There is nothing to translate in the file.')
+        return
+      }
+      api.openDialog('translation')
+    },
   },
   'tool/resampleres': {
     run: (_, api) => api.openDialog('resample'),
@@ -1057,11 +1112,9 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   },
   'tool/time/kanji': {
     run: (_, api) => api.openDialog('kanji-timer'),
-    enabled: (ctx) => Boolean(ctx.activeCue),
   },
   'subtitle/spellcheck': {
     run: (_, api) => api.openDialog('spellcheck'),
-    enabled: (ctx) => Boolean(ctx.activeCue),
   },
   'app/options': {
     run: (_, api) => api.openDialog('options'),
@@ -1563,14 +1616,4 @@ async function splitLinesAtCursor(
   commands.push({ type: 'updateCue', id: activeCue.id, patch: leftPatch })
   commands.push({ type: 'addCue', afterId: activeCue.id, cue: right })
   await api.apply(commands, 'split')
-}
-
-/** 全部行的 Start/End 去重排序（video/frame/*\/boundary 的边界表） */
-function boundaryTimes(ctx: CommandContext): number[] {
-  const times = new Set<number>()
-  for (const cue of ctx.core.document.cues) {
-    times.add(cue.startMs)
-    times.add(cue.endMs)
-  }
-  return [...times].sort((a, b) => a - b)
 }

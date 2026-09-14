@@ -36,6 +36,8 @@ interface AudioPaneProps {
   onSeek: (timeMs: number) => void
   onVideoSeek: (timeMs: number) => void
   mediaAction: { sequence: number; type: string }
+  /** 双击网格行的 ScrollToActiveLine 请求（App nonce，Waveform 无条件滚到活动行） */
+  scrollToActiveLine: number
   onDurationChange: (durationMs: number) => void
   onPatchCue: (id: string, patch: Partial<Omit<SubtitleCue, 'id'>>, label: string) => void
   onCommand: (id: string) => void
@@ -449,6 +451,7 @@ export function AudioPane(props: AudioPaneProps) {
           karaokeMode={props.karaokeMode}
           playing={props.playing}
           autoScroll={options.autoScroll}
+          scrollToActiveLine={props.scrollToActiveLine}
           view={view}
           zoomLevel={zoomLevel}
           amplitude={amplitude}

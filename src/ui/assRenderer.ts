@@ -32,6 +32,8 @@ import { logInfo, logWarning } from './log'
 export interface AssRenderer {
   /** 全量替换 track（内部防抖） */
   setTrack(content: string): void
+  /** 立即替换 track 并补绘（视觉工具拖拽逐帧同步：源码每次鼠标事件 Commit+Render） */
+  flushNow(content: string): void
   /**
    * 渲染某一时刻。storage 为视频分辨率坐标（真实视频 = videoWidth/Height，
    * dummy = dummy 宽高），同时把 canvas 对齐到宿主内媒体元素的位置与尺寸。
@@ -317,6 +319,15 @@ export async function createAssRenderer(
       .catch(() => {})
   }
 
+  /** 换 track + 补绘一帧（不注册字体——拖拽中数值变化不引入新字体，首次加载走 flushTrack） */
+  const applyTrack = (content: string) => {
+    if (!instance) return
+    instance.renderer.setTrack(content)
+    // jassub 的 setTrack 只换 track 不重绘；暂停状态下没有下一帧渲染 demand，
+    // 必须手动补一帧，编辑器里改字才能即时反映到画面（对应原版实时预览）
+    redrawLast()
+  }
+
   const flushTrack = () => {
     trackTimer = null
     if (!pendingTrack || !instance) return
@@ -324,10 +335,22 @@ export async function createAssRenderer(
     pendingTrack = null
     // 先增量注册新引用的系统字体（异步），再换 track；字体就绪后补绘
     syncSystemFonts(content)
-    instance.renderer.setTrack(content)
-    // jassub 的 setTrack 只换 track 不重绘；暂停状态下没有下一帧渲染 demand，
-    // 必须手动补一帧，编辑器里改字才能即时反映到画面（对应原版实时预览）
-    redrawLast()
+    applyTrack(content)
+  }
+
+  /** 拖拽合流：源码 async_video_provider 用版本号丢弃中间请求（UpdateSubtitles →
+   * ProcAsync 只跑最新版本），web 等价实现是 rAF 合流——高频 flushNow 只保留
+   * 最新内容，按显示帧节拍应用一次，避免每次 pointermove 都全量重解析+重渲染 */
+  let pendingFlush: string | null = null
+  let flushRaf = 0
+  const scheduleFlush = () => {
+    if (flushRaf) return
+    flushRaf = requestAnimationFrame(() => {
+      flushRaf = 0
+      const content = pendingFlush
+      pendingFlush = null
+      if (content !== null) applyTrack(stripBom(content))
+    })
   }
 
   /** canvas 对齐宿主内的媒体元素（video / WebCodecs 包裹层 / dummy 框），未打开媒体时隐藏 */
@@ -352,6 +375,16 @@ export async function createAssRenderer(
       if (trackTimer) clearTimeout(trackTimer)
       trackTimer = setTimeout(flushTrack, SET_TRACK_DEBOUNCE_MS)
     },
+    flushNow(content) {
+      if (trackTimer) {
+        clearTimeout(trackTimer)
+        trackTimer = null
+      }
+      pendingTrack = null
+      // rAF 合流（见 scheduleFlush 注释）：帧节拍内多次调用只应用最后一份
+      pendingFlush = content
+      scheduleFlush()
+    },
     render(timeMs, storageWidth, storageHeight) {
       if (!instance) return
       syncCanvasBox()
@@ -373,6 +406,9 @@ export async function createAssRenderer(
       redrawTimers = []
       if (trackTimer) clearTimeout(trackTimer)
       trackTimer = null
+      if (flushRaf) cancelAnimationFrame(flushRaf)
+      flushRaf = 0
+      pendingFlush = null
       pendingTrack = null
       lastRender = null
       const target = instance

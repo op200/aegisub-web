@@ -24,8 +24,15 @@ describe('ASS visual overrides', () => {
   })
 
   it('adds and replaces overrides while preserving other tags', () => {
-    expect(setOverride('{\\b1}Text', 'fscx', '125')).toBe('{\\fscx125\\b1}Text')
+    // SetOverride：首个覆写块内删除同名/互删标签后追加到块尾（AddTag）
+    expect(setOverride('{\\b1}Text', 'fscx', '125')).toBe('{\\b1\\fscx125}Text')
     expect(setOverride('{\\b1\\fscx80}Text', 'fscx', '125')).toBe('{\\b1\\fscx125}Text')
-    expect(setPosition('{\\move(0,0,10,10)\\b1}Text', 12, 34)).toBe('{\\pos(12,34)\\b1}Text')
+    expect(setPosition('{\\move(0,0,10,10)\\b1}Text', 12, 34)).toBe('{\\b1\\pos(12,34)}Text')
+  })
+
+  it('prepends a new override block when the first block is plain or comment', () => {
+    // 首块非覆写块：整体前插 {tag value}，注释块原样保留
+    expect(setOverride('Text', 'pos', '(1,2)')).toBe('{\\pos(1,2)}Text')
+    expect(setOverride('{comment}Text', 'pos', '(1,2)')).toBe('{\\pos(1,2)}{comment}Text')
   })
 })

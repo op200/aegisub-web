@@ -36,10 +36,13 @@ function endPoint(curve: SplineCurve): Vec2 {
   return curve.type === 'line' ? curve.p2 : curve.p4
 }
 
-/** float_to_string(x, 2)：两位小数并去尾零（utils.cpp Vector2D::Str） */
+/** float_to_string(x, 2)（utils.cpp）：两位小数并按源码截断逻辑去尾零 */
 function formatCoord(value: number): string {
   const text = value.toFixed(2)
-  return text.includes('.') ? text.replace(/0+$/, '').replace(/\.$/, '') : text
+  let pos = text.length - 1
+  while (pos > 0 && text[pos] === '0') pos--
+  if (pos !== text.indexOf('.')) pos++
+  return text.slice(0, pos)
 }
 
 export class Spline {

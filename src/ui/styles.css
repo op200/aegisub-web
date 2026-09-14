@@ -200,7 +200,7 @@ button:disabled {
   width: 100%;
   height: 25px;
   display: grid;
-  grid-template-columns: 18px minmax(145px, 1fr) max-content 14px;
+  grid-template-columns: 18px 18px minmax(145px, 1fr) max-content 14px;
   align-items: center;
   gap: 6px;
   padding: 0 5px 0 2px;
@@ -218,6 +218,11 @@ button:disabled {
 .menu-check {
   display: grid;
   place-items: center;
+}
+.menu-icon {
+  width: 16px;
+  height: 16px;
+  display: block;
 }
 .menu-shortcut {
   padding-left: 20px;
@@ -336,6 +341,20 @@ button:disabled {
   /* Aegisub Audio/Display Height = 200 */
   display: grid;
   grid-template-rows: 200px minmax(0, 1fr);
+}
+/* AudioBox（wxSashWindow）底边 sash：SetSashVisible(wxSASH_BOTTOM, true) 的 3D 分隔条，
+   拖动改变音频栏高度（OnSashDrag → SetMinSize → Layout） */
+.audio-sash {
+  height: 4px;
+  cursor: ns-resize;
+  background: var(--border-dark);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.35);
+  touch-action: none;
+  user-select: none;
+}
+.audio-sash:hover {
+  background: var(--hover-border);
 }
 .preview-panel {
   min-width: 0;
@@ -1186,19 +1205,21 @@ button:disabled {
   color: var(--grid-cps-error, #ff0000);
   font-weight: 700;
 }
-/* Aegisub Colour/Subtitle Grid 配色（Preferences → Interface → Colors 可改） */
+/* Aegisub Colour/Subtitle Grid 配色（Preferences → Interface → Colors 可改）
+   背景优先级同 base_grid.cpp OnPaint：SelectedComment > Selection > Comment > Default，
+   Inframe 仅当背景仍为 Default 时应用（因此用 :not 限定） */
 .subtitle-row.selected {
   background: var(--grid-sel-bg, #ceffe7);
   color: var(--grid-sel-fg, #000);
 }
 .subtitle-row.comment {
+  /* 源码注释行只改背景，前景仍走 standard/selection 文本色 */
   background: var(--grid-comment-bg, #d8def5);
-  color: var(--text-soft);
 }
 .subtitle-row.selected.comment {
   background: var(--grid-sel-comment-bg, #d3eeee);
 }
-.subtitle-row.at-time {
+.subtitle-row.at-time:not(.selected):not(.comment) {
   background: var(--grid-inframe-bg, #fffdea);
 }
 .subtitle-row.active {
@@ -1209,6 +1230,10 @@ button:disabled {
   justify-content: flex-end;
   color: var(--grid-left-fg);
   background: var(--grid-left-bg, #c4ecd1);
+}
+/* 选中行前景色（Colour/Subtitle Grid/Selection）作用于所有列含行号列 */
+.subtitle-row.selected .row-number {
+  color: var(--grid-sel-fg, #000);
 }
 
 .grid-context-menu {
@@ -2042,6 +2067,51 @@ button:disabled {
 }
 .dialog-spacer {
   flex: 1;
+}
+/* Timing Post-Processor（dialog_timing_processor.cpp：左样式清单 + 右选项组） */
+.timing-columns {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.timing-styles {
+  width: 170px;
+  flex-shrink: 0;
+}
+.dialog-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--border-dark);
+  padding: 4px;
+}
+.timing-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.timing-thresholds {
+  display: grid;
+  grid-template-columns: auto 70px;
+  gap: 4px 8px;
+  align-items: center;
+}
+.timing-number {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.timing-number input[type='number'] {
+  width: 70px;
+}
+.dialog-error {
+  color: var(--error);
+  margin: 8px 0 0;
 }
 
 /* ---- Browser cache 页 ---- */

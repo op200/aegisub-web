@@ -13,6 +13,7 @@ import {
 } from '../../storage/styleCatalogStore'
 import { assColorToCss, assColorToHex, hexToAssColor } from '../color'
 import { tPlain } from '../i18n'
+import { useEscapeClose } from './dialogs'
 
 interface Props {
   styles: SubtitleStyle[]
@@ -77,6 +78,8 @@ export function StyleManagerDialog({
   onDelete,
   onReorder,
 }: Props) {
+  // ESC 关闭（嵌套 StyleEditor 后挂载于栈顶，先于主窗响应）
+  useEscapeClose(onClose)
   const [catalogs, setCatalogs] = useState<StyleCatalog[]>(loadStyleCatalogs)
   const [catalogName, setCatalogName] = useState(catalogs[0]?.name ?? 'Default')
   const catalog = catalogs.find((item) => item.name === catalogName) ?? catalogs[0]
@@ -331,6 +334,8 @@ function StyleEditor({
   onCancel: () => void
   onApply: (style: SubtitleStyle) => void
 }) {
+  // ESC 关闭编辑器（栈顶优先于主窗）
+  useEscapeClose(onCancel)
   const [draft, setDraft] = useState(structuredClone(style))
   // 预览文本（dialog_style_editor.cpp PreviewText：OPT_GET 初值 + 析构 OPT_SET）
   const [previewText, setPreviewText] = useState(() =>

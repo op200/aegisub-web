@@ -1,8 +1,15 @@
 import { X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
-import { getOptionBool, getOptionInt, getOptionString, setOption } from '../../config/options'
+import {
+  getOptionBool,
+  getOptionDouble,
+  getOptionInt,
+  getOptionString,
+  setOption,
+} from '../../config/options'
 import { formatEditorTime, formatVideoTime } from '../../core/time'
+import { processTiming } from '../../core/timingProcessor'
 import type { CoreCommand, SubtitleCue, SubtitleStyle } from '../../core/types'
 import { Framerate } from '../../core/vfr'
 import type { DummyVideoOptions, MediaSource } from '../../platform/types'
@@ -17,6 +24,7 @@ import {
   setLocale,
   storeLanguage,
   t,
+  tFmt,
   tPlain,
 } from '../i18n'
 
@@ -27,15 +35,47 @@ interface DialogProps {
   footer?: React.ReactNode
 }
 
+// 弹窗 ESC 关闭栈：挂载顺序即层级顺序，仅栈顶弹窗响应 ESC（多级弹窗逐层关闭）。
+// 冒泡阶段监听——热键捕获（capture 阶段 stopPropagation）可优先拦截。
+type EscapeHandler = () => void
+const escapeStack: EscapeHandler[] = []
+let escapeListenerInstalled = false
+
+function ensureEscapeListener() {
+  if (escapeListenerInstalled) return
+  escapeListenerInstalled = true
+  window.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || event.defaultPrevented) return
+    const top = escapeStack[escapeStack.length - 1]
+    if (!top) return
+    event.preventDefault()
+    event.stopPropagation()
+    top()
+  })
+}
+
+/** 注册到 ESC 关闭栈；active=false 时不响应（如 findMode 为 null 时） */
+export function useEscapeClose(onClose: () => void, active = true) {
+  const ref = useRef(onClose)
+  useEffect(() => {
+    ref.current = onClose
+  })
+  useEffect(() => {
+    if (!active) return
+    ensureEscapeListener()
+    const handler = () => ref.current()
+    escapeStack.push(handler)
+    return () => {
+      const index = escapeStack.indexOf(handler)
+      if (index >= 0) escapeStack.splice(index, 1)
+    }
+  }, [active])
+}
+
 export function Dialog({ title, onClose, children, footer }: DialogProps) {
+  useEscapeClose(onClose)
   return (
-    <div
-      className="dialog-backdrop"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose()
-      }}
-    >
+    <div className="dialog-backdrop" role="presentation">
       <section className="app-dialog" role="dialog" aria-modal="true" aria-label={title}>
         <header>
           <strong>{title}</strong>
@@ -1241,14 +1281,15 @@ export function SelectLinesDialog({ onClose, onApply }: SelectLinesDialogProps) 
       title={tPlain('Select Lines')}
       onClose={onClose}
       footer={
+        // CreateButtonSizer(wxOK | wxCANCEL | wxAPPLY | wxHELP)：顺序 OK | Cancel | Apply（Help 无对应帮助页省略）
         <>
           <button onClick={() => apply(true)} disabled={!matchText}>
             {tPlain('OK')}
           </button>
+          <button onClick={onClose}>{tPlain('Cancel')}</button>
           <button onClick={() => apply(false)} disabled={!matchText}>
             {tPlain('Apply')}
           </button>
-          <button onClick={onClose}>{tPlain('Cancel')}</button>
         </>
       }
     >
@@ -1321,61 +1362,65 @@ export function SelectLinesDialog({ onClose, onApply }: SelectLinesDialogProps) 
       </fieldset>
       <fieldset className="dialog-fieldset">
         <legend>{tPlain('In Field')}</legend>
-        <label className="dialog-check">
-          <input
-            type="radio"
-            name="select-field"
-            checked={field === 'text'}
-            onChange={() => setField('text')}
-          />{' '}
-          {tPlain('Text')}
-        </label>
-        <label className="dialog-check">
-          <input
-            type="radio"
-            name="select-field"
-            checked={field === 'style'}
-            onChange={() => setField('style')}
-          />{' '}
-          {tPlain('Style')}
-        </label>
-        <label className="dialog-check">
-          <input
-            type="radio"
-            name="select-field"
-            checked={field === 'actor'}
-            onChange={() => setField('actor')}
-          />{' '}
-          {tPlain('Actor')}
-        </label>
-        <label className="dialog-check">
-          <input
-            type="radio"
-            name="select-field"
-            checked={field === 'effect'}
-            onChange={() => setField('effect')}
-          />{' '}
-          {tPlain('Effect')}
-        </label>
+        <div className="dialog-row">
+          <label className="dialog-check">
+            <input
+              type="radio"
+              name="select-field"
+              checked={field === 'text'}
+              onChange={() => setField('text')}
+            />{' '}
+            {tPlain('Text')}
+          </label>
+          <label className="dialog-check">
+            <input
+              type="radio"
+              name="select-field"
+              checked={field === 'style'}
+              onChange={() => setField('style')}
+            />{' '}
+            {tPlain('Style')}
+          </label>
+          <label className="dialog-check">
+            <input
+              type="radio"
+              name="select-field"
+              checked={field === 'actor'}
+              onChange={() => setField('actor')}
+            />{' '}
+            {tPlain('Actor')}
+          </label>
+          <label className="dialog-check">
+            <input
+              type="radio"
+              name="select-field"
+              checked={field === 'effect'}
+              onChange={() => setField('effect')}
+            />{' '}
+            {tPlain('Effect')}
+          </label>
+        </div>
       </fieldset>
       <fieldset className="dialog-fieldset">
         <legend>{tPlain('Match dialogues/comments')}</legend>
-        <label className="dialog-check">
-          <input
-            type="checkbox"
-            checked={dialogue}
-            onChange={(event) => toggleDialogue(event.target.checked)}
-          />{' '}
-          {tPlain('Dialogues')}
-        </label>
-        <label className="dialog-check">
-          <input
-            type="checkbox"
-            checked={comments}
-            onChange={(event) => toggleComments(event.target.checked)}
-          />{' '}
-          {tPlain('Comments')}
-        </label>
+        <div className="dialog-row">
+          <label className="dialog-check">
+            <input
+              type="checkbox"
+              checked={dialogue}
+              onChange={(event) => toggleDialogue(event.target.checked)}
+            />{' '}
+            {tPlain('Dialogues')}
+          </label>
+          <label className="dialog-check">
+            <input
+              type="checkbox"
+              checked={comments}
+              onChange={(event) => toggleComments(event.target.checked)}
+            />{' '}
+            {tPlain('Comments')}
+          </label>
+        </div>
       </fieldset>
       <fieldset className="dialog-fieldset">
         <legend>{tPlain('Action')}</legend>
@@ -1416,6 +1461,333 @@ export function SelectLinesDialog({ onClose, onApply }: SelectLinesDialogProps) 
           {tPlain('Intersect with selection')}
         </label>
       </fieldset>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Timing Post-Processor（dialog_timing_processor.cpp）
+// ---------------------------------------------------------------------------
+interface TimingProcessorDialogProps {
+  cues: SubtitleCue[]
+  styles: string[]
+  selectedIds: string[]
+  keyframes: number[]
+  frameCount: number
+  hasVideo: boolean
+  frameRate: Framerate
+  onClose: () => void
+  onApply: (commands: CoreCommand[], label: string) => void
+}
+
+export function TimingProcessorDialog({
+  cues,
+  styles,
+  selectedIds,
+  keyframes,
+  frameCount,
+  hasVideo,
+  frameRate,
+  onClose,
+  onApply,
+}: TimingProcessorDialogProps) {
+  // 关键帧仅在关键帧与 timecodes 都可用时可吸附（keysAvailable）
+  const keysAvailable = keyframes.length > 0 && frameRate.isLoaded()
+
+  // 初值来自 Options（dialog_timing_processor.cpp 构造时 OPT_GET；样式默认全选 = CheckAll(true)）
+  const [checkedStyles, setCheckedStyles] = useState<Set<string>>(() => new Set(styles))
+  const [onlySelection, setOnlySelection] = useState(() =>
+    getOptionBool('Tool/Timing Post Processor/Only Selection'),
+  )
+  const [enableLeadIn, setEnableLeadIn] = useState(() =>
+    getOptionBool('Tool/Timing Post Processor/Enable/Lead/IN'),
+  )
+  const [leadIn, setLeadIn] = useState(() => getOptionInt('Tool/Timing Post Processor/Lead/IN'))
+  const [enableLeadOut, setEnableLeadOut] = useState(() =>
+    getOptionBool('Tool/Timing Post Processor/Enable/Lead/OUT'),
+  )
+  const [leadOut, setLeadOut] = useState(() => getOptionInt('Tool/Timing Post Processor/Lead/OUT'))
+  const [enableAdjacent, setEnableAdjacent] = useState(() =>
+    getOptionBool('Tool/Timing Post Processor/Enable/Adjacent'),
+  )
+  const [adjGap, setAdjGap] = useState(() =>
+    getOptionInt('Tool/Timing Post Processor/Threshold/Adjacent Gap'),
+  )
+  const [adjOverlap, setAdjOverlap] = useState(() =>
+    getOptionInt('Tool/Timing Post Processor/Threshold/Adjacent Overlap'),
+  )
+  // wxSlider 取 int(GetDouble()*100)（截断）
+  const [adjacentBias, setAdjacentBias] = useState(() =>
+    Math.max(
+      0,
+      Math.min(100, Math.trunc(getOptionDouble('Tool/Timing Post Processor/Adjacent Bias') * 100)),
+    ),
+  )
+  const [enableKeyframes, setEnableKeyframes] = useState(
+    () => keysAvailable && getOptionBool('Tool/Timing Post Processor/Enable/Keyframe'),
+  )
+  const [beforeStart, setBeforeStart] = useState(() =>
+    getOptionInt('Tool/Timing Post Processor/Threshold/Key Start Before'),
+  )
+  const [afterStart, setAfterStart] = useState(() =>
+    getOptionInt('Tool/Timing Post Processor/Threshold/Key Start After'),
+  )
+  const [beforeEnd, setBeforeEnd] = useState(() =>
+    getOptionInt('Tool/Timing Post Processor/Threshold/Key End Before'),
+  )
+  const [afterEnd, setAfterEnd] = useState(() =>
+    getOptionInt('Tool/Timing Post Processor/Threshold/Key End After'),
+  )
+  const [error, setError] = useState<string | null>(null)
+
+  const toggleStyle = (style: string, checked: boolean) => {
+    setCheckedStyles((current) => {
+      const next = new Set(current)
+      if (checked) next.add(style)
+      else next.delete(style)
+      return next
+    })
+  }
+
+  // UpdateControls：任一功能启用且至少勾选一个样式时 OK 可用
+  const applyEnabled =
+    checkedStyles.size > 0 && (enableLeadIn || enableLeadOut || enableKeyframes || enableAdjacent)
+
+  const apply = () => {
+    // OnApply：先写回全部选项再处理（源码 OK 时才保存）
+    setOption('Tool/Timing Post Processor/Lead/IN', leadIn)
+    setOption('Tool/Timing Post Processor/Lead/OUT', leadOut)
+    setOption('Tool/Timing Post Processor/Threshold/Key Start Before', beforeStart)
+    setOption('Tool/Timing Post Processor/Threshold/Key Start After', afterStart)
+    setOption('Tool/Timing Post Processor/Threshold/Key End Before', beforeEnd)
+    setOption('Tool/Timing Post Processor/Threshold/Key End After', afterEnd)
+    setOption('Tool/Timing Post Processor/Threshold/Adjacent Gap', adjGap)
+    setOption('Tool/Timing Post Processor/Threshold/Adjacent Overlap', adjOverlap)
+    setOption('Tool/Timing Post Processor/Adjacent Bias', adjacentBias / 100)
+    setOption('Tool/Timing Post Processor/Enable/Lead/IN', enableLeadIn)
+    setOption('Tool/Timing Post Processor/Enable/Lead/OUT', enableLeadOut)
+    if (keysAvailable) setOption('Tool/Timing Post Processor/Enable/Keyframe', enableKeyframes)
+    setOption('Tool/Timing Post Processor/Enable/Adjacent', enableAdjacent)
+    setOption('Tool/Timing Post Processor/Only Selection', onlySelection)
+
+    const result = processTiming({
+      cues,
+      selectedIds: new Set(selectedIds),
+      checkedStyles,
+      options: {
+        leadIn,
+        leadOut,
+        beforeStart,
+        afterStart,
+        beforeEnd,
+        afterEnd,
+        adjGap,
+        adjOverlap,
+        adjacentBias: adjacentBias / 100,
+        enableLeadIn,
+        enableLeadOut,
+        enableKeyframes,
+        enableAdjacent,
+        onlySelection,
+      },
+      keyframes,
+      frameCount,
+      hasVideo,
+      frameRate,
+    })
+    // 源码弹 wxMessageBox 后同样中止不应用（fmt_tl）
+    if (result.invalidRow !== null) {
+      setError(
+        tFmt(
+          'One of the lines in the file (%i) has negative duration. Aborting.',
+          result.invalidRow,
+        ),
+      )
+      return
+    }
+    if (result.patches.length > 0) {
+      onApply(
+        result.patches.map((patch) => ({
+          type: 'updateCue' as const,
+          id: patch.id,
+          patch: { startMs: patch.startMs, endMs: patch.endMs },
+        })),
+        'timing processor',
+      )
+    }
+    onClose()
+  }
+
+  /** 整数输入（wxIntegerValidator SetMin(0)） */
+  const numberInput = (
+    value: number,
+    onChange: (value: number) => void,
+    label: string,
+    disabled: boolean,
+  ) => (
+    <label className="timing-number">
+      {label}
+      <input
+        type="number"
+        min={0}
+        value={value}
+        disabled={disabled}
+        onChange={(event) => onChange(Math.max(0, Math.round(Number(event.target.value) || 0)))}
+      />
+    </label>
+  )
+
+  return (
+    <Dialog
+      title={tPlain('Timing Post-Processor')}
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={apply} disabled={!applyEnabled}>
+            {tPlain('OK')}
+          </button>
+          <button onClick={onClose}>{tPlain('Cancel')}</button>
+        </>
+      }
+    >
+      <div className="timing-columns">
+        <fieldset className="dialog-fieldset timing-styles">
+          <legend>{tPlain('Apply to styles')}</legend>
+          <div
+            className="dialog-checklist"
+            title={tPlain('Select styles to process. Unchecked ones will be ignored.')}
+          >
+            {styles.map((style) => (
+              <label key={style} className="dialog-check">
+                <input
+                  type="checkbox"
+                  checked={checkedStyles.has(style)}
+                  onChange={(event) => toggleStyle(style, event.target.checked)}
+                />{' '}
+                {style}
+              </label>
+            ))}
+          </div>
+          <div className="dialog-row">
+            <button onClick={() => setCheckedStyles(new Set(styles))}>{tPlain('All')}</button>
+            <button onClick={() => setCheckedStyles(new Set())}>{tPlain('None')}</button>
+          </div>
+        </fieldset>
+        <div className="timing-options">
+          <fieldset className="dialog-fieldset">
+            <legend>{tPlain('Options')}</legend>
+            <label className="dialog-check">
+              <input
+                type="checkbox"
+                checked={onlySelection}
+                onChange={(event) => setOnlySelection(event.target.checked)}
+              />{' '}
+              {tPlain('Affect selection only')}
+            </label>
+          </fieldset>
+          <fieldset className="dialog-fieldset">
+            <legend>{tPlain('Lead-in/Lead-out')}</legend>
+            <div className="dialog-row">
+              <label className="dialog-check" title={tPlain('Enable adding of lead-ins to lines')}>
+                <input
+                  type="checkbox"
+                  checked={enableLeadIn}
+                  onChange={(event) => setEnableLeadIn(event.target.checked)}
+                />{' '}
+                {tPlain('Add lead in:')}
+              </label>
+              {numberInput(leadIn, setLeadIn, '', !enableLeadIn)}
+            </div>
+            <div className="dialog-row">
+              <label className="dialog-check" title={tPlain('Enable adding of lead-outs to lines')}>
+                <input
+                  type="checkbox"
+                  checked={enableLeadOut}
+                  onChange={(event) => setEnableLeadOut(event.target.checked)}
+                />{' '}
+                {tPlain('Add lead out:')}
+              </label>
+              {numberInput(leadOut, setLeadOut, '', !enableLeadOut)}
+            </div>
+          </fieldset>
+          <fieldset className="dialog-fieldset">
+            <legend>{tPlain('Make adjacent subtitles continuous')}</legend>
+            <label
+              className="dialog-check"
+              title={tPlain(
+                'Enable snapping of subtitles together if they are within a certain distance of each other',
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={enableAdjacent}
+                onChange={(event) => setEnableAdjacent(event.target.checked)}
+              />{' '}
+              {tPlain('Enable')}
+            </label>
+            <div className="dialog-row">
+              {numberInput(adjGap, setAdjGap, tPlain('Max gap:'), !enableAdjacent)}
+              {numberInput(adjOverlap, setAdjOverlap, tPlain('Max overlap:'), !enableAdjacent)}
+            </div>
+            <div
+              className="dialog-row"
+              title={tPlain(
+                'Sets how to set the adjoining of lines. If set totally to left, it will extend or shrink start time of the second line; if totally to right, it will extend or shrink the end time of the first line.',
+              )}
+            >
+              <span>{tPlain('Bias: Start <- ')}</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={adjacentBias}
+                disabled={!enableAdjacent}
+                onChange={(event) => setAdjacentBias(Number(event.target.value))}
+              />
+              <span>{tPlain(' -> End')}</span>
+            </div>
+          </fieldset>
+          <fieldset className="dialog-fieldset">
+            <legend>{tPlain('Keyframe snapping')}</legend>
+            <label
+              className="dialog-check"
+              title={tPlain(
+                'Enable snapping of subtitles to nearest keyframe, if distance is within threshold',
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={enableKeyframes}
+                disabled={!keysAvailable}
+                onChange={(event) => setEnableKeyframes(event.target.checked)}
+              />{' '}
+              {tPlain('Enable')}
+            </label>
+            <div className="timing-thresholds">
+              {numberInput(
+                beforeStart,
+                setBeforeStart,
+                tPlain('Starts before thres.:'),
+                !enableKeyframes,
+              )}
+              {numberInput(
+                afterStart,
+                setAfterStart,
+                tPlain('Starts after thres.:'),
+                !enableKeyframes,
+              )}
+              {numberInput(
+                beforeEnd,
+                setBeforeEnd,
+                tPlain('Ends before thres.:'),
+                !enableKeyframes,
+              )}
+              {numberInput(afterEnd, setAfterEnd, tPlain('Ends after thres.:'), !enableKeyframes)}
+            </div>
+          </fieldset>
+        </div>
+      </div>
+      {error && <p className="dialog-error">{error}</p>}
     </Dialog>
   )
 }

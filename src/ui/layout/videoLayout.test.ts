@@ -23,4 +23,14 @@ describe('attached video layout', () => {
     expect(at112_5.panelWidth).toBeGreaterThan(at100.panelWidth)
     expect(at112_5.panelHeight).toBeGreaterThan(at100.panelHeight)
   })
+
+  it('divides display size by device pixel ratio so 100% zoom stays point-to-point', () => {
+    // video_display.cpp：viewport = video × zoom 是物理像素，客户区 = 物理 / scale_factor
+    expect(calculateAttachedVideoLayout({ width: 1280, height: 720 }, 1, 16 / 9, 2)).toMatchObject({
+      displayWidth: 640,
+      displayHeight: 360,
+      panelWidth: 671,
+      panelHeight: 416,
+    })
+  })
 })
