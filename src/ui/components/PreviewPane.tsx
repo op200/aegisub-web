@@ -23,6 +23,7 @@ import { Spline, scaleSpline, vec, type SplineCurve, type Vec2 } from '../../cor
 import { formatVideoTime } from '../../core/time'
 import type { SubtitleCue, SubtitleDocument, SubtitleStyle } from '../../core/types'
 import type { Framerate } from '../../core/vfr'
+import { ptsToMs } from '../../core/vfr'
 import { WebCodecsVideoSource } from '../../media/webcodecsVideo'
 import type { MediaSource } from '../../platform/types'
 import { aegisubIconUrl, commandIcon } from '../aegisubIcons'
@@ -92,7 +93,7 @@ interface PreviewPaneProps {
 /** 视频解码通道 */
 export type VideoPlaybackMode = 'native' | 'webcodecs'
 
-const VICON = (name: string) => aegisubIconUrl(name, 16)
+const VICON = (name: string) => aegisubIconUrl(`${name}_64`)
 
 /** colorspace.cpp clip_colorval */
 function clipColorVal(value: number): number {
@@ -878,6 +879,8 @@ export function PreviewPane({
   const zoomStageRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  // 十字工具坐标读数专用层（不挂 difference 混合，见 .cross-coordinate-overlay）
+  const crossTextRef = useRef<HTMLCanvasElement>(null)
   // WebCodecs 视频回退：<video> 无法解码的容器（mkv 等）onError 后切换
   const [wcMode, setWcMode] = useState(false)
   const [wcError, setWcError] = useState<string | null>(null)
@@ -1252,6 +1255,15 @@ export function PreviewPane({
     if (!context) return
     context.setTransform(ratio, 0, 0, ratio, 0, 0)
     context.clearRect(0, 0, cssWidth, cssHeight)
+    // 同步清空十字工具读数层（cross 分支命中时再重画）
+    const crossTextCanvas = crossTextRef.current
+    if (crossTextCanvas) {
+      const crossCtx = crossTextCanvas.getContext('2d')
+      if (crossCtx) {
+        crossCtx.setTransform(1, 0, 0, 1, 0, 0)
+        crossCtx.clearRect(0, 0, crossTextCanvas.width, crossTextCanvas.height)
+      }
+    }
     // jassub/libass 接管字幕绘制时，交互 canvas 只保留辅助绘制与 hitbox
     const assActive =
       !!assRenderer && !assError && getOptionString('Subtitle/Provider') !== 'canvas' && hasVideo
@@ -1335,19 +1347,19 @@ export function PreviewPane({
       if (rect.width > 0 && rect.height > 0 && mousePx && mouseScript) {
         const playResY = Number(document.scriptInfo.PlayResY) || 1080
         const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
-        const drawCross = (color: string, width: number) => {
-          context.strokeStyle = color
-          context.lineWidth = width
-          context.beginPath()
-          context.moveTo(rect.left, mousePx.y)
-          context.lineTo(rect.left + rect.width, mousePx.y)
-          context.moveTo(mousePx.x, rect.top)
-          context.lineTo(mousePx.x, rect.top + rect.height)
-          context.stroke()
-        }
-        // 源码用 SetInvert 反色保证任意背景可见；Web 画布无法反色视频层，用暗晕 + 白线近似
-        drawCross('rgba(0,0,0,.5)', 3)
-        drawCross('white', 1)
+        // 源码 gl.SetInvert + SetLineColour(*wxWHITE, 1.0, 1)：恒定 1px 反色线。
+        // canvas 元素挂 mix-blend-mode: difference（见 JSX 内联样式），画白色即为
+        // 对底层视频的反色；0.5 对齐像素保证 1px 不虚
+        const cx = Math.round(mousePx.x) + 0.5
+        const cy = Math.round(mousePx.y) + 0.5
+        context.strokeStyle = 'white'
+        context.lineWidth = 1
+        context.beginPath()
+        context.moveTo(rect.left, cy)
+        context.lineTo(rect.left + rect.width, cy)
+        context.moveTo(cx, rect.top)
+        context.lineTo(cx, rect.top + rect.height)
+        context.stroke()
         // Shift = 显示对称点坐标（源码 2*video_pos+video_size-mouse_pos 的脚本系等价）
         const sx = mouseShiftRef.current ? playResX - mouseScript.x : mouseScript.x
         const sy = mouseShiftRef.current ? playResY - mouseScript.y : mouseScript.y
@@ -1356,16 +1368,39 @@ export function PreviewPane({
           rect.width > playResX
             ? `${floatToString(sx, 3)},${floatToString(sy, 3)}`
             : `${Math.trunc(sx)},${Math.trunc(sy)}`
-        context.font = 'bold 12px Verdana, sans-serif'
-        const textWidth = context.measureText(text).width
-        let dx = mousePx.x
-        let dy = mousePx.y
+        // 坐标读数画在独立层（不反色）：源码 gl_text Print 先在 ±1 偏移画 1px 黑边、
+        // 再画白字（gl_text.cpp），保证任意视频底色上可读；层不带 difference 混合
+        const textLayer = crossTextRef.current
+        if (!textLayer) return
+        if (textLayer.width !== pixelWidth || textLayer.height !== pixelHeight) {
+          textLayer.width = pixelWidth
+          textLayer.height = pixelHeight
+        }
+        const textCtx = textLayer.getContext('2d')
+        if (!textCtx) return
+        textCtx.setTransform(ratio, 0, 0, ratio, 0, 0)
+        textCtx.font = 'bold 12px Verdana, sans-serif'
+        const metrics = textCtx.measureText(text)
+        const textWidth = metrics.width
+        const textHeight = Math.ceil(
+          metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent,
+        )
+        // 源码 Print 原点是文字左上角（glyph 顶点 y..y+h），偏移 4/3px 使坐标读数
+        // 落在靠视频中心一侧的象限内、不与十字线重叠
+        textCtx.textBaseline = 'top'
+        let dx = Math.round(mousePx.x)
+        let dy = Math.round(mousePx.y)
         if (dx > rect.left + rect.width / 2) dx -= textWidth + 4
         else dx += 4
         if (dy < rect.top + rect.height / 2) dy += 3
-        else dy -= 15
-        context.fillStyle = 'white'
-        context.fillText(text, dx, dy)
+        else dy -= textHeight + 3
+        textCtx.fillStyle = 'black'
+        textCtx.fillText(text, dx - 1, dy)
+        textCtx.fillText(text, dx + 1, dy)
+        textCtx.fillText(text, dx, dy - 1)
+        textCtx.fillText(text, dx, dy + 1)
+        textCtx.fillStyle = 'white'
+        textCtx.fillText(text, dx, dy)
       }
     }
 
@@ -1561,8 +1596,9 @@ export function PreviewPane({
         drawGlCircle(context, map, ax * radius, ay * radius, 4, colors.baseFill, colors.secondary)
         drawGlCircle(context, map, -ax * radius, -ay * radius, 4, colors.baseFill, colors.secondary)
         drawFeature(ox, oy, 'triangle', colors.baseFill)
-        // 鼠标位置连线（距原点 >10px）
-        const mouse = mousePosRef.current
+        // 鼠标位置连线（visual_tool_rotatez.cpp：mouse_pos 存在且距原点平方 >100，
+        // 即画布坐标下 10px；离开视频区不画——源码 mouse_pos 出界清空）
+        const mouse = mouseOnStageRef.current ? mousePosRef.current : null
         if (mouse) {
           const mxp = mapX(mouse.x)
           const myp = mapY(mouse.y)
@@ -1966,23 +2002,33 @@ export function PreviewPane({
     contentZoom,
   ])
 
-  useEffect(() => {
-    renderOverlay()
-    const observer = new ResizeObserver(renderOverlay)
-    if (stageRef.current) observer.observe(stageRef.current)
-    return () => observer.disconnect()
-  }, [renderOverlay])
-
   // 十字工具随鼠标移动实时重绘（visual_tool_cross.cpp 每次鼠标事件后 Render），
   // rAF 合流避免高频 pointermove 全量重绘
   const overlayRenderRafRef = useRef(0)
-  const scheduleOverlayRender = () => {
+  const renderOverlayRef = useRef<() => void>(() => {})
+  const scheduleOverlayRender = useCallback(() => {
     if (overlayRenderRafRef.current) return
     overlayRenderRafRef.current = requestAnimationFrame(() => {
       overlayRenderRafRef.current = 0
-      renderOverlay()
+      renderOverlayRef.current()
     })
-  }
+  }, [])
+
+  // 统一异步弃帧优化：renderOverlay 变化（拖拽高频提交/时间更新等）只调度，
+  // rAF 合流后一帧至多重绘一次 overlay；由 ref 间接调用保证取到最新闭包
+  useEffect(() => {
+    renderOverlayRef.current = renderOverlay
+    scheduleOverlayRender()
+    const observer = new ResizeObserver(scheduleOverlayRender)
+    if (stageRef.current) observer.observe(stageRef.current)
+    return () => {
+      observer.disconnect()
+      if (overlayRenderRafRef.current) {
+        cancelAnimationFrame(overlayRenderRafRef.current)
+        overlayRenderRafRef.current = 0
+      }
+    }
+  }, [renderOverlay, scheduleOverlayRender])
 
   // ---- JASSUB（libass WASM）字幕渲染器生命周期（对应原版 SubtitlesProvider）----
   useEffect(() => {
@@ -2045,7 +2091,9 @@ export function PreviewPane({
     if (!video || !playing) return
     let frame = 0
     const update = () => {
-      onTimeChange(video.currentTime * 1000)
+      // ptsToMs：暂停时 currentTime 即所 seek 的帧 PTS，浮点直接乘 1000 会差 1ms
+      // 导致 currentFrame 落到前一帧（VideoPosition/网格帧列错位）
+      onTimeChange(ptsToMs(video.currentTime))
       frame = requestAnimationFrame(update)
     }
     frame = requestAnimationFrame(update)
@@ -2054,7 +2102,7 @@ export function PreviewPane({
 
   useEffect(() => {
     const video = videoRef.current
-    if (video && !playing && Math.abs(video.currentTime * 1000 - currentTimeMs) > 40)
+    if (video && !playing && Math.abs(ptsToMs(video.currentTime) - currentTimeMs) > 40)
       video.currentTime = currentTimeMs / 1000
   }, [currentTimeMs, playing])
 
@@ -2247,7 +2295,7 @@ export function PreviewPane({
     }
     const currentTime = () => {
       if (wcSource) return wcSource.currentTime
-      if (video) return video.currentTime * 1000
+      if (video) return ptsToMs(video.currentTime)
       return 0
     }
     const duration = () => {
@@ -2700,12 +2748,15 @@ export function PreviewPane({
   }
 
   const canvasPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    // 鼠标状态跟踪（十字工具 Draw 的输入）：相对 overlay 的像素位置、Shift 状态、在台上
+    // 鼠标状态跟踪（十字/旋转工具 Draw 的输入）：相对 overlay 的像素位置、Shift 状态、在台上
     const bounds = event.currentTarget.getBoundingClientRect()
     mouseStagePxRef.current = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }
     mouseShiftRef.current = event.shiftKey
     mouseOnStageRef.current = true
-    if (visualTool === 'video/tool/cross') scheduleOverlayRender()
+    // 源码每次鼠标事件后 Render：Draw 含 mouse_pos 的工具都要随移动实时重绘
+    // （visual_tool_cross.cpp 十字线、visual_tool_rotatez.cpp 原点→鼠标连线）
+    if (visualTool === 'video/tool/cross' || visualTool === 'video/tool/rotate/z')
+      scheduleOverlayRender()
     if (vclipRef.current) {
       vclipPointerMove(event)
       return
@@ -3036,7 +3087,14 @@ export function PreviewPane({
   }, [contextMenu])
 
   return (
-    <section className="preview-panel" aria-label={tPlain('Video preview')} style={panelStyle}>
+    // 快捷键上下文挂面板根：源码 video_box 全箱属 Video 上下文——按钮/滑条聚焦时
+    // Video 热键仍可用（此前只挂 canvas，点按钮后上下文落回 Default 使热键失效）
+    <section
+      className="preview-panel"
+      aria-label={tPlain('Video preview')}
+      style={panelStyle}
+      data-shortcut-context="Video"
+    >
       <div
         className="video-content"
         onMouseEnter={() => setVideoHover(true)}
@@ -3089,14 +3147,8 @@ export function PreviewPane({
                     )
                   }
                 >
-                  {commandIcon(id, 16) ? (
-                    <img
-                      src={commandIcon(id, 16)}
-                      alt=""
-                      width={16}
-                      height={16}
-                      draggable={false}
-                    />
+                  {commandIcon(id) ? (
+                    <img src={commandIcon(id)} alt="" width={16} height={16} draggable={false} />
                   ) : (
                     <span className="tool-button-label">{COMMANDS[id]?.label?.[0]}</span>
                   )}
@@ -3109,7 +3161,6 @@ export function PreviewPane({
           className="video-stage"
           ref={stageRef}
           tabIndex={0}
-          data-shortcut-context="Video"
           onPointerDown={(event) => {
             // video_display.cpp OnMouseEvent：按住中键拖动平移视频画面（Pan(位置差)）
             if (event.button !== 1 || !hasVideo) return
@@ -3258,19 +3309,25 @@ export function PreviewPane({
             className="subtitle-overlay"
             style={{
               pointerEvents: !hasVideo ? 'none' : 'auto',
+              // 十字工具：源码 SetCursor(wxCURSOR_BLANK) 隐藏光标（十字线即光标）；
+              // gl.SetInvert 的反色十字线经 difference 混合实现（白线 = 反转底层视频）
+              cursor: visualTool === 'video/tool/cross' ? 'none' : 'default',
+              mixBlendMode: visualTool === 'video/tool/cross' ? 'difference' : undefined,
             }}
             onPointerDown={canvasPointerDown}
             onPointerMove={canvasPointerMove}
             onPointerUp={canvasPointerUp}
             onPointerCancel={canvasPointerUp}
             onPointerLeave={() => {
-              // 鼠标离开视频区：清除十字工具状态并重绘擦除
+              // 鼠标离开视频区：清除十字工具状态并重绘擦除（源码 mouse_pos 清空）
               mouseOnStageRef.current = false
               mouseStagePxRef.current = null
-              if (visualTool === 'video/tool/cross') renderOverlay()
+              if (visualTool === 'video/tool/cross' || visualTool === 'video/tool/rotate/z')
+                renderOverlay()
             }}
             onDoubleClick={canvasDoubleClick}
           />
+          <canvas ref={crossTextRef} className="cross-coordinate-overlay" />
         </div>
       </div>
       <div className="video-static-line" />

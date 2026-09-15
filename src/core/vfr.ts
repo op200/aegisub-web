@@ -10,6 +10,32 @@
 
 export type TimeKind = 'exact' | 'start' | 'end'
 
+/**
+ * 升序数组中第一个 ≥ value 的下标（lower_bound）。空表返回 0。
+ * 关键帧 ms → 帧号即此语义：FFMS2 索引按 PTS 升序排帧，帧号 = 帧在排序表中的位置。
+ */
+export function lowerBoundIndex(sorted: number[], value: number): number {
+  let lo = 0
+  let hi = sorted.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (sorted[mid] < value) lo = mid + 1
+    else hi = mid
+  }
+  return lo
+}
+
+/**
+ * 浮点秒 → 毫秒，对齐 FFMS2 `(int)((PTS * TimeBase->Num) / TimeBase->Den)` 的
+ * int64 截断。web-demuxer/HTMLMediaElement 只给 double 秒，直接 trunc 会在
+ * 精确整数毫秒点因浮点下取差 1ms（1/1000 时基 1 小时实测约 0.4% 的帧）。
+ * 补偿 1e-6ms：远大于 double 误差（~1e-9ms），远小于最小时基分数间隔
+ * （1/1e6 时基为 0.001ms），不会把真实非整数点推进到下一毫秒。
+ */
+export function ptsToMs(seconds: number): number {
+  return Math.trunc(seconds * 1000 + 1e-6)
+}
+
 interface V1Range {
   start: number
   end: number
@@ -35,22 +61,25 @@ export class Framerate {
     return new Framerate([], 0, 0)
   }
 
-  /** Framerate(double fps)：CFR 构造 */
+  /** Framerate(double fps)：CFR 构造（numerator(int64_t(fps * denominator)) 截断） */
   static cfr(fps: number): Framerate {
-    return new Framerate([0], Math.round(fps * 1e9), 0)
+    return new Framerate([0], Math.trunc(fps * 1e9), 0)
   }
 
-  /** 从 v2 timecodes 表构造（已归一化，首帧 0） */
+  /** 从 v2 timecodes 表构造（已归一化，首帧 0）。
+   *  源码 SetFromTimecodes 的 numerator 为 int64 整除（截断非四舍五入） */
   static fromTimecodes(timecodes: number[]): Framerate {
     const normalized = timecodes.map((value) => value - timecodes[0])
-    const numerator = ((normalized.length - 1) * 1e9 * 1000) / normalized[normalized.length - 1]
+    const numerator = Math.trunc(
+      ((normalized.length - 1) * 1e9 * 1000) / normalized[normalized.length - 1],
+    )
     const last = (normalized.length - 1) * 1e9 * 1000
-    return new Framerate(normalized, Math.round(numerator), last)
+    return new Framerate(normalized, numerator, last)
   }
 
   /** 从 v1 展开结果构造（源码 v1 展开走四舍五入，见 parseTimecodes） */
   static fromExpanded(timecodes: number[], assumedFps: number, last: number): Framerate {
-    return new Framerate(timecodes, Math.round(assumedFps * 1e9), last)
+    return new Framerate(timecodes, Math.trunc(assumedFps * 1e9), last)
   }
 
   isLoaded(): boolean {
@@ -279,9 +308,9 @@ export function parseTimecodes(text: string): Framerate {
       }
     }
     timecodes.push(Math.round(time)) // 末尾哨兵
-    // last = 未舍入累计时长（v1 外推语义）
+    // last = 未舍入累计时长（v1 外推语义；int64_t 截断）
     const lastUnrounded = time * assumedFps * 1e9
-    return Framerate.fromExpanded(timecodes, assumedFps, Math.round(lastUnrounded))
+    return Framerate.fromExpanded(timecodes, assumedFps, Math.trunc(lastUnrounded))
   }
 
   throw new Error('Unknown timecodes format')

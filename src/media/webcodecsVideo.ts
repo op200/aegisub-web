@@ -50,6 +50,11 @@ export class WebCodecsVideoSource {
   private currentTimeUs = 0
   private durationMs = 0
   private destroyed = false
+  /** 首个解码帧的原始 PTS（µs）。对外时间线以"首帧 = 0"归一化——FFMS2 的
+   *  Framerate(TimecodesVector) 会把 timecodes.front() 平移到 0（normalize_timecodes），
+   *  桌面版 seek 又按帧号进行；web 按 seek 按时间走，必须与归一化时间码表同一时间线，
+   *  否则容器首帧 PTS ≠ 0 时（mkv 时延/MP4 edit list）帧号整体错位。 */
+  private baseUs: number | null = null
   /** 已发现关键帧（ms，升序）；读流时从 chunk.type === 'key' 收集 */
   private keyframeMs: number[] = []
   private keyframeReported = 0
@@ -68,6 +73,7 @@ export class WebCodecsVideoSource {
           frame.close()
           return
         }
+        if (this.baseUs === null) this.baseUs = frame.timestamp
         this.frames.push(frame)
       },
       error: (error) => this.events.onError(error.message),
@@ -162,18 +168,32 @@ export class WebCodecsVideoSource {
     if (this.destroyed || !this.frames.length) return
     this.drawUpTo(this.frames[0].timestamp)
     this.flushKeyframes()
+    // 首帧 PTS 已知：以归一化时间线重报时长（open 时容器时长含首帧前偏移）
+    if (this.baseUs !== null && this.baseUs > 0)
+      this.events.onDurationChange(Math.max(0, this.durationMs - this.baseMs))
   }
 
   get duration(): number {
-    return this.durationMs
+    return Math.max(0, this.durationMs - this.baseMs)
   }
 
   get playing(): boolean {
     return this.playingState
   }
 
+  /** 首帧 PTS（ms）；首个解码帧出现前为 0 */
+  private get baseMs(): number {
+    return (this.baseUs ?? 0) / 1000
+  }
+
+  /** 对外当前位置（ms，归一化时间线） */
+  private get currentTimeMs(): number {
+    return Math.max(0, (this.currentTimeUs - (this.baseUs ?? 0)) / 1000)
+  }
+
+  /** 对外只读当前位置（ms，归一化时间线；内部 currentTimeUs 为原始 PTS） */
   get currentTime(): number {
-    return this.currentTimeUs / 1000
+    return this.currentTimeMs
   }
 
   toggle(): void {
@@ -185,7 +205,7 @@ export class WebCodecsVideoSource {
     if (this.destroyed || this.playingState) return
     if (this.streamDone && !this.frames.length) {
       // 播放到结尾后再播放：重新 seek 到当前位置起流，随后继续播放
-      this.seek(this.currentTimeUs / 1000)
+      this.seek(this.currentTimeMs)
       this.seekJob = this.seekJob.then(() => {
         if (!this.destroyed && !this.playingState) this.play()
       })
@@ -200,14 +220,14 @@ export class WebCodecsVideoSource {
       const nowMs = this.playStartMs + (performance.now() - this.playStartWall)
       void this.pumpAhead()
       this.drawUpTo(Math.round(nowMs * 1000))
-      this.events.onTimeUpdate(this.currentTimeUs / 1000)
+      this.events.onTimeUpdate(this.currentTimeMs)
       if (this.streamDone && !this.frames.length) {
         // 流结束且缓冲耗尽：停在结尾
         this.playingState = false
         this.events.onPlaying(false)
         if (this.durationMs > 0) {
           this.currentTimeUs = this.durationMs * 1000
-          this.events.onTimeUpdate(this.durationMs)
+          this.events.onTimeUpdate(this.duration)
         }
         return
       }
@@ -221,14 +241,15 @@ export class WebCodecsVideoSource {
     this.playingState = false
     cancelAnimationFrame(this.raf)
     this.events.onPlaying(false)
-    this.events.onTimeUpdate(this.currentTimeUs / 1000)
+    this.events.onTimeUpdate(this.currentTimeMs)
   }
 
-  /** seek（可重入，串行执行）：从目标前关键帧解码到目标帧 */
+  /** seek（可重入，串行执行）：从目标前关键帧解码到目标帧。
+   *  入参为归一化时间线（首帧 = 0）；内部换回原始 PTS 再驱动解复用器 */
   seek(timeMs: number): void {
     if (this.destroyed) return
-    const target = Math.max(0, Math.min(this.durationMs || timeMs, timeMs))
-    this.seekJob = this.seekJob.then(() => this.doSeek(target)).catch(() => undefined)
+    const target = Math.max(0, Math.min(this.duration || timeMs, timeMs))
+    this.seekJob = this.seekJob.then(() => this.doSeek(target + this.baseMs)).catch(() => undefined)
   }
 
   private async doSeek(targetMs: number): Promise<void> {
@@ -257,7 +278,7 @@ export class WebCodecsVideoSource {
     // 也避免暂停同步 effect 因差值 ≥ 帧时长而反复 seek）
     this.currentTimeUs = targetUs
     if (wasPlaying) this.play()
-    else this.events.onTimeUpdate(this.currentTimeUs / 1000)
+    else this.events.onTimeUpdate(this.currentTimeMs)
   }
 
   destroy(): void {

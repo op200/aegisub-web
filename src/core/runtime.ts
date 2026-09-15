@@ -173,8 +173,8 @@ export class TypeScriptCoreRuntime {
         cue[field] = value.slice(0, match.start) + replacement + value.slice(match.end)
     }
     // 提交后快照入栈（search_replace_engine.cpp:Commit(_("replace"))）
-    this.undoStack.push({ label: 'Replace all', document: structuredClone(this.document) })
-    this.amendLabel = 'Replace all'
+    this.undoStack.push({ label: 'replace', document: structuredClone(this.document) })
+    this.amendLabel = 'replace'
     this.amendTarget = ''
     this.coalescable = true
     this.redoStack = []

@@ -169,3 +169,31 @@ describe('loadLocale', () => {
     await expect(loadLocale('missing')).resolves.toBeNull()
   })
 })
+
+describe('web 补充词典（i18nSupplement，仅 po 未命中时兜底）', () => {
+  beforeEach(() => {
+    // 空 po：仅头部条目（真实 zh_CN.po 由 dev middleware 从源码目录提供）
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response('msgid ""\nmsgstr ""\n"Content-Type: text/plain; charset=UTF-8\\n"\n', {
+            status: 200,
+          }),
+        ),
+      ),
+    )
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('zh_CN：wx stock/web 专属文案经补充词典命中，技术标识回退英文', async () => {
+    await setLocale('zh_CN')
+    expect(tPlain('OK')).toBe('确定')
+    expect(tPlain('Ready')).toBe('就绪')
+    expect(tPlain('PlayResX')).toBe('PlayResX')
+    expect(tPlain('Not In Supplement')).toBe('Not In Supplement')
+  })
+})

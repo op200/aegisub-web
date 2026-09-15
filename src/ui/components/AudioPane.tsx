@@ -370,7 +370,7 @@ export function AudioPane(props: AudioPaneProps) {
   const renderButton = (command: string) => {
     const isToggle = TOGGLES.has(command)
     const label = commandTooltip(command, 'Audio')
-    const icon = commandIcon(command, 16)
+    const icon = commandIcon(command)
     const intercepted = command === 'audio/commit' && karaokePending
     return (
       <button
@@ -505,7 +505,7 @@ export function AudioPane(props: AudioPaneProps) {
               aria-pressed={linked}
             >
               <img
-                src={aegisubIconUrl('toggle_audio_link', 16)}
+                src={aegisubIconUrl('toggle_audio_link_64')}
                 alt=""
                 width={16}
                 height={16}

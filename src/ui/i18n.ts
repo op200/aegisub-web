@@ -19,6 +19,7 @@ import { useSyncExternalStore } from 'react'
 
 import linguasRaw from '../../Aegisub/po/LINGUAS?raw'
 import { getOptionString, setOption } from '../config/options'
+import { WEB_SUPPLEMENT } from './i18nSupplement'
 
 // ---------------------------------------------------------------------------
 // po 解析
@@ -343,6 +344,18 @@ function lookup(catalog: Catalog | null, msgid: string, ctx?: string): PoEntry |
   return catalog.exact.get(key) ?? catalog.loose.get(key) ?? null
 }
 
+/**
+ * web 补充词典查询（i18nSupplement.ts）：仅源码 po 未命中时兜底，
+ * 键 = t() 查询键（ctx \u0004 msgid）；未收录语言/键返回 undefined 回退英文。
+ */
+function supplementLookup(msgid: string, ctx?: string): string | undefined {
+  if (!currentLocale) return undefined
+  const table = WEB_SUPPLEMENT[currentLocale]
+  if (!table) return undefined
+  const hit = table[ctx ? `${ctx}\u0004${msgid}` : msgid]
+  return typeof hit === 'string' ? hit : undefined
+}
+
 function stripAccess(label: string): { label: string; accessKey?: string } {
   const match = label.match(/&(.)/)
   if (!match) return { label: label.replace(/&/g, '').trim() }
@@ -505,7 +518,7 @@ export function t(msgid: string, ctx?: string): string {
   if (cached !== undefined) return cached
   const catalog = currentLocale ? (catalogs.get(currentLocale) ?? null) : null
   const entry = lookup(catalog, msgid, ctx)
-  const result = entry?.forms[0] ?? msgid
+  const result = entry?.forms[0] ?? supplementLookup(msgid, ctx) ?? msgid
   translationCache.set(key, result)
   return result
 }

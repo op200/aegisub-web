@@ -408,7 +408,7 @@ export function Waveform({
   }, [view, optionsVersion])
 
   // ---- 绘制 ----
-  useEffect(() => {
+  const drawWaveform = () => {
     const canvas = canvasRef.current
     if (!canvas || size.w <= 0 || size.h <= 0) return
     const ratio = window.devicePixelRatio || 1
@@ -933,6 +933,25 @@ export function Waveform({
       ctx.textBaseline = 'middle'
       ctx.fillText(tPlain('Waveform unavailable'), size.w / 2, audioTop + audioHeight / 2)
     }
+  }
+
+  // 统一异步弃帧优化：rAF 合流，高频失效（拖拽标记/播放推进/滚轮）一帧至多绘制一次
+  const drawWaveformRef = useRef(drawWaveform)
+  const drawRafRef = useRef(0)
+  useEffect(() => {
+    drawWaveformRef.current = drawWaveform
+    if (drawRafRef.current) return
+    drawRafRef.current = requestAnimationFrame(() => {
+      drawRafRef.current = 0
+      drawWaveformRef.current()
+    })
+    return () => {
+      if (drawRafRef.current) {
+        cancelAnimationFrame(drawRafRef.current)
+        drawRafRef.current = 0
+      }
+    }
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [
     amplitude,
     clampedScroll,

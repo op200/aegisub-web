@@ -234,7 +234,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
       void navigator.clipboard
         ?.writeText(lines.map((cue) => cue.text).join('\n'))
         .catch(() => undefined)
-      void api.apply([{ type: 'deleteCues', ids: ctx.selected }], 'Cut lines')
+      void api.apply([{ type: 'deleteCues', ids: ctx.selected }], 'cut lines')
     },
     enabled: requireSelection,
   },
@@ -247,7 +247,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
         afterId: ctx.activeCue?.id,
         cue: cueData(cue),
       }))
-      void api.apply(commands, 'Paste lines').then((next) => {
+      void api.apply(commands, 'paste').then((next) => {
         if (!next) return
         const inserted = next.document.cues.filter((cue) => !before.has(cue.id))
         if (inserted.length) api.selectLines(inserted.map((cue) => cue.id))
@@ -260,10 +260,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
       if (!clipboardLines.length || !ctx.activeCue) return
       const lines = clipboardLines.map((cue) => structuredClone(cue))
       const first = lines[0]
-      void api.apply(
-        [{ type: 'updateCue', id: ctx.activeCue.id, patch: cueData(first) }],
-        'Paste lines over',
-      )
+      void api.apply([{ type: 'updateCue', id: ctx.activeCue.id, patch: cueData(first) }], 'paste')
     },
     enabled: (ctx) => clipboardLines.length > 0 && Boolean(ctx.activeCue),
   },
@@ -299,7 +296,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   },
   'edit/line/duplicate': {
     run: (ctx, api) =>
-      void api.apply([{ type: 'duplicateCues', ids: ctx.selected }], 'Duplicate lines'),
+      void api.apply([{ type: 'duplicateCues', ids: ctx.selected }], 'duplicate lines'),
     enabled: requireSelection,
   },
   'edit/line/split/before': {
@@ -324,7 +321,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     enabled: (ctx) => Boolean(ctx.videoMedia && ctx.activeCue),
   },
   'edit/line/delete': {
-    run: (ctx, api) => void api.apply([{ type: 'deleteCues', ids: ctx.selected }], 'Delete lines'),
+    run: (ctx, api) => void api.apply([{ type: 'deleteCues', ids: ctx.selected }], 'delete lines'),
     enabled: requireSelection,
   },
   'edit/line/join/concatenate': {
@@ -371,36 +368,31 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   },
   'grid/move/up': {
     run: (ctx, api) =>
-      void api.apply([{ type: 'moveCues', ids: ctx.selected, direction: -1 }], 'Move lines up'),
+      void api.apply([{ type: 'moveCues', ids: ctx.selected, direction: -1 }], 'move lines'),
     enabled: requireSelection,
   },
   'grid/move/down': {
     run: (ctx, api) =>
-      void api.apply([{ type: 'moveCues', ids: ctx.selected, direction: 1 }], 'Move lines down'),
+      void api.apply([{ type: 'moveCues', ids: ctx.selected, direction: 1 }], 'move lines'),
     enabled: requireSelection,
   },
   'grid/sort/start': {
-    run: (ctx, api) =>
-      void api.apply([{ type: 'sortCuesBy', column: 'start' }], 'Sort lines by start'),
+    run: (ctx, api) => void api.apply([{ type: 'sortCuesBy', column: 'start' }], 'sort'),
   },
   'grid/sort/end': {
-    run: (ctx, api) => void api.apply([{ type: 'sortCuesBy', column: 'end' }], 'Sort lines by end'),
+    run: (ctx, api) => void api.apply([{ type: 'sortCuesBy', column: 'end' }], 'sort'),
   },
   'grid/sort/style': {
-    run: (ctx, api) =>
-      void api.apply([{ type: 'sortCuesBy', column: 'style' }], 'Sort lines by style'),
+    run: (ctx, api) => void api.apply([{ type: 'sortCuesBy', column: 'style' }], 'sort'),
   },
   'grid/sort/actor': {
-    run: (ctx, api) =>
-      void api.apply([{ type: 'sortCuesBy', column: 'actor' }], 'Sort lines by actor'),
+    run: (ctx, api) => void api.apply([{ type: 'sortCuesBy', column: 'actor' }], 'sort'),
   },
   'grid/sort/effect': {
-    run: (ctx, api) =>
-      void api.apply([{ type: 'sortCuesBy', column: 'effect' }], 'Sort lines by effect'),
+    run: (ctx, api) => void api.apply([{ type: 'sortCuesBy', column: 'effect' }], 'sort'),
   },
   'grid/sort/layer': {
-    run: (ctx, api) =>
-      void api.apply([{ type: 'sortCuesBy', column: 'layer' }], 'Sort lines by layer'),
+    run: (ctx, api) => void api.apply([{ type: 'sortCuesBy', column: 'layer' }], 'sort'),
   },
   ...sortSelectedCommands(),
   ...recentCommands(),
@@ -462,7 +454,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
           id: cue.id,
           patch: { startMs: start, ...(cue.endMs < end ? { endMs: end } : {}) },
         }))
-      if (commands.length) void api.apply(commands, 'Snap start to video')
+      if (commands.length) void api.apply(commands, 'timing')
     },
     // time.cpp validate_video_loaded：仅要求视频已加载，无选中行时 no-op
     enabled: (ctx) => Boolean(ctx.videoMedia),
@@ -479,7 +471,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
           id: cue.id,
           patch: { endMs: end, ...(cue.startMs > start ? { startMs: start } : {}) },
         }))
-      if (commands.length) void api.apply(commands, 'Snap end to video')
+      if (commands.length) void api.apply(commands, 'timing')
     },
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
@@ -495,7 +487,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
           id: cue.id,
           patch: { startMs: cue.startMs + shift, endMs: cue.endMs + shift },
         }))
-      if (commands.length) void api.apply(commands, 'Shift lines to current frame')
+      if (commands.length) void api.apply(commands, 'shift to frame')
     },
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
@@ -531,7 +523,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
               },
             },
           ],
-          'Adjust start time',
+          'timing',
         )
     },
   },
@@ -546,7 +538,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
               patch: { endMs: ctx.activeCue.endMs + getOptionInt('Audio/Lead/OUT') },
             },
           ],
-          'Adjust end time',
+          'timing',
         )
     },
   },
@@ -561,7 +553,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
               patch: { startMs: Math.max(0, ctx.activeCue.startMs - 100) },
             },
           ],
-          'Adjust start time',
+          'timing',
         )
     },
     enabled: (ctx) => Boolean(ctx.activeCue),
@@ -577,7 +569,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
               patch: { startMs: Math.min(ctx.activeCue.endMs, ctx.activeCue.startMs + 100) },
             },
           ],
-          'Adjust start time',
+          'timing',
         )
     },
     enabled: (ctx) => Boolean(ctx.activeCue),
@@ -593,7 +585,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
               patch: { endMs: ctx.activeCue.endMs + 100 },
             },
           ],
-          'Adjust end time',
+          'timing',
         )
     },
     enabled: (ctx) => Boolean(ctx.activeCue),
@@ -609,7 +601,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
               patch: { endMs: Math.max(ctx.activeCue.startMs, ctx.activeCue.endMs - 100) },
             },
           ],
-          'Adjust end time',
+          'timing',
         )
     },
     enabled: (ctx) => Boolean(ctx.activeCue),
@@ -1158,7 +1150,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
       const commands = ctx.core.document.cues
         .filter((cue) => ctx.selected.includes(cue.id))
         .map((cue): CoreCommand => ({ type: 'updateCue', id: cue.id, patch: { startMs, endMs } }))
-      if (commands.length) void api.apply(commands, 'Snap to scene')
+      if (commands.length) void api.apply(commands, 'snap to scene')
     },
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
@@ -1220,7 +1212,7 @@ function sortSelectedCommands(): Record<string, CommandDef> {
         const ordered = core.document.cues.filter((cue) => selSet.has(cue.id))
         if (ordered.length < 2) return
         const sorted = [...ordered].sort(compareBy(column))
-        void reinsertSorted(ctx, api, sorted, `Sort selected by ${column}`)
+        void reinsertSorted(ctx, api, sorted, 'sort')
       },
       enabled: (ctx) => ctx.selected.length > 1,
     }
@@ -1292,7 +1284,7 @@ async function insertLine(
         cue,
       },
     ],
-    'Insert line',
+    'line insertion',
   )
   if (!next) return
   const inserted = next.document.cues.filter((item) => !existing.has(item.id))
@@ -1317,7 +1309,7 @@ async function splitLine(ctx: CommandContext, api: CommandApi, before: boolean):
         { type: 'updateCue', id: activeCue.id, patch: { endMs: splitAt } },
         { type: 'addCue', afterId: activeCue.id, cue: { ...data, startMs: splitAt } },
       ]
-  const next = await api.apply(commands, 'Split line')
+  const next = await api.apply(commands, 'split')
   if (!next) return
   const inserted = next.document.cues.filter((cue) => !existing.has(cue.id))
   if (inserted.length) api.selectLines(inserted.map((cue) => cue.id))
@@ -1370,7 +1362,7 @@ async function makeContinuous(
       patches.push({ type: 'updateCue', id: cues[i].id, patch: { endMs: cues[i + 1].startMs } })
     }
   }
-  if (patches.length) void api.apply(patches, 'make continuous')
+  if (patches.length) void api.apply(patches, 'adjoin')
 }
 
 /** Aegisub validate_adjoinable：选区为空、非相邻时禁用 */
@@ -1481,7 +1473,7 @@ async function recombineLines(ctx: CommandContext, api: CommandApi): Promise<voi
     })
     commands.push({ type: 'deleteCues', ids: plan.dropIds })
   }
-  await api.apply(commands, 'Recombine lines')
+  await api.apply(commands, 'combining')
 }
 
 /** 最后一行可见文本（供 recombine 拼接判断） */
@@ -1548,7 +1540,7 @@ async function splitByKaraoke(ctx: CommandContext, api: CommandApi): Promise<voi
     api.setStatus('Selected lines have no karaoke timing')
     return
   }
-  const next = await api.apply(commands, 'Split lines by karaoke')
+  const next = await api.apply(commands, 'splitting')
   if (!next) return
   const inserted = next.document.cues.filter((cue) => !before.has(cue.id))
   if (inserted.length) api.selectLines(inserted.map((cue) => cue.id))

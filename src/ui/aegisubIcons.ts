@@ -1,9 +1,11 @@
 /**
  * Aegisub 命令 → 图标文件映射。
  *
- * 图标源文件来自 Aegisub 源码 `Aegisub/src/bitmaps/button/*.png`（16/24/32/48/64px），
- * 已按 16px + 24px 复制到 `public/icons/aegisub/`。
- * 文件名规则：`{basename}_{size}.png`。
+ * 图标源文件来自 Aegisub 源码 `Aegisub/src/bitmaps/button/*.png`（16/24/32/48/64px）。
+ * 统一采用 64px 版本（`{basename}_64.png`）：位图非矢量，64px 下采样到 16/24px 显示
+ * 在高分屏（DPR≥1.5）上比 16px 原图更清晰，浏览器缩放质量足够。
+ * 显示尺寸仍由 CSS/width 属性控制（菜单/工具栏 16px），与源码布局一致。
+ * 无尺寸后缀的文件（app_icon.png）来自其他目录，保持原样。
  */
 
 export const COMMAND_ICONS: Record<string, string> = {
@@ -138,17 +140,16 @@ export const COMMAND_ICONS: Record<string, string> = {
 
 /**
  * 按 Vite base（兼容 GitHub Pages 子路径部署）拼出图标 URL。
- * size 省略时返回不带尺寸后缀的文件（如 app_icon.png）。
+ * basename 不带尺寸后缀，统一取 64px 版本（{basename}_64.png）；
+ * app_icon 等不带后缀的文件由调用方直接传全名。
  */
-export function aegisubIconUrl(basename: string, size?: 16 | 24): string {
+export function aegisubIconUrl(basename: string): string {
   const base = import.meta.env.BASE_URL ?? '/'
-  return size
-    ? `${base}icons/aegisub/${basename}_${size}.png`
-    : `${base}icons/aegisub/${basename}.png`
+  return `${base}icons/aegisub/${basename}.png`
 }
 
-/** 返回指定命令在给定尺寸下的图标 URL（无图标时返回 undefined） */
-export function commandIcon(command: string, size: 16 | 24 = 16): string | undefined {
+/** 返回指定命令的 64px 图标 URL（无图标时返回 undefined） */
+export function commandIcon(command: string): string | undefined {
   const basename = COMMAND_ICONS[command]
-  return basename ? aegisubIconUrl(basename, size) : undefined
+  return basename ? aegisubIconUrl(`${basename}_64`) : undefined
 }

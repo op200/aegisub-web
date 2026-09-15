@@ -1,5 +1,5 @@
 import { Captions, X } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 
 import {
   loadAutomationScript,
@@ -20,6 +20,7 @@ import { exportSubtitle } from '../core/format'
 import type { CoreCommand, CoreState, SubtitleDocument } from '../core/types'
 import {
   Framerate,
+  lowerBoundIndex,
   parseKeyframes,
   parseTimecodes,
   serializeKeyframes,
@@ -340,6 +341,8 @@ export function App() {
   const [busy, setBusy] = useState(false)
   const [toolbarVisible, setToolbarVisible] = useState(() => getOptionBool('App/Show Toolbar'))
   const [showStyleManager, setShowStyleManager] = useState(false)
+  // 编辑框 Edit 按钮直达样式编辑（源码 DialogStyleEditor），菜单入口仍是样式管理器
+  const [styleManagerAutoEdit, setStyleManagerAutoEdit] = useState(false)
   const [findMode, setFindMode] = useState<'find' | 'replace' | null>(null)
   // 查找/替换弹窗 ESC 关闭（不响应点击外部关闭）
   useEscapeClose(() => setFindMode(null), findMode !== null)
@@ -389,6 +392,8 @@ export function App() {
   const keyframeScanIdRef = useRef(0) // 换视频/关视频时作废旧的后台扫描
   const [timecodes, setTimecodes] = useState<Framerate | null>(null)
   const [timecodesFromFile, setTimecodesFromFile] = useState(false)
+  // 视频自带逐帧时间码表（ms；FFMS2 TimecodesVector 语义，解复用扫描上报）
+  const [videoFrameTimes, setVideoFrameTimes] = useState<number[] | null>(null)
   const [frameMode, setFrameMode] = useState(false) // 网格/编辑框帧号模式
   // 最近文件（mru.cpp）与探测到的真实视频帧率
   const [recentLists, setRecentLists] = useState<RecentLists>(() => ({
@@ -572,37 +577,55 @@ export function App() {
     setVideoTimeMs(frameRate.timeAtFrame(frameRate.frameAtTime(startMs, 'start'), 'exact'))
   }
 
+  // 活动行切换标记：仅行变化时 seek（源码 OnActiveLineChanged 只由行切换触发，
+  // 字幕内容/时间编辑不改活动行，不应错误跳转）
+  const activeLineIdRef = useRef<string | null | undefined>(undefined)
   useEffect(() => {
+    const lineChanged = activeLineIdRef.current !== activeId
+    activeLineIdRef.current = activeId
     // 视频自动跟随选中行（video_controller.cpp OnActiveLineChanged：Stop() + JumpToTime）
     // oxlint-disable-next-line react/set-state-in-effect
-    if (videoAutoScroll && videoMedia && selectedCue) {
+    if (lineChanged && videoAutoScroll && videoMedia && selectedCue) {
       sendVideoAction('stop')
       seekVideoToLineStart(selectedCue.startMs)
     }
     // oxlint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedCue, videoAutoScroll, videoMedia])
+  }, [activeId, selectedCue, videoAutoScroll, videoMedia])
 
-  // 帧率状态机：timecodes 文件 > 视频自带 CFR（探测帧率或 24）> 未加载（project.cpp）
-  const frameRate = useMemo(
-    () => timecodes ?? (videoMedia ? Framerate.cfr(detectedFps ?? DEFAULT_FPS) : Framerate.empty()),
-    [timecodes, videoMedia, detectedFps],
-  )
+  // 帧率状态机（project.cpp）：timecodes 文件 > 视频自带逐帧时间码表（FFMS2
+  // TimecodesVector）> 视频自带 CFR（探测帧率或 24，表不可得时的回退）> 未加载
+  const frameRate = useMemo(() => {
+    if (timecodes) return timecodes
+    if (videoFrameTimes && videoFrameTimes.length >= 2)
+      return Framerate.fromTimecodes(videoFrameTimes)
+    if (videoMedia) return Framerate.cfr(detectedFps ?? DEFAULT_FPS)
+    return Framerate.empty()
+  }, [timecodes, videoFrameTimes, videoMedia, detectedFps])
   const currentFrame = useMemo(
     () => (frameRate.isLoaded() ? frameRate.frameAtTime(videoTimeMs) : 0),
     [frameRate, videoTimeMs],
   )
   const frameCount = useMemo(() => {
-    if (timecodes) return timecodes.frameCount()
-    // provider GetFrameCount 语义：总帧数按探测帧率而非固定 24（否则滑块游标错位）
+    // 源码 project.cpp：timecodes 文件只改时间↔帧映射，帧数仍是视频 provider 的
+    // （GetFrameCount 不随加载的 timecodes 变；滑块长度、Save Timecodes 外推长度同理）
+    if (videoFrameTimes && videoFrameTimes.length >= 2) return videoFrameTimes.length
+    // 回退：provider GetFrameCount 语义按探测帧率而非固定 24（否则滑块游标错位）
     if (videoDurationMs > 0)
       return Math.max(1, Math.round((videoDurationMs * (detectedFps ?? DEFAULT_FPS)) / 1000))
+    if (timecodes) return timecodes.frameCount()
     return 1
-  }, [timecodes, videoDurationMs, detectedFps])
-  // 视频关键帧 ms→帧号：派生而非上报时换算，探测帧率晚到也能得到正确帧号
-  const videoKeyframes = useMemo(
-    () => videoKeyframeTimes.map((ms) => frameRate.frameAtTime(ms)),
-    [videoKeyframeTimes, frameRate],
-  )
+  }, [timecodes, videoFrameTimes, videoDurationMs, detectedFps])
+  // 视频关键帧 ms→帧号：关键帧时间为视频流原始 PTS。帧号 = 在原始逐帧时间码表中的
+  // 下界序号（FFMS2 索引按 PTS 升序排帧，keyframe 帧号即排序后位置）——不能用归一化
+  // 后的 frameRate.frameAtTime（首帧 PTS ≠ 0 时整体偏移 N 帧；加载 timecodes 文件后
+  // 时间线也换掉），视频自身帧序号不随这些变
+  const videoKeyframes = useMemo(() => {
+    if (!videoKeyframeTimes.length) return []
+    if (videoFrameTimes && videoFrameTimes.length >= 2)
+      return videoKeyframeTimes.map((ms) => lowerBoundIndex(videoFrameTimes, ms))
+    // 无表（CFR 回退）：帧号按探测帧率时间线外推
+    return videoKeyframeTimes.map((ms) => frameRate.frameAtTime(ms))
+  }, [videoKeyframeTimes, videoFrameTimes, frameRate])
   // keyframes 文件优先（project.cpp：文件加载 > 视频自带）
   const activeKeyframes = keyframesFromFile ? keyframes : videoKeyframes
 
@@ -753,7 +776,8 @@ export function App() {
         const next = await coreRef.current.apply(commands, label)
         setCore(next)
         setDirty(true)
-        setStatus(label)
+        // label 为源码 msgid（小写），经 tPlain 命中 po 翻译显示
+        setStatus(tPlain(label))
         return next
       } catch (error) {
         setStatus(error instanceof Error ? error.message : tPlain('Edit failed'))
@@ -812,7 +836,7 @@ export function App() {
           },
         },
       ],
-      tPlain('Insert line'),
+      tPlain('line insertion'),
     )
     const inserted = state?.document.cues.find((cue) => !before.has(cue.id))
     if (inserted) selectOnly(inserted.id)
@@ -1017,6 +1041,7 @@ export function App() {
     setVideoTimeMs(0)
     setVideoDurationMs(0)
     setDetectedFps(null) // 新视频重新探测帧率
+    setVideoFrameTimes(null) // 新视频重新扫描逐帧时间码表
     // 关键帧后台扫描（project.cpp：视频 provider 建索引提供 keyframes——是文件属性，
     // 与解码路径无关；原生 <video> 拿不到 chunk 类型，必须独立解复用扫描）。
     // ffindex 索引缓存对应物：同 crc32_大小_修改时间 的文件命中 IndexedDB 缓存免扫描
@@ -1028,10 +1053,14 @@ export function App() {
         const cached = await loadCachedKeyframes(scanFile)
         if (keyframeScanIdRef.current !== scanId) return
         if (cached) {
-          setVideoKeyframeTimes(cached)
-          return
+          setVideoKeyframeTimes(cached.keyframeTimesMs)
+          // v2 条目附带逐帧时间码表；v1 旧条目（undefined）继续走扫描补全
+          if (cached.frameTimesMs && cached.frameTimesMs.length >= 2)
+            setVideoFrameTimes(cached.frameTimesMs)
+          if (cached.frameTimesMs) return
         }
         let latest: number[] = []
+        let latestFrames: number[] | null = null
         await extractVideoKeyframes(
           scanFile,
           (times) => {
@@ -1039,11 +1068,15 @@ export function App() {
             if (keyframeScanIdRef.current === scanId) setVideoKeyframeTimes(times)
           },
           () => keyframeScanIdRef.current !== scanId,
+          (frames) => {
+            latestFrames = frames
+            if (keyframeScanIdRef.current === scanId) setVideoFrameTimes(frames)
+          },
         ).catch(() => {
-          // 容器打不开（罕见封装）时保持无关键帧，不影响视频播放
+          // 容器打不开（罕见封装）时保持无关键帧/无表，不影响视频播放
         })
-        if (keyframeScanIdRef.current === scanId && latest.length > 0)
-          void storeCachedKeyframes(scanFile, latest)
+        if (keyframeScanIdRef.current !== scanId) return
+        if (latest.length > 0) void storeCachedKeyframes(scanFile, latest, latestFrames ?? [])
       })()
     }
     // 旧视频 URL 若仍被保留的音频引用（Video/Open Audio 关闭时）不能释放
@@ -1065,6 +1098,7 @@ export function App() {
     setVideoTimeMs(0)
     keyframeScanIdRef.current += 1 // 作废后台扫描
     setVideoKeyframeTimes([])
+    setVideoFrameTimes(null)
     // project.cpp DoCloseVideo：无外部文件时回退为空关键帧/未加载 timecodes
     if (!keyframesFromFile) setKeyframes([])
     if (!timecodesFromFile) {
@@ -1361,10 +1395,7 @@ export function App() {
       if (match) {
         const text =
           selectedCue.text.slice(0, match.start) + replaceQuery + selectedCue.text.slice(match.end)
-        void apply(
-          [{ type: 'updateCue', id: selectedCue.id, patch: { text } }],
-          tPlain('Replace text'),
-        )
+        void apply([{ type: 'updateCue', id: selectedCue.id, patch: { text } }], tPlain('replace'))
       } else {
         setStatus(tPlain('No match in current line'))
       }
@@ -1561,10 +1592,28 @@ export function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return
       const target = event.target as HTMLElement
-      const editing = target.matches('input, textarea, select, [contenteditable="true"]')
+      // 编辑守卫只拦文本输入类（源码 wxTextCtrl 全消费）；range/checkbox/radio 在
+      // wxSLIDER/wxCHKBUTTON 语义下仅消费自身导航键、其余键向上传播（wx 事件 Skip）
+      const editing = target.matches(
+        'input:not([type="range"], [type="checkbox"], [type="radio"], [type="button"]), textarea, select, [contenteditable="true"]',
+      )
+      const isRangeSlider = target.matches('input[type="range"]')
       const contextElement = target.closest<HTMLElement>('[data-shortcut-context]')
       const context = (contextElement?.dataset.shortcutContext ?? 'Default') as ShortcutContext
       const shortcut = shortcutFromKeyboardEvent(event)
+      // 滑条聚焦时导航键由原生控件消费（源码 wxSlider 先吃掉方向键再传播）
+      if (
+        isRangeSlider &&
+        (shortcut === 'Left' ||
+          shortcut === 'Right' ||
+          shortcut === 'Up' ||
+          shortcut === 'Down' ||
+          shortcut === 'Home' ||
+          shortcut === 'End' ||
+          shortcut === 'PageUp' ||
+          shortcut === 'PageDown')
+      )
+        return
       const command = commandForShortcut(shortcut, context)
       const isSubtitleEditor = context === 'Subtitle Edit Box'
       const nativeEditingCommands = new Set([
@@ -1595,6 +1644,7 @@ export function App() {
   return (
     <main
       className={`app-shell${toolbarVisible ? '' : ' toolbar-hidden'}`}
+      style={{ '--icon-size': `${getOptionInt('App/Toolbar Icon Size')}px` } as CSSProperties}
       onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
         event.preventDefault()
@@ -1704,7 +1754,9 @@ export function App() {
           <div
             className="right-workspace"
             style={
-              !isNarrowViewport && audioMedia && displayMode !== 'video_subs'
+              // 源码 AudioBox 恒有底边 sash（SetSashVisible(wxSASH_BOTTOM, true)），
+              // 与是否加载音频无关；video_subs 布局无音频框才没有
+              !isNarrowViewport && displayMode !== 'video_subs'
                 ? { gridTemplateRows: `${audioBoxHeight}px 4px minmax(0, 1fr)` }
                 : undefined
             }
@@ -1738,7 +1790,7 @@ export function App() {
                 }
               />
             )}
-            {!isNarrowViewport && audioMedia && displayMode !== 'video_subs' && (
+            {!isNarrowViewport && displayMode !== 'video_subs' && (
               <div
                 className="audio-sash"
                 role="separator"
@@ -1795,6 +1847,10 @@ export function App() {
               }}
               onCommand={executeCommand}
               isCommandEnabled={isCommandEnabled}
+              onEditStyle={() => {
+                setStyleManagerAutoEdit(true)
+                setShowStyleManager(true)
+              }}
             />
           </div>
         </div>
@@ -1855,15 +1911,21 @@ export function App() {
         <StyleManagerDialog
           styles={core.document.styles}
           activeStyleName={selectedCue?.style ?? core.document.styles[0]?.name ?? ''}
-          onClose={() => setShowStyleManager(false)}
-          onUpdate={(id, patch) =>
-            void apply([{ type: 'updateStyle', id, patch }], tPlain('Update style'))
+          autoEdit={styleManagerAutoEdit}
+          onClose={() => {
+            setShowStyleManager(false)
+            setStyleManagerAutoEdit(false)
+          }}
+          onUpdate={(id, patch, label) =>
+            void apply([{ type: 'updateStyle', id, patch }], tPlain(label ?? 'style change'))
           }
-          onAdd={(style) => void apply([{ type: 'addStyle', style }], tPlain('Add style'))}
+          onAdd={(style, label) =>
+            void apply([{ type: 'addStyle', style }], tPlain(label ?? 'style change'))
+          }
           onDelete={(ids) =>
-            ids.forEach((id) => void apply([{ type: 'deleteStyle', id }], tPlain('Delete style')))
+            ids.forEach((id) => void apply([{ type: 'deleteStyle', id }], tPlain('style delete')))
           }
-          onReorder={(ids) => void apply([{ type: 'reorderStyles', ids }], tPlain('Move styles'))}
+          onReorder={(ids) => void apply([{ type: 'reorderStyles', ids }], tPlain('style move'))}
         />
       )}
 
@@ -1969,7 +2031,7 @@ export function App() {
           scriptInfo={core.document.scriptInfo}
           onClose={() => setDialog(null)}
           onApply={(patch) =>
-            void apply([{ type: 'updateScriptInfo', patch }], tPlain('Update script properties'))
+            void apply([{ type: 'updateScriptInfo', patch }], tPlain('property changes'))
           }
         />
       )}
@@ -1981,7 +2043,7 @@ export function App() {
           onApply={(style, next) => {
             void apply(
               [{ type: 'updateCue', id: selectedCue.id, patch: { style } }],
-              tPlain('Apply style'),
+              tPlain('styling assistant'),
             )
             if (next) moveSelection(1)
           }}
@@ -2007,7 +2069,7 @@ export function App() {
           onApply={(text) =>
             void apply(
               [{ type: 'updateCue', id: selectedCue.id, patch: { text } }],
-              tPlain('Translate line'),
+              tPlain('translation assistant'),
             )
           }
           onClose={() => setDialog(null)}
@@ -2023,7 +2085,7 @@ export function App() {
         <ResampleDialog
           scriptInfo={core.document.scriptInfo}
           onApply={(patch) =>
-            void apply([{ type: 'updateScriptInfo', patch }], tPlain('Resample resolution'))
+            void apply([{ type: 'updateScriptInfo', patch }], tPlain('resolution resampling'))
           }
           onClose={() => setDialog(null)}
         />

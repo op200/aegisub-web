@@ -15,9 +15,11 @@ import { openMainDatabase } from './db'
 const STORE = 'keyframes'
 
 interface StoredKeyframeEntry {
-  version: 1
+  version: 1 | 2 | 3
   name: string
   keyframeTimesMs: number[]
+  /** v3：逐帧 PTS 毫秒时间码表（FFMS2 TimecodesVector 对应物）；空数组=容器无有效表 */
+  frameTimesMs?: number[]
   savedAt: number
   bytes: number
 }
@@ -46,7 +48,13 @@ export function keyframeCacheKey(file: File): string {
   return `${crc32(file.name)}_${file.size}_${modifiedSeconds}`
 }
 
-export async function loadCachedKeyframes(file: File): Promise<number[] | null> {
+export interface CachedVideoIndex {
+  keyframeTimesMs: number[]
+  /** 逐帧时间码表；undefined=旧条目（无表或为浮点旧算法，需重扫描补全） */
+  frameTimesMs?: number[]
+}
+
+export async function loadCachedKeyframes(file: File): Promise<CachedVideoIndex | null> {
   try {
     if (typeof indexedDB === 'undefined') return null
     const database = await openMainDatabase()
@@ -56,9 +64,12 @@ export async function loadCachedKeyframes(file: File): Promise<number[] | null> 
         request.onsuccess = () => resolve(request.result as StoredKeyframeEntry | undefined)
         request.onerror = () => reject(request.error)
       })
-      return entry?.version === 1 && Array.isArray(entry.keyframeTimesMs)
-        ? entry.keyframeTimesMs
-        : null
+      if (!entry || !Array.isArray(entry.keyframeTimesMs)) return null
+      // v1/v2 旧条目只回关键帧（v2 的表用浮点秒截断，个别帧差 1ms，v3 重扫修正）；
+      // v3 起附带逐帧时间码表
+      if (entry.version !== 3 || !Array.isArray(entry.frameTimesMs))
+        return { keyframeTimesMs: entry.keyframeTimesMs }
+      return { keyframeTimesMs: entry.keyframeTimesMs, frameTimesMs: entry.frameTimesMs }
     } finally {
       database.close()
     }
@@ -89,20 +100,37 @@ function selectEvictions(
   return evict
 }
 
-export async function storeCachedKeyframes(file: File, keyframeTimesMs: number[]): Promise<void> {
+export async function storeCachedKeyframes(
+  file: File,
+  keyframeTimesMs: number[],
+  frameTimesMs?: number[],
+): Promise<void> {
   try {
     if (typeof indexedDB === 'undefined' || keyframeTimesMs.length === 0) return
     const key = keyframeCacheKey(file)
-    const serialized = JSON.stringify(keyframeTimesMs)
-    const entry: StoredKeyframeEntry = {
-      version: 1,
-      name: file.name,
-      keyframeTimesMs,
-      savedAt: Date.now(),
-      bytes: serialized.length, // JSON 数字为 ASCII，字符数即字节数
-    }
     const database = await openMainDatabase()
     try {
+      // 渐进上报（WebCodecs 读流路径）不带表调用时保留既有条目的时间码表，
+      // 避免空表覆盖解复用扫描已建好的表
+      let table = frameTimesMs ?? []
+      if (table.length === 0) {
+        const existing = await new Promise<StoredKeyframeEntry | undefined>((resolve, reject) => {
+          const request = database.transaction(STORE).objectStore(STORE).get(key)
+          request.onsuccess = () => resolve(request.result as StoredKeyframeEntry | undefined)
+          request.onerror = () => reject(request.error)
+        })
+        if (existing?.version === 3 && Array.isArray(existing.frameTimesMs))
+          table = existing.frameTimesMs
+      }
+      const serialized = JSON.stringify([keyframeTimesMs, table])
+      const entry: StoredKeyframeEntry = {
+        version: 3,
+        name: file.name,
+        keyframeTimesMs,
+        frameTimesMs: table,
+        savedAt: Date.now(),
+        bytes: serialized.length, // JSON 数字为 ASCII，字符数即字节数
+      }
       const store = database.transaction(STORE, 'readwrite').objectStore(STORE)
       store.put(entry, key)
       await new Promise<void>((resolve, reject) => {

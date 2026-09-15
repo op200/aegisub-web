@@ -18,9 +18,13 @@ import { useEscapeClose } from './dialogs'
 interface Props {
   styles: SubtitleStyle[]
   activeStyleName: string
+  /** 挂载即打开当前行样式的编辑面板（编辑框 Edit 按钮语义，源码 DialogStyleEditor） */
+  autoEdit?: boolean
   onClose: () => void
-  onAdd: (style: SubtitleStyle) => void
-  onUpdate: (id: string, patch: Partial<Omit<SubtitleStyle, 'id'>>) => void
+  // label 覆写用于跨表复制（源码 dialog_style_manager.cpp CopyToCurrent = "style copy"），
+  // 编辑面板保存/新建经 DialogStyleEditor 统一 "style change"
+  onAdd: (style: SubtitleStyle, label?: string) => void
+  onUpdate: (id: string, patch: Partial<Omit<SubtitleStyle, 'id'>>, label?: string) => void
   onDelete: (ids: string[]) => void
   onReorder: (ids: string[]) => void
 }
@@ -72,6 +76,7 @@ function reorder(
 export function StyleManagerDialog({
   styles,
   activeStyleName,
+  autoEdit,
   onClose,
   onAdd,
   onUpdate,
@@ -93,6 +98,12 @@ export function StyleManagerDialog({
     setPrevActiveId(active?.id ?? null)
     setCurrentSelected(active ? [active.id] : [])
   }
+  // Edit 按钮（编辑框）直达当前样式编辑，等价源码直接 ShowModal DialogStyleEditor
+  useEffect(() => {
+    if (autoEdit && active)
+      setEditor({ side: 'current', style: structuredClone(active), originalId: active.id })
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- 仅按挂载时的活动行样式初始化
+  }, [])
   const saveCatalogs = (next: StyleCatalog[]) => {
     setCatalogs(next)
     saveStyleCatalogs(next)
@@ -132,8 +143,9 @@ export function StyleManagerDialog({
             id?: string
           }
           delete replacement.id
-          onUpdate(existing.id, replacement)
-        } else onAdd({ ...structuredClone(style), id: `style-${crypto.randomUUID()}` })
+          onUpdate(existing.id, replacement, 'style copy')
+        } else
+          onAdd({ ...structuredClone(style), id: `style-${crypto.randomUUID()}` }, 'style copy')
       } else {
         updateCatalogStyles(
           existing

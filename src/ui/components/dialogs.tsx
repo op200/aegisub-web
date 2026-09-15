@@ -159,7 +159,7 @@ export function ShiftTimesDialog({ cues, selectedIds, onClose, onApply }: ShiftT
         endMs: Math.max(0, cue.endMs + signed),
       },
     }))
-    onApply(commands, `Shift times ${backward ? 'backward' : 'forward'}`)
+    onApply(commands, 'shifting')
     onClose()
   }
 
@@ -1687,6 +1687,7 @@ export function TimingProcessorDialog({
           </fieldset>
           <fieldset className="dialog-fieldset">
             <legend>{tPlain('Lead-in/Lead-out')}</legend>
+            {/* 源码为单行横排：两组"启用勾选 + 毫秒输入"并排（LeadSizer wxHORIZONTAL） */}
             <div className="dialog-row">
               <label className="dialog-check" title={tPlain('Enable adding of lead-ins to lines')}>
                 <input
@@ -1697,8 +1698,6 @@ export function TimingProcessorDialog({
                 {tPlain('Add lead in:')}
               </label>
               {numberInput(leadIn, setLeadIn, '', !enableLeadIn)}
-            </div>
-            <div className="dialog-row">
               <label className="dialog-check" title={tPlain('Enable adding of lead-outs to lines')}>
                 <input
                   type="checkbox"

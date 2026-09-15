@@ -12,6 +12,8 @@ import { WebDemuxer, AVSeekFlag, AVMediaType } from 'web-demuxer'
 import type { WebAVStream, WebMediaInfo } from 'web-demuxer'
 import demuxerWasmAsset from 'web-demuxer/wasm?url'
 
+import { ptsToMs } from '../core/vfr'
+
 // web-demuxer 的 worker 由 blob URL 创建（内嵌 base64 脚本），blob: 无层次路径，
 // worker 内 fetch 相对/根相对 URL 会 "Failed to parse URL" —— 必须先解析为绝对 URL
 const demuxerWasmUrl = new URL(demuxerWasmAsset, globalThis.location.href).href
@@ -65,11 +67,17 @@ export function needsDemuxFallback(name: string): boolean {
  * 扫描视频流关键帧时间（project.cpp：FFMS2 provider 建索引时提供 keyframes，是文件的
  * 属性而非解码器的——浏览器原生 <video> 路径拿不到 chunk 类型，必须独立解复用扫描）。
  * 渐进上报全量列表（每 ≥32 个或流结束），timesMs 为毫秒；isStale 返回 true 时中止。
+ *
+ * 同时收集全部视频包 PTS 毫秒（onFrameTimes）——对应 FFMS2
+ * video_provider_ffmpegsource.cpp 的 TimecodesVector：逐帧 `(PTS * TimeBase->Num) /
+ * TimeBase->Den`（毫秒截断）后 Framerate(TimecodesVector) 建表，源码视频的"帧率"
+ * 实为逐帧时间码表而非标量 CFR。
  */
 export async function extractVideoKeyframes(
   file: File,
   onProgress: (timesMs: number[]) => void,
   isStale: () => boolean,
+  onFrameTimes?: (framesMs: number[]) => void,
 ): Promise<void> {
   const demuxer = new WebDemuxer({ wasmFilePath: demuxerWasmUrl })
   try {
@@ -79,21 +87,31 @@ export async function extractVideoKeyframes(
     const streams = (info.streams ?? []) as WebAVStream[]
     if (!streams.some((stream) => stream.codec_type === AVMediaType.AVMEDIA_TYPE_VIDEO)) return
     const found: number[] = []
+    const frameTimes: number[] = []
     let reported = 0
     const reader = demuxer.readMediaPacket('video').getReader()
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
       if (isStale()) return
+      // (int)((PTS * TimeBase->Num) / TimeBase->Den)：毫秒截断（浮点补偿见 ptsToMs）
+      frameTimes.push(ptsToMs(value.timestamp))
       if (value.keyframe) {
-        found.push(value.timestamp * 1000)
+        found.push(ptsToMs(value.timestamp))
         if (found.length - reported >= 32) {
           reported = found.length
           onProgress(found.slice())
         }
       }
     }
-    if (!isStale() && found.length > reported) onProgress(found.slice())
+    if (isStale()) return
+    if (found.length > reported) onProgress(found.slice())
+    // 包按封装（解码）顺序到来，B 帧会乱序；FFMS2 索引按显示序——升序排序后建表。
+    // 全 0 / 单包的畸形容器不产出（调用方回退 CFR 探测）
+    if (onFrameTimes && frameTimes.length >= 2) {
+      const sorted = [...frameTimes].sort((a, b) => a - b)
+      if (sorted[sorted.length - 1] > 0) onFrameTimes(sorted)
+    }
   } finally {
     demuxer.destroy()
   }

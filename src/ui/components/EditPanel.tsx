@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-import { getOptionBool, getOptionInt, getOptionString } from '../../config/options'
+import { getOptionBool, getOptionInt, getOptionString, setOption } from '../../config/options'
 import {
   assOverrideColor,
   blockAtPos,
@@ -19,13 +19,13 @@ import { aegisubIconUrl } from '../aegisubIcons'
 import { tokenizeAss, getSyntaxColors } from '../assHighlight'
 import { assColorToHex } from '../color'
 import { editCursorState } from '../commandRegistry'
-import { commandTooltip } from '../commands'
+import { COMMANDS, commandTooltip } from '../commands'
 import { tPlain } from '../i18n'
 import { useSystemTheme } from '../theme'
 import { Dialog } from './dialogs'
 import { MenuPopup } from './MenuPopup'
 
-const EDIT_ICON = (name: string) => aegisubIconUrl(name, 16)
+const EDIT_ICON = (name: string) => aegisubIconUrl(`${name}_64`)
 
 /** edit/color/* 按钮 → 覆写标签 + 样式字段（command/edit.cpp show_color_picker） */
 const COLOR_TAGS = {
@@ -95,6 +95,8 @@ interface EditPanelProps {
   onCommit: (patch: Partial<Omit<SubtitleCue, 'id'>>, label: string) => void
   onCommand: (id: string) => void
   isCommandEnabled: (id: string) => boolean
+  /** Edit 按钮：直接打开当前行样式的编辑对话框（源码 DialogStyleEditor） */
+  onEditStyle: () => void
 }
 
 export function EditPanel({
@@ -108,9 +110,11 @@ export function EditPanel({
   onCommit,
   onCommand,
   isCommandEnabled,
+  onEditStyle,
 }: EditPanelProps) {
   const [draft, setDraft] = useState<SubtitleCue | null>(cue ? structuredClone(cue) : null)
-  const [showOriginal, setShowOriginal] = useState(false)
+  // Show Original 持久化（subs_edit_box.cpp OnSplit 写 OPT_SET "Subtitle/Show Original"）
+  const [showOriginal, setShowOriginal] = useState(() => getOptionBool('Subtitle/Show Original'))
   const [originalText, setOriginalText] = useState(cue?.text ?? '')
   const originalCueIdRef = useRef(cue?.id)
   const editorRef = useRef<HTMLTextAreaElement>(null)
@@ -124,7 +128,15 @@ export function EditPanel({
   const [fontFamilies, setFontFamilies] = useState<string[]>([])
   // 时间框编辑会话起点（subs_edit_box.cpp initial_times：焦点获得时快照，
   // 改 Start 时 End=max(Start, 会话初值)、改 End 时 Start=min(End, 会话初值)）
-  const initialTimesRef = useRef<{ startMs: number; endMs: number } | null>(null)
+  const initialTimesRef = useRef<{ id: string; startMs: number; endMs: number } | null>(null)
+  // 焦点字段用 state：渲染期草稿重置需要读取（React Compiler 禁止渲染期访问 ref），
+  // 且换行时在渲染期重置（React 官方"props 变化调整 state"模式）
+  const [editingField, setEditingField] = useState<keyof SubtitleCue | null>(null)
+  // 已发送字段值：按 "行id:字段" 键控（cue prop 可能落后于在途事务，用陈旧 cue 比较
+  // 会漏发补丁；跨行残留的键值只会命中"core 已有该值"的正确 no-op）
+  const sentFieldsRef = useRef<
+    Record<string, string | number | boolean | { startMs?: number; endMs: number }>
+  >({})
   // 右键菜单（subs_edit_ctrl.cpp OnContextMenu）
   const [textMenu, setTextMenu] = useState<{ x: number; y: number } | null>(null)
   useEffect(() => {
@@ -140,7 +152,23 @@ export function EditPanel({
   const [prevCue, setPrevCue] = useState<SubtitleCue | null>(cue)
   if (cue !== prevCue) {
     setPrevCue(cue)
-    setDraft(cue ? structuredClone(cue) : null)
+    if (cue?.id !== prevCue?.id) {
+      // 换行即结束编辑会话（源码 OnCommit → initial_times.clear()）；时间会话 ref 由
+      // commitTimeKeystroke 按 cue.id 键控自动重建，blur 时清空
+      setEditingField(null)
+    }
+    setDraft((old) => {
+      if (!cue) return null
+      if (!old || cue.id !== old.id) return structuredClone(cue)
+      // apply 回写晚于下一次按键时，回写中间值会在渲染期覆盖本地草稿吞掉输入：
+      // 焦点字段以本地草稿为准（同行内）
+      if (!editingField) return structuredClone(cue)
+      const merged = structuredClone(cue)
+      ;(merged as unknown as Record<string, unknown>)[editingField] = (
+        old as unknown as Record<string, unknown>
+      )[editingField]
+      return merged
+    })
   }
   const darkTheme = useSystemTheme() === 'dark'
   useEffect(() => {
@@ -158,6 +186,53 @@ export function EditPanel({
     label: string,
   ) => {
     if (cue[field] !== value) onCommit({ [field]: value }, label)
+  }
+  /** 逐键提交（源码 EVT_TEXT）：以已发送值为准去重（cue prop 可能落后于在途事务，
+   *  用陈旧 cue 比较会漏发补丁）；键含行 id，跨行残留只会命中"core 已有该值"的 no-op；
+   *  runtime 按"同 label+同目标行"合并 undo */
+  const commitField = (
+    field: 'actor' | 'effect' | 'marginL' | 'marginR' | 'marginV',
+    value: string | number,
+    label: string,
+  ) => {
+    const key = `${cue.id}:${field}`
+    if (sentFieldsRef.current[key] === value) return
+    sentFieldsRef.current[key] = value
+    onCommit({ [field]: value } as Partial<Omit<SubtitleCue, 'id'>>, label)
+  }
+  /** 时间提交（subs_edit_box.cpp CommitTimes）：以已发送值为准去重后发送；
+   *  undo 标签 "modify times"（源码同） */
+  const commitTimes = (patch: { startMs?: number; endMs: number }) => {
+    const key = `${cue.id}:times`
+    const sent = sentFieldsRef.current[key] as { startMs?: number; endMs: number } | undefined
+    const startSent = patch.startMs === undefined || sent?.startMs === patch.startMs
+    if (startSent && sent?.endMs === patch.endMs) return
+    sentFieldsRef.current[key] = { ...sent, ...patch }
+    onCommit(patch, 'modify times')
+  }
+  /** 时间编辑会话（subs_edit_box.cpp initial_times）：按行缓存快照，跨行自动重建 */
+  const timeSession = () => {
+    let session = initialTimesRef.current
+    if (!session || session.id !== cue.id) {
+      session = { id: cue.id, startMs: cue.startMs, endMs: cue.endMs }
+      initialTimesRef.current = session
+    }
+    return session
+  }
+  /** Start/End 输入逐键提交（CommitTimes TIME_START/TIME_END 分支）：改 Start 时
+   *  End=max(Start, 会话初值)；改 End 时 Start=min(End, 会话初值) */
+  const commitTimeKeystroke = (field: 'startMs' | 'endMs', value: number) => {
+    const session = timeSession()
+    let patch: { startMs: number; endMs: number }
+    if (field === 'startMs') {
+      session.startMs = value
+      patch = { startMs: value, endMs: Math.max(value, session.endMs) }
+    } else {
+      session.endMs = value
+      patch = { endMs: value, startMs: Math.min(value, session.startMs) }
+    }
+    setDraft({ ...draft, ...patch })
+    commitTimes(patch)
   }
   /** 光标处的有效字体（command/edit.cpp font_for_line） */
   const effectiveFontAt = (text: string, normPos: number): EffectiveFont => {
@@ -199,12 +274,12 @@ export function EditPanel({
     // subs_edit_box.cpp CommitTimes：改 Start 时 End=max(Start, 会话初值)；
     // 改 End 时 Start=min(End, 会话初值)；未进入编辑会话按当前值互钳
     const initial = initialTimesRef.current ?? { startMs: cue.startMs, endMs: cue.endMs }
-    const patch: Partial<Omit<SubtitleCue, 'id'>> =
+    const patch: { startMs?: number; endMs: number } =
       field === 'startMs'
         ? { startMs: value, endMs: Math.max(value, initial.endMs) }
         : { endMs: value, startMs: Math.min(value, initial.startMs) }
     setDraft({ ...draft, ...patch })
-    onCommit(patch, 'modify times')
+    commitTimes(patch)
   }
   /** command/edit.cpp toggle_override_tag：光标处读取当前状态后真实切换；
    *  有选区时首尾各写一个标签（state?0:1 … state?1:0），无选区只写光标处一个 */
@@ -336,21 +411,13 @@ export function EditPanel({
   const highlighted = tokenizeAss(draft.text)
   const syntaxColors = getSyntaxColors(darkTheme)
   const syntaxHighlight = getOptionBool('Subtitle/Highlight/Syntax')
-  // 字符计数（Subtitle/Character Limit + Counter 选项；超限红色，CPS 超 warning/error 阈值提示）
+  // 字符计数（Subtitle/Character Limit 选项；超限红底，UpdateCharacterCount 只显示数字）
   const characterCount = longestVisibleLine(
     draft.text,
     getOptionBool('Subtitle/Character Counter/Ignore Whitespace'),
     getOptionBool('Subtitle/Character Counter/Ignore Punctuation'),
   )
   const characterLimit = getOptionInt('Subtitle/Character Limit')
-  const cpsWarningThreshold = getOptionInt('Subtitle/Character Counter/CPS Warning Threshold')
-  const cpsErrorThreshold = getOptionInt('Subtitle/Character Counter/CPS Error Threshold')
-  const lineCps =
-    draft.endMs > draft.startMs
-      ? Math.round(
-          (draft.text.replace(/\{[^}]*\}/g, '').length * 1000) / (draft.endMs - draft.startMs),
-        )
-      : 0
   const editFontFace = getOptionString('Subtitle/Edit Box/Font Face')
   const editFontSize = Math.round((getOptionInt('Subtitle/Edit Box/Font Size') * 4) / 3)
   const editorStyle = {
@@ -390,7 +457,7 @@ export function EditPanel({
       const start = editor.selectionStart
       const end = editor.selectionEnd
       const nextText = `${draft.text.slice(0, start)}${text}${draft.text.slice(end)}`
-      commitText(nextText, 'Edit text')
+      commitText(nextText, 'modify text')
       requestAnimationFrame(() =>
         editor.setSelectionRange(start + text.length, start + text.length),
       )
@@ -416,7 +483,13 @@ export function EditPanel({
   }
 
   return (
-    <section className="edit-panel" aria-label={tPlain('Line editor')}>
+    <section
+      className="edit-panel"
+      aria-label={tPlain('Line editor')}
+      // 整个编辑框是 "Subtitle Edit Box" 热键上下文（源码 wx 传播：TimeEdit 等子
+      // 控件的按键沿父链到达 SubsEditBox::OnKeyDown），时间输入框聚焦时热键不失效
+      data-shortcut-context="Subtitle Edit Box"
+    >
       {/* 第 1 行：Comment | Style | Edit | Actor | Effect | 字符数（Aegisub top_sizer） */}
       <div className="edit-row edit-row-top">
         <label className="comment-toggle">
@@ -425,7 +498,7 @@ export function EditPanel({
             checked={draft.comment}
             onChange={(event) => {
               setDraft({ ...draft, comment: event.target.checked })
-              commit('comment', event.target.checked, 'Toggle comment')
+              commit('comment', event.target.checked, 'comment change')
             }}
           />
           {tPlain('Comment')}
@@ -435,7 +508,7 @@ export function EditPanel({
             value={draft.style}
             onChange={(event) => {
               setDraft({ ...draft, style: event.target.value })
-              commit('style', event.target.value, 'Set style')
+              commit('style', event.target.value, 'style change')
             }}
           >
             {styles.map((style) => (
@@ -443,9 +516,11 @@ export function EditPanel({
             ))}
           </select>
         </label>
+        {/* 源码 Edit 按钮直接打开当前行样式的编辑对话框（subs_edit_box.cpp，样式缺失时禁用） */}
         <button
           className="edit-edit-btn"
-          onClick={() => onCommand('tool/style/manager')}
+          onClick={onEditStyle}
+          disabled={!styles.some((style) => style.name === draft.style)}
           title={tPlain('Edit style')}
         >
           {tPlain('Edit')}
@@ -455,8 +530,15 @@ export function EditPanel({
             list={`edit-actor-values-${cue.id}`}
             placeholder={tPlain('Actor')}
             value={draft.actor}
-            onChange={(event) => setDraft({ ...draft, actor: event.target.value })}
-            onBlur={() => commit('actor', draft.actor, 'Set actor')}
+            onFocus={() => setEditingField('actor')}
+            onChange={(event) => {
+              setDraft({ ...draft, actor: event.target.value })
+              commitField('actor', event.target.value, 'actor change')
+            }}
+            onBlur={() => {
+              setEditingField(null)
+              commitField('actor', draft.actor, 'actor change')
+            }}
           />
           <datalist id={`edit-actor-values-${cue.id}`}>
             {actors.map((value) => (
@@ -469,8 +551,15 @@ export function EditPanel({
             list={`edit-effect-values-${cue.id}`}
             placeholder={tPlain('Effect')}
             value={draft.effect}
-            onChange={(event) => setDraft({ ...draft, effect: event.target.value })}
-            onBlur={() => commit('effect', draft.effect, 'Set effect')}
+            onFocus={() => setEditingField('effect')}
+            onChange={(event) => {
+              setDraft({ ...draft, effect: event.target.value })
+              commitField('effect', event.target.value, 'effect change')
+            }}
+            onBlur={() => {
+              setEditingField(null)
+              commitField('effect', draft.effect, 'effect change')
+            }}
           />
           <datalist id={`edit-effect-values-${cue.id}`}>
             {effects.map((value) => (
@@ -483,13 +572,6 @@ export function EditPanel({
           title={tPlain('Number of characters in the longest line of this subtitle')}
         >
           {characterCount}
-          {characterLimit > 0 ? `/${characterLimit}` : ''}
-          {lineCps > 0 && lineCps > cpsWarningThreshold ? (
-            <span className={`char-cps${lineCps > cpsErrorThreshold ? ' cps-error' : ' cps-warn'}`}>
-              {' '}
-              {lineCps} {tPlain('cps')}
-            </span>
-          ) : null}
         </output>
       </div>
 
@@ -504,30 +586,44 @@ export function EditPanel({
             min={0}
             max={999}
             value={draft.layer}
+            onFocus={() => setEditingField('layer')}
             onChange={(event) => setDraft({ ...draft, layer: Number(event.target.value) })}
-            onBlur={() => commit('layer', draft.layer, 'Set layer')}
+            onBlur={() => {
+              setEditingField(null)
+              commit('layer', draft.layer, 'layer change')
+            }}
           />
           <input
             className="time-field"
             aria-label={tPlain('Start')}
             title={tPlain('Start time')}
             value={toStartText(draft.startMs)}
+            onFocus={() => setEditingField('startMs')}
             onChange={(event) => {
               const parsed = parseStartInput(event.target.value)
-              if (parsed !== null) setDraft({ ...draft, startMs: parsed })
+              if (parsed !== null) commitTimeKeystroke('startMs', parsed)
             }}
-            onBlur={(event) => setTime('startMs', event.target.value, parseStartInput)}
+            onBlur={(event) => {
+              setEditingField(null)
+              setTime('startMs', event.target.value, parseStartInput)
+              initialTimesRef.current = null
+            }}
           />
           <input
             className="time-field"
             aria-label={tPlain('End')}
             title={tPlain('End time')}
             value={toEndText(draft.endMs)}
+            onFocus={() => setEditingField('endMs')}
             onChange={(event) => {
               const parsed = parseEndInput(event.target.value)
-              if (parsed !== null) setDraft({ ...draft, endMs: parsed })
+              if (parsed !== null) commitTimeKeystroke('endMs', parsed)
             }}
-            onBlur={(event) => setTime('endMs', event.target.value, parseEndInput)}
+            onBlur={(event) => {
+              setEditingField(null)
+              setTime('endMs', event.target.value, parseEndInput)
+              initialTimesRef.current = null
+            }}
           />
           <input
             className="time-field duration-field"
@@ -538,6 +634,7 @@ export function EditPanel({
                 ? String(durationFrames)
                 : formatEditorTime(Math.max(0, draft.endMs - draft.startMs))
             }
+            onFocus={() => setEditingField('endMs')}
             onChange={(event) => {
               if (frameTiming) {
                 const frames = Number(event.target.value.trim())
@@ -546,26 +643,33 @@ export function EditPanel({
                     frameRate.frameAtTime(draft.startMs, 'start') + frames - 1,
                     'end',
                   )
+                  // CommitTimes TIME_DURATION：End=Start+时长，更新会话初值 End，不钳制 Start
+                  const session = timeSession()
+                  session.endMs = endMs
                   setDraft({ ...draft, endMs })
-                  commit('endMs', endMs, 'Set duration')
+                  commitTimes({ endMs })
                 }
                 return
               }
               const parsed = parseEditorTime(event.target.value)
               if (parsed !== null) {
                 const endMs = draft.startMs + parsed
+                const session = timeSession()
+                session.endMs = endMs
                 setDraft({ ...draft, endMs })
-                commit('endMs', endMs, 'Set duration')
+                commitTimes({ endMs })
               }
             }}
             onBlur={(event) => {
+              setEditingField(null)
               if (frameTiming) return // 帧模式在 onChange 即时提交
               const parsed = parseEditorTime(event.target.value)
               if (parsed !== null) {
                 const endMs = draft.startMs + parsed
                 setDraft({ ...draft, endMs })
-                commit('endMs', endMs, 'Set duration')
+                commitTimes({ endMs })
               }
+              initialTimesRef.current = null
             }}
           />
           <input
@@ -574,8 +678,16 @@ export function EditPanel({
             title={tPlain('Left Margin (0 = default from style)')}
             type="number"
             value={draft.marginL}
-            onChange={(event) => setDraft({ ...draft, marginL: Number(event.target.value) })}
-            onBlur={() => commit('marginL', draft.marginL, 'Set left margin')}
+            onFocus={() => setEditingField('marginL')}
+            onChange={(event) => {
+              const value = Number(event.target.value)
+              setDraft({ ...draft, marginL: value })
+              commitField('marginL', value, 'left margin change')
+            }}
+            onBlur={() => {
+              setEditingField(null)
+              commitField('marginL', draft.marginL, 'left margin change')
+            }}
           />
           <input
             className="margin-field"
@@ -583,8 +695,16 @@ export function EditPanel({
             title={tPlain('Right Margin (0 = default from style)')}
             type="number"
             value={draft.marginR}
-            onChange={(event) => setDraft({ ...draft, marginR: Number(event.target.value) })}
-            onBlur={() => commit('marginR', draft.marginR, 'Set right margin')}
+            onFocus={() => setEditingField('marginR')}
+            onChange={(event) => {
+              const value = Number(event.target.value)
+              setDraft({ ...draft, marginR: value })
+              commitField('marginR', value, 'right margin change')
+            }}
+            onBlur={() => {
+              setEditingField(null)
+              commitField('marginR', draft.marginR, 'right margin change')
+            }}
           />
           <input
             className="margin-field"
@@ -592,8 +712,16 @@ export function EditPanel({
             title={tPlain('Vertical Margin (0 = default from style)')}
             type="number"
             value={draft.marginV}
-            onChange={(event) => setDraft({ ...draft, marginV: Number(event.target.value) })}
-            onBlur={() => commit('marginV', draft.marginV, 'Set vertical margin')}
+            onFocus={() => setEditingField('marginV')}
+            onChange={(event) => {
+              const value = Number(event.target.value)
+              setDraft({ ...draft, marginV: value })
+              commitField('marginV', value, 'vertical margin change')
+            }}
+            onBlur={() => {
+              setEditingField(null)
+              commitField('marginV', draft.marginV, 'vertical margin change')
+            }}
           />
         </div>
 
@@ -762,7 +890,10 @@ export function EditPanel({
             <input
               type="checkbox"
               checked={showOriginal}
-              onChange={(event) => setShowOriginal(event.target.checked)}
+              onChange={(event) => {
+                setShowOriginal(event.target.checked)
+                setOption('Subtitle/Show Original', event.target.checked)
+              }}
             />{' '}
             {tPlain('Show Original')}
           </label>
@@ -790,11 +921,24 @@ export function EditPanel({
           ).map((segment, index) => {
             const style = syntaxColors[segment.type]
             return (
-              <span key={index} style={{ color: style.color, fontWeight: style.bold ? 700 : 400 }}>
+              <span
+                key={index}
+                style={
+                  // Bold 对齐源码 Colour/Subtitle/Syntax/Bold/* 选项，但用 text-stroke
+                  // 模拟加粗：fontWeight 会改变字形宽度，导致高亮层与 textarea 纯文本
+                  // 换行位置/光标位置错位（源码 Scintilla 单控件无此问题）
+                  style.bold
+                    ? { color: style.color, WebkitTextStroke: '0.45px currentColor' }
+                    : { color: style.color }
+                }
+              >
                 {segment.text}
               </span>
             )
           })}
+          {/* textarea 保留尾随换行的空行盒而 pre 会丢弃末个换行：补一个 \n 保持
+              两层行数一致，否则行数不同步时滚动错位、光标与可见文字错位 */}
+          {draft.text.endsWith('\n') ? '\n' : null}
         </pre>
         <textarea
           ref={editorRef}
@@ -804,11 +948,15 @@ export function EditPanel({
           value={draft.text}
           spellCheck
           style={editorStyle}
+          onFocus={() => setEditingField('text')}
+          onBlur={() => {
+            if (editingField === 'text') setEditingField(null)
+          }}
           onSelect={(event) => trackCursor(event.currentTarget)}
           onChange={(event) => {
             setDraft({ ...draft, text: event.target.value })
             trackCursor(event.currentTarget)
-            onCommit({ text: event.target.value }, 'Edit text')
+            onCommit({ text: event.target.value }, 'modify text')
           }}
           onContextMenu={(event) => {
             event.preventDefault()
@@ -832,12 +980,12 @@ export function EditPanel({
               const nextText = `${draft.text.slice(0, editor.selectionStart)}${tag}${draft.text.slice(editor.selectionEnd)}`
               const nextPosition = editor.selectionStart + 2
               setDraft({ ...draft, text: nextText })
-              onCommit({ text: nextText }, 'Edit text')
+              onCommit({ text: nextText }, 'modify text')
               requestAnimationFrame(() => editor.setSelectionRange(nextPosition, nextPosition))
             } else if (event.key === 'Enter' && !event.ctrlKey && !event.altKey && !event.metaKey) {
               event.preventDefault()
               event.stopPropagation()
-              onCommit({ text: draft.text }, 'Edit text')
+              onCommit({ text: draft.text }, 'modify text')
               onCommand('grid/line/next/create')
             } else if (event.key === 'Tab') {
               event.preventDefault()
@@ -860,11 +1008,11 @@ export function EditPanel({
       </div>
       {showOriginal && (
         <div className="edit-bottom-actions">
-          <button onClick={() => commitText(originalText, 'Revert line')}>
+          <button onClick={() => commitText(originalText, 'revert line')}>
             {tPlain('Revert')}
           </button>
-          <button onClick={() => commitText('', 'Clear line')}>{tPlain('Clear')}</button>
-          <button onClick={() => commitText(stripPlainText(draft.text), 'Clear line text')}>
+          <button onClick={() => commitText('', 'clear line')}>{tPlain('Clear')}</button>
+          <button onClick={() => commitText(stripPlainText(draft.text), 'clear line')}>
             {tPlain('Clear Text')}
           </button>
           <button
@@ -874,7 +1022,7 @@ export function EditPanel({
               const end = editor?.selectionEnd ?? start
               commitText(
                 `${draft.text.slice(0, start)}${originalText}${draft.text.slice(end)}`,
-                'Insert original',
+                'insert original',
               )
             }}
           >
@@ -977,9 +1125,8 @@ export function EditPanel({
             disabled={!isCommandEnabled('edit/line/split/preserve')}
             onClick={() => runTextMenuCommand('edit/line/split/preserve')}
           >
-            <span className="menu-label">
-              {commandTooltip('edit/line/split/preserve', 'Default').split(' (')[0]}
-            </span>
+            {/* 源码菜单用完整 STR_MENU 标签（subs_edit_ctrl.cpp OnContextMenu） */}
+            <span className="menu-label">{tPlain(COMMANDS['edit/line/split/preserve'].label)}</span>
           </button>
           <button
             className="menu-item"
@@ -987,9 +1134,7 @@ export function EditPanel({
             disabled={!isCommandEnabled('edit/line/split/estimate')}
             onClick={() => runTextMenuCommand('edit/line/split/estimate')}
           >
-            <span className="menu-label">
-              {commandTooltip('edit/line/split/estimate', 'Default').split(' (')[0]}
-            </span>
+            <span className="menu-label">{tPlain(COMMANDS['edit/line/split/estimate'].label)}</span>
           </button>
           <button
             className="menu-item"
@@ -997,9 +1142,7 @@ export function EditPanel({
             disabled={!isCommandEnabled('edit/line/split/video')}
             onClick={() => runTextMenuCommand('edit/line/split/video')}
           >
-            <span className="menu-label">
-              {commandTooltip('edit/line/split/video', 'Default').split(' (')[0]}
-            </span>
+            <span className="menu-label">{tPlain(COMMANDS['edit/line/split/video'].label)}</span>
           </button>
         </MenuPopup>
       )}

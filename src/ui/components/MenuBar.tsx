@@ -73,7 +73,7 @@ export function MenuBar({
 
   // 菜单项图标（menu.cpp SetBitmap(co->Icon())：命令带 16px 位图图标；无图标处空占位保持对齐）
   const renderIcon = (command?: string) => {
-    const icon = command ? commandIcon(command, 16) : undefined
+    const icon = command ? commandIcon(command) : undefined
     return icon ? <img className="menu-icon" src={icon} alt="" /> : <span className="menu-icon" />
   }
 
@@ -163,11 +163,11 @@ export function MenuBar({
         ? tPlain(checked ? 'Hide Toolbar' : 'Show Toolbar')
         : item.command === 'edit/undo'
           ? undoLabel
-            ? tFmt('Undo %s', undoLabel)
+            ? tFmt('Undo %s', tPlain(undoLabel))
             : (item.label ?? t(COMMANDS[item.command]?.label ?? item.command))
           : item.command === 'edit/redo'
             ? redoLabel
-              ? tFmt('Redo %s', redoLabel)
+              ? tFmt('Redo %s', tPlain(redoLabel))
               : (item.label ?? t(COMMANDS[item.command]?.label ?? item.command))
             : (item.label ?? t(COMMANDS[item.command]?.label ?? item.command))
     return (
@@ -212,6 +212,8 @@ export function MenuBar({
                 role="menuitem"
                 aria-haspopup="menu"
                 aria-expanded={openMenu === menu.id}
+                // wx 菜单栏不抢键盘焦点：点击后焦点留在原窗口（各上下文热键不失效）
+                onMouseDown={(event) => event.preventDefault()}
                 onClick={() => {
                   setOpenMenu((current) => (current === menu.id ? null : menu.id))
                   setOpenSubmenu(null)

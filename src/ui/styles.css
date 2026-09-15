@@ -190,7 +190,8 @@ button:disabled {
   top: 25px;
   left: 0;
   width: max-content;
-  min-width: 245px;
+  /* 原生菜单比例：9pt（12px）字体、约 20px 行高、宽度随内容（wxMSW） */
+  font-size: 12px;
   padding: 3px;
   background: var(--control-raised);
   border: 1px solid var(--border-popup);
@@ -198,11 +199,11 @@ button:disabled {
 }
 .menu-item {
   width: 100%;
-  height: 25px;
+  height: 20px;
   display: grid;
-  grid-template-columns: 18px 18px minmax(145px, 1fr) max-content 14px;
+  grid-template-columns: 16px 16px minmax(0, 1fr) max-content 14px;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   padding: 0 5px 0 2px;
   border: 0;
   border-radius: 0;
@@ -290,12 +291,26 @@ button:disabled {
   cursor: default;
 }
 .tool-button {
-  width: 26px;
-  height: 26px;
+  /* 主工具栏按钮随 App/Toolbar Icon Size 缩放（源码 toolbar.cpp OnIconSizeChange 重建） */
+  width: calc(var(--icon-size, 16px) + 10px);
+  height: calc(var(--icon-size, 16px) + 10px);
+}
+/* 工具栏图标随 App/Toolbar Icon Size 缩放（源码 command->Icon(icon_size)）；
+   菜单图标与 ToggleBitmap 在源码固定 16，.menu-icon/.icon-button/.video-tool-btn 等不参与 */
+.tool-button img,
+.visual-tool img,
+.audio-tool img {
+  width: var(--icon-size, 16px);
+  height: var(--icon-size, 16px);
 }
 .tool-button img {
   pointer-events: none;
   user-select: none;
+}
+.visual-tool,
+.audio-tool {
+  width: calc(var(--icon-size, 16px) + 11px);
+  height: calc(var(--icon-size, 16px) + 11px);
 }
 .tool-button-label {
   font-size: 11px;
@@ -343,18 +358,20 @@ button:disabled {
   grid-template-rows: 200px minmax(0, 1fr);
 }
 /* AudioBox（wxSashWindow）底边 sash：SetSashVisible(wxSASH_BOTTOM, true) 的 3D 分隔条，
-   拖动改变音频栏高度（OnSashDrag → SetMinSize → Layout） */
+   拖动改变音频栏高度（OnSashDrag → SetMinSize → Layout）。
+   视觉对齐 wxSW_3D：父背景上仅一对 1px 亮/暗斜面线，无同高实色条 */
 .audio-sash {
   height: 4px;
   cursor: ns-resize;
-  background: var(--border-dark);
+  background: transparent;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   border-bottom: 1px solid rgba(0, 0, 0, 0.35);
   touch-action: none;
   user-select: none;
 }
-.audio-sash:hover {
-  background: var(--hover-border);
+.audio-sash:hover,
+.audio-sash:focus-visible {
+  background: rgba(128, 128, 128, 0.28);
 }
 .preview-panel {
   min-width: 0;
@@ -370,7 +387,9 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr);
+  /* 视觉工具列宽随图标尺寸伸缩（源码 wxToolBar 最佳尺寸撑开 sizer 列），30px 为
+     16px 图标时的基准宽（.visual-toolbar min-width 维持默认外观） */
+  grid-template-columns: auto minmax(0, 1fr);
   /* video_box.cpp：visualToolBar proportion=1 拉伸填满列高，visualSubToolBar 自然高度（wxTB_BOTTOM）沉底 */
   grid-template-rows: minmax(0, 1fr) auto;
 }
@@ -395,13 +414,11 @@ button:disabled {
   padding: 3px 0;
   background: var(--surface);
   border-right: 1px solid var(--border);
+  /* 16px 图标时列宽基准 30px（wxMSW 视觉工具栏默认观感） */
+  min-width: 30px;
   /* 矢量裁剪子工具栏出现时主工具栏行被压缩：可滚动而非被不透明背景盖住（"工具消失"） */
   min-height: 0;
   overflow-y: auto;
-}
-.visual-tool {
-  width: 26px;
-  height: 26px;
 }
 .visual-sep {
   width: 22px;
@@ -500,6 +517,15 @@ button:disabled {
   pointer-events: none;
   cursor: crosshair;
 }
+/* 十字工具坐标读数层：源码文字为白字黑描边、经普通 alpha 混合绘制（gl_text.cpp
+   Print 先在 ±1 偏移画黑边再画白字），不参与十字线的 difference 反色 */
+.cross-coordinate-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
 .empty-media {
   display: flex;
   flex-direction: column;
@@ -593,7 +619,9 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) 30px;
+  /* 工具栏行高随图标尺寸伸缩（源码 audio_box TopSizer 行高取工具栏最佳尺寸）；
+     16px 图标时 = 26px 按钮 + 2px×2 padding = 30px 基准 */
+  grid-template-rows: minmax(0, 1fr) auto;
   background: #1c1c1c;
   border-bottom: 1px solid var(--border-dark);
 }
@@ -633,10 +661,6 @@ button:disabled {
 .audio-toolbar-group:last-child {
   border-right: 0;
 }
-.audio-tool {
-  width: 26px;
-  height: 26px;
-}
 .audio-vert {
   /* Aegisub audio_box.cpp：HorizontalZoom + [VerticalZoom|Volume] + link */
   flex: 0 0 60px;
@@ -674,6 +698,11 @@ button:disabled {
   width: 100%;
   height: 26px;
   flex: 0 0 26px;
+}
+/* vertical_link 是源码 ToggleBitmap(..., 16, ...)：图标固定 16，不随工具栏图标尺寸缩放 */
+.audio-vertvol-area > .audio-tool img {
+  width: 16px;
+  height: 16px;
 }
 .vert-slider {
   writing-mode: vertical-lr;
@@ -1075,7 +1104,11 @@ button:disabled {
   z-index: 1;
 }
 .cue-editor::selection {
+  /* 选中态由 textarea 自绘（不透明底 + 显式文字色），盖住下方高亮层：
+     半透明浅底（55% --blue-soft）叠白底后近乎全白，深色文字被冲淡看不清；
+     Firefox 还会对透明选区文字做对比度回退画成浅色，双保险须显式 color */
   background: var(--blue-soft);
+  color: var(--text);
 }
 .cue-editor:focus {
   outline: none;
@@ -1239,7 +1272,8 @@ button:disabled {
 .grid-context-menu {
   position: fixed;
   z-index: 120;
-  min-width: 220px;
+  min-width: 160px;
+  font-size: 12px;
   padding: 3px;
   background: var(--control-raised);
   border: 1px solid var(--border-popup);
@@ -1248,7 +1282,7 @@ button:disabled {
 }
 .grid-context-menu .menu-item {
   width: 100%;
-  height: 25px;
+  height: 20px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2095,9 +2129,10 @@ button:disabled {
   flex: 1;
 }
 .timing-thresholds {
+  /* 源码 wxFlexGridSizer(2,…)：四组"标签+输入"两列并排（每组整体为一个单元格） */
   display: grid;
-  grid-template-columns: auto 70px;
-  gap: 4px 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 12px;
   align-items: center;
 }
 .timing-number {

@@ -290,14 +290,16 @@ export async function createAssRenderer(
 
   /** 补绘上一帧：字体异步注册（_allocFonts）与 setTrack 都不触发重绘，
    * 暂停状态下没有渲染 demand，必须手动补一帧画面才更新 */
-  const redrawLast = () => {
-    if (!instance || !lastRender) return
-    void instance.manualRender({
-      expectedDisplayTime: performance.now(),
-      width: lastRender.storageWidth,
-      height: lastRender.storageHeight,
-      mediaTime: lastRender.timeMs / 1000,
-    })
+  const redrawLast = (): Promise<void> => {
+    if (!instance || !lastRender) return Promise.resolve()
+    return instance
+      .manualRender({
+        expectedDisplayTime: performance.now(),
+        width: lastRender.storageWidth,
+        height: lastRender.storageHeight,
+        mediaTime: lastRender.timeMs / 1000,
+      })
+      .catch(() => {})
   }
 
   /** 字体经 queryLocalFonts/懒加载就绪的时间不可知，且 jassub _allocFonts 不重绘上一帧；
@@ -319,13 +321,14 @@ export async function createAssRenderer(
       .catch(() => {})
   }
 
-  /** 换 track + 补绘一帧（不注册字体——拖拽中数值变化不引入新字体，首次加载走 flushTrack） */
-  const applyTrack = (content: string) => {
-    if (!instance) return
+  /** 换 track + 补绘一帧（不注册字体——拖拽中数值变化不引入新字体，首次加载走 flushTrack）。
+   *  返回渲染完成的 promise（拖拽合流按"完成"节拍合流用） */
+  const applyTrack = (content: string): Promise<void> => {
+    if (!instance) return Promise.resolve()
     instance.renderer.setTrack(content)
     // jassub 的 setTrack 只换 track 不重绘；暂停状态下没有下一帧渲染 demand，
     // 必须手动补一帧，编辑器里改字才能即时反映到画面（对应原版实时预览）
-    redrawLast()
+    return redrawLast()
   }
 
   const flushTrack = () => {
@@ -339,17 +342,31 @@ export async function createAssRenderer(
   }
 
   /** 拖拽合流：源码 async_video_provider 用版本号丢弃中间请求（UpdateSubtitles →
-   * ProcAsync 只跑最新版本），web 等价实现是 rAF 合流——高频 flushNow 只保留
-   * 最新内容，按显示帧节拍应用一次，避免每次 pointermove 都全量重解析+重渲染 */
+   * ProcAsync 只跑最新版本，渲染耗时时实际帧率自动降为"完成节拍"）。web 等价实现
+   * 是"按完成合流"——高频 flushNow 只保留最新内容，上一份渲染未完成时不提交新任务
+   * （否则 jassub worker 把 setTrack/render 全部排队，延迟无限累积），完成后立即
+   * 应用最新版，中间版本全部丢弃 */
   let pendingFlush: string | null = null
   let flushRaf = 0
+  let flushBusy = false
+  const applyPendingFlush = () => {
+    if (flushBusy || pendingFlush === null) return
+    const content = pendingFlush
+    pendingFlush = null
+    flushBusy = true
+    applyTrack(stripBom(content))
+      .catch(() => {})
+      .finally(() => {
+        flushBusy = false
+        // 渲染期间又来了新内容：只跑最新版本
+        if (pendingFlush !== null) applyPendingFlush()
+      })
+  }
   const scheduleFlush = () => {
     if (flushRaf) return
     flushRaf = requestAnimationFrame(() => {
       flushRaf = 0
-      const content = pendingFlush
-      pendingFlush = null
-      if (content !== null) applyTrack(stripBom(content))
+      applyPendingFlush()
     })
   }
 
@@ -409,6 +426,7 @@ export async function createAssRenderer(
       if (flushRaf) cancelAnimationFrame(flushRaf)
       flushRaf = 0
       pendingFlush = null
+      flushBusy = false
       pendingTrack = null
       lastRender = null
       const target = instance

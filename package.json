@@ -21,7 +21,7 @@
   "dependencies": {
     "fengari": "^0.1.5",
     "jassub": "^2.5.16",
-    "lucide-react": "^1.45.0",
+    "lucide-react": "^1.46.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "web-demuxer": "^4.0.0"

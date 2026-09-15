@@ -1,6 +1,7 @@
 export type ShortcutContext =
   | 'Always'
   | 'Default'
+  | 'Main Frame'
   | 'Subtitle Grid'
   | 'Subtitle Edit Box'
   | 'Video'
@@ -12,6 +13,7 @@ import {
   aegisubCommandForShortcut,
   aegisubPrimaryShortcut,
   getActiveHotkeys,
+  shortcutContextChain,
 } from './aegisubHotkeys'
 import { tPlain } from './i18n'
 
@@ -864,10 +866,9 @@ export function shortcutFromKeyboardEvent(event: KeyboardEvent): string {
 }
 
 export function commandForShortcut(shortcut: string, context: ShortcutContext): string | null {
-  return aegisubCommandForShortcut(shortcut, context, (fallbackShortcut, fallbackContext) => {
-    const contexts: ShortcutContext[] =
-      fallbackContext === 'Default' ? ['Default'] : [fallbackContext, 'Default']
-    for (const candidateContext of contexts) {
+  return aegisubCommandForShortcut(shortcut, context, (fallbackShortcut) => {
+    // COMMANDS.shortcuts 注册表与热键表共用同一查找链（源码传播链语义）
+    for (const candidateContext of shortcutContextChain(context)) {
       for (const [id, info] of Object.entries(COMMANDS)) {
         if (info.shortcuts?.[candidateContext]?.includes(fallbackShortcut)) return id
       }

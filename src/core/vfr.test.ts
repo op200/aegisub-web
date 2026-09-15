@@ -4,9 +4,25 @@ import {
   Framerate,
   parseKeyframes,
   parseTimecodes,
+  ptsToMs,
   serializeKeyframes,
   utf8ByteLength,
 } from './vfr'
+
+describe('ptsToMs（FFMS2 int64 截断的浮点补偿）', () => {
+  it('精确整数毫秒点不因浮点下取差 1（1/1000 时基全 PTS 段抽样）', () => {
+    // pts * double(0.001) 往返，不加补偿在精确整数点会落到 m-1
+    for (let pts = 0; pts <= 60000; pts += 7) {
+      expect(ptsToMs(pts * (1 / 1000))).toBe(pts)
+    }
+  })
+  it('真实非整数毫秒仍按截断，不被补偿推进', () => {
+    // 1/90000 时基：pts*1000/90000 的小数间隔最小 1/90 ms，远大于 1e-6
+    expect(ptsToMs(1 / 90000)).toBe(0)
+    expect(ptsToMs((90000 * 33 + 45000) / 90000 / 1000)).toBe(33)
+    expect(ptsToMs((90000 * 33 + 89999) / 90000 / 1000)).toBe(33)
+  })
+})
 
 describe('Framerate（libaegisub vfr.cpp 语义）', () => {
   it('CFR 25fps：EXACT 截断，START/END 为中点向上取整', () => {

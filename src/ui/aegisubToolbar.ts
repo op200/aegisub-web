@@ -3,8 +3,8 @@ import toolbarData from './aegisub-data/default_toolbar.json'
  * 从 Aegisub 的 `default_toolbar.json` 构建工具栏。
  *
  * 数据格式：{ "工具栏名": [ "cmd/id", "", "cmd/id", ... ] }，空字符串为分组分隔符。
- * 图标：见 aegisubIcons.ts 的 COMMAND_ICONS 映射。
- * 尺寸：默认 16px（Aegisub `App/Toolbar Icon Size = 16`）。
+ * 图标：见 aegisubIcons.ts 的 COMMAND_ICONS 映射（64px 源图，CSS 经 --icon-size 缩放，
+ * 随 Preferences 的 App/Toolbar Icon Size 变化，默认 16 对应源码默认值）。
  */
 import { commandIcon } from './aegisubIcons'
 
@@ -16,8 +16,6 @@ export interface ToolbarButton {
 export interface ToolbarGroup {
   buttons: ToolbarButton[]
 }
-
-const ICON_SIZE = 16
 
 function buildToolbars(): Record<string, ToolbarGroup[]> {
   const raw = toolbarData as unknown as Record<string, string[]>
@@ -32,7 +30,7 @@ function buildToolbars(): Record<string, ToolbarGroup[]> {
           current = []
         }
       } else {
-        current.push({ command: entry, icon: commandIcon(entry, ICON_SIZE) })
+        current.push({ command: entry, icon: commandIcon(entry) })
       }
     }
     if (current.length) groups.push({ buttons: current })

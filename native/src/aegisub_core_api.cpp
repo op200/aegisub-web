@@ -1139,8 +1139,8 @@ int32_t aegisub_document_replace_all(aegisub_document_t document, const char* se
 		if (replaced > 0) {
 			// 替换成功才算一次提交（search_replace_engine.cpp:Commit(_("replace"))）
 			doc->undo_stack.push_back(clone_file(*doc->file));
-			doc->undo_labels.push_back("Replace all");
-			doc->amend_label = "Replace all";
+			doc->undo_labels.push_back("replace");
+			doc->amend_label = "replace";
 			doc->amend_target.clear();
 			doc->coalescable = true;
 			doc->redo_stack.clear();

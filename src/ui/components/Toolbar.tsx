@@ -17,6 +17,8 @@ export function Toolbar({ onCommand, isCommandEnabled, isCommandChecked }: Toolb
             <button
               className={`tool-button${isCommandChecked(command) ? ' pressed' : ''}`}
               key={command}
+              // wx 工具栏不抢键盘焦点：点击后焦点留在原窗口（音频/网格热键不失效）
+              onMouseDown={(event) => event.preventDefault()}
               onClick={() => onCommand(command)}
               disabled={!isCommandEnabled(command)}
               aria-pressed={isCommandChecked(command)}
