@@ -1,4 +1,10 @@
-import type { CoreRequest, CoreResponse, SearchMatch, SearchSettings } from '../workers/protocol'
+import type {
+  CoreRequest,
+  CoreResponse,
+  CoreTextDelta,
+  SearchMatch,
+  SearchSettings,
+} from '../workers/protocol'
 import type { CoreCommand, CoreState, SubtitleDocument, SubtitleFormat } from './types'
 
 type CoreRequestPayload = CoreRequest extends infer Request
@@ -12,6 +18,8 @@ export class CoreClient {
     type: 'module',
   })
   private nextId = 1
+  /** 最近一次完整状态：文本增量响应按它做局部合并（未变 cue 保留对象身份） */
+  private lastState: CoreState | null = null
   private pending = new Map<
     number,
     {
@@ -31,9 +39,43 @@ export class CoreClient {
       const pending = this.pending.get(data.id)
       if (!pending) return
       this.pending.delete(data.id)
-      if (data.error) pending.reject(new Error(data.error))
-      else if (data.result !== undefined) pending.resolve(data.result)
+      if (data.error) {
+        pending.reject(new Error(data.error))
+        return
+      }
+      if (data.delta) {
+        // 极罕见：尚无基准状态（启动即拖动）→ 回退取整份状态
+        const merged = this.mergeDelta(data.delta)
+        if (merged) pending.resolve(merged)
+        else void this.state().then((state) => pending.resolve(state), pending.reject)
+        return
+      }
+      if (data.result !== undefined) {
+        if (isCoreState(data.result)) this.lastState = data.result
+        pending.resolve(data.result)
+      }
     }
+  }
+
+  /** 文本增量 → 完整状态：只重建受影响的 cue（其余 cue 对象原样复用） */
+  private mergeDelta(delta: CoreTextDelta): CoreState | null {
+    const base = this.lastState
+    if (!base) return null
+    const texts = new Map(delta.changes.map((change) => [change.id, change.text]))
+    const cues = base.document.cues.map((cue) => {
+      const text = texts.get(cue.id)
+      return text === undefined ? cue : { ...cue, text }
+    })
+    const next: CoreState = {
+      ...base,
+      document: { ...base.document, cues, revision: delta.revision },
+      canUndo: delta.canUndo,
+      canRedo: delta.canRedo,
+      undoLabel: delta.undoLabel,
+      redoLabel: delta.redoLabel,
+    }
+    this.lastState = next
+    return next
   }
 
   state(): Promise<CoreState> {
@@ -65,7 +107,11 @@ export class CoreClient {
     return this.request<SearchMatch[]>({ method: 'search', settings })
   }
   replaceAll(settings: SearchSettings): Promise<number> {
-    return this.request<number>({ method: 'replaceAll', settings })
+    // 该路径直接改文档却不回传状态：立即补取基准，避免后续文本增量合并到陈旧文档
+    return this.request<number>({ method: 'replaceAll', settings }).then((count) => {
+      void this.state()
+      return count
+    })
   }
   /** 运行时配置（Limits/Undo Levels 等）；无响应 */
   configure(config: { undoLevels: number }): void {
@@ -93,3 +139,6 @@ export class CoreClient {
     })
   }
 }
+
+const isCoreState = (value: CoreState | Uint8Array | SearchMatch[] | number): value is CoreState =>
+  typeof value === 'object' && value !== null && 'document' in value

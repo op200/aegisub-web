@@ -123,6 +123,9 @@ export const WEB_SUPPLEMENT: Record<string, Record<string, string>> = {
     'Keyframe cache': '关键帧缓存',
     'Keyframes closed': '关键帧已关闭',
     'Keyframes saved': '关键帧已保存',
+    'Keep offset': '保留偏移',
+    'Keep offset: times start at the raw first-frame PTS (arch1t3cht fork behavior).':
+      '保留偏移：时间从原始首帧 PTS 起（arch1t3cht fork 行为）。',
     'Left margin': '左边距',
     Length: '长度',
     'libass renders subtitles from font file data. System fonts are exposed via the Local Font Access API (Chromium only); font files dropped onto the window are cached and available in any browser.':
@@ -191,10 +194,14 @@ export const WEB_SUPPLEMENT: Record<string, Record<string, string>> = {
     'The complete hotkey table (replaces the current one on import), compatible with the desktop Aegisub hotkey file, including the pre-3.1 ':
       '完整热键表（导入时替换当前热键表），与桌面版 Aegisub 热键文件兼容，包含 3.1 之前的 ',
     'The selected file does not contain video': '所选文件不包含视频',
+    'The video has a first-frame offset of %s ms. Keep it in the exported timecodes file?':
+      '视频存在 %s 毫秒的首帧偏移，导出的时间码文件是否保留？',
     'This browser does not expose local fonts.': '此浏览器不提供本地字体。',
     'This command is not available in the web build': '此命令在 web 版中不可用',
     'Time (ms)': '时间（毫秒）',
     'Time display mode': '时间显示模式',
+    'Timecodes are normalized to start at 0 ms when loaded (upstream Aegisub semantics). You can keep this offset when exporting timecodes.':
+      '载入时时间码已按 Aegisub 主线语义归一化（首帧记为 0 毫秒）。导出时间码时可选择保留此偏移。',
     'Timecodes closed': '时间码已关闭',
     'Timecodes saved': '时间码已保存',
     Type: '类型',
@@ -203,6 +210,7 @@ export const WEB_SUPPLEMENT: Record<string, Record<string, string>> = {
     'Vertical margin': '垂直边距',
     'Video closed': '视频已关闭',
     'Video context menu': '视频右键菜单',
+    'Video first-frame offset': '视频首帧偏移',
     'Video preview': '视频预览',
     'Video timeline': '视频时间轴',
     'Video zoom': '视频缩放',

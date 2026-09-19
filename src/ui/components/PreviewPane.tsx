@@ -24,6 +24,7 @@ import { formatVideoTime } from '../../core/time'
 import type { SubtitleCue, SubtitleDocument, SubtitleStyle } from '../../core/types'
 import type { Framerate } from '../../core/vfr'
 import { ptsToMs } from '../../core/vfr'
+import { detachElementGain, setElementGain } from '../../media/elementGain'
 import { WebCodecsVideoSource } from '../../media/webcodecsVideo'
 import type { MediaSource } from '../../platform/types'
 import { aegisubIconUrl, commandIcon } from '../aegisubIcons'
@@ -33,6 +34,7 @@ import { assColorToCss, cssColorToHex } from '../color'
 import { COMMANDS, commandTooltip } from '../commands'
 import { tPlain } from '../i18n'
 import { logError, logInfo, logWarning } from '../log'
+import { serialLatest, type SerialLatest } from '../rafThrottle'
 import { SLIDER_PALETTES, useSystemTheme } from '../theme'
 import { probeLocalFonts } from './dialogs'
 import { MenuPopup } from './MenuPopup'
@@ -47,12 +49,16 @@ interface PreviewPaneProps {
   onOpenMedia: () => void
   mediaAction: { sequence: number; type: string }
   onCommand: (id: string) => void
-  onPatchCue: (id: string, patch: Partial<Omit<SubtitleCue, 'id'>>, label: string) => void
+  onPatchCue: (
+    id: string,
+    patch: Partial<Omit<SubtitleCue, 'id'>>,
+    label: string,
+  ) => Promise<unknown> | void
   /** 批量补丁（一次 apply = 一条 undo 记录）：SetSelectedOverride 多行同改语义 */
   onPatchCues: (
     patches: { id: string; patch: Partial<Omit<SubtitleCue, 'id'>> }[],
     label: string,
-  ) => void
+  ) => Promise<unknown> | void
   /** 当前选中行（含活动行）：视觉工具 SetSelectedOverride 的目标集合 */
   selectedCues: SubtitleCue[]
   onPatchStyle: (id: string, patch: Partial<Omit<SubtitleStyle, 'id'>>, label: string) => void
@@ -87,6 +93,8 @@ interface PreviewPaneProps {
   onPlaybackModeChange?: (mode: VideoPlaybackMode | null) => void
   /** 解码通道覆盖：true=强制 WebCodecs，false=强制原生，缺省/null=自动（<video> onError 切换） */
   decoderOverride?: boolean | null
+  /** 播放音量增益（源码唯一 audio player 同时供视频出声，AudioPane 音量滑条统一控制） */
+  playbackGain: number
   style?: CSSProperties
 }
 
@@ -605,6 +613,11 @@ function VideoSliderControl({
 }: VideoSliderProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const draggingRef = useRef(false)
+  // 拖动寻址合流：pointermove（可达数百 Hz）只记录最新目标，按帧节拍至多寻址一次；
+  // pointerup 冲刷最终目标（video_slider.cpp 每次事件 JumpToFrame，provider 侧再按
+  // 版本号丢弃被取代的请求——web 侧在入口先合流，省去中间位置的解码呈现）
+  const pendingSeekRef = useRef<{ x: number; snap: boolean } | null>(null)
+  const seekRafRef = useRef(0)
   const [focused, setFocused] = useState(false)
   const focusedRef = useRef(false)
   const theme = useSystemTheme()
@@ -774,8 +787,39 @@ function VideoSliderControl({
 
   const seekFromPointer = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect()
-    seekFromX(event.clientX - bounds.left, event.shiftKey)
+    scheduleSeek(event.clientX - bounds.left, event.shiftKey)
   }
+
+  /** 执行被保留的最新目标（帧节拍或 pointerup 冲刷时调用） */
+  const runPendingSeek = () => {
+    const pending = pendingSeekRef.current
+    pendingSeekRef.current = null
+    if (pending) seekFromX(pending.x, pending.snap)
+  }
+
+  const scheduleSeek = (x: number, snap: boolean) => {
+    pendingSeekRef.current = { x, snap }
+    if (seekRafRef.current) return
+    seekRafRef.current = requestAnimationFrame(() => {
+      seekRafRef.current = 0
+      runPendingSeek()
+    })
+  }
+
+  const flushSeek = () => {
+    if (seekRafRef.current) {
+      cancelAnimationFrame(seekRafRef.current)
+      seekRafRef.current = 0
+    }
+    runPendingSeek()
+  }
+
+  useEffect(
+    () => () => {
+      if (seekRafRef.current) cancelAnimationFrame(seekRafRef.current)
+    },
+    [],
+  )
 
   return (
     <canvas
@@ -808,11 +852,13 @@ function VideoSliderControl({
       }}
       onPointerUp={(event) => {
         draggingRef.current = false
+        flushSeek()
         if (event.currentTarget.hasPointerCapture(event.pointerId))
           event.currentTarget.releasePointerCapture(event.pointerId)
       }}
       onPointerCancel={(event) => {
         draggingRef.current = false
+        flushSeek()
         if (event.currentTarget.hasPointerCapture(event.pointerId))
           event.currentTarget.releasePointerCapture(event.pointerId)
       }}
@@ -872,6 +918,7 @@ export function PreviewPane({
   onKeyframesChange,
   onPlaybackModeChange,
   decoderOverride,
+  playbackGain,
   style: panelStyle,
 }: PreviewPaneProps) {
   const optionsVersion = useOptionsVersion() // Preferences 提交后重渲染（滑条关键帧/滚轮行为/工具配色）
@@ -894,6 +941,8 @@ export function PreviewPane({
   const wcCanvasRef = useRef<HTMLCanvasElement>(null)
   const wcSourceRef = useRef<WebCodecsVideoSource | null>(null)
   const onKeyframesChangeRef = useRef(onKeyframesChange)
+  // 当前接线的视频元素（wcActive 切换/媒体更换会替换元素，替换时拆掉旧节点路由）
+  const gainVideoRef = useRef<HTMLMediaElement | null>(null)
   // 实际生效的解码通道：状态栏覆盖（手动切换）优先，否则自动（<video> onError）
   const wcActive = decoderOverride ?? wcMode
   // 状态栏解码通道指示（原生 / WebCodecs；无视频为 null）
@@ -972,31 +1021,36 @@ export function PreviewPane({
   // 拖拽刚结束的时间戳：pointerup 冲刷的最终提交在 effect 运行时拖拽态已复位，
   // 用短时间窗让最终提交仍走 flushNow（否则落入 250ms 防抖，最终帧有延迟感）
   const dragEndedAtRef = useRef(0)
-  // 拖拽提交合流：源码 UpdateDrag 每次鼠标事件 Commit（C++ 信号廉价），web 的
-  // apply → 全文档序列化 + React 重渲染昂贵，高频 pointermove（可达数百 Hz）按
-  // 帧节拍合流只提交最后一帧（源码异步渲染同样丢弃中间结果，最终位置为准）。
-  // pointerup 同步冲刷，保证最终位置立即落盘
-  const dragCommitRafRef = useRef(0)
-  const dragCommitRef = useRef<(() => void) | null>(null)
-  const scheduleDragCommit = (commit: () => void) => {
-    dragCommitRef.current = commit
-    if (dragCommitRafRef.current) return
-    dragCommitRafRef.current = requestAnimationFrame(() => {
-      dragCommitRafRef.current = 0
-      const fn = dragCommitRef.current
-      dragCommitRef.current = null
-      fn?.()
-    })
-  }
-  const flushDragCommit = () => {
-    if (dragCommitRafRef.current) {
-      cancelAnimationFrame(dragCommitRafRef.current)
-      dragCommitRafRef.current = 0
-    }
-    const fn = dragCommitRef.current
-    dragCommitRef.current = null
-    fn?.()
-  }
+  // 拖拽提交走「串行最新目标」通道（对齐 async_video_provider.cpp 的 RequestFrame：
+  // 在途不排队、新目标覆盖待发槽位、pointerup 冲刷最终值）。源码 UpdateDrag 每次鼠标
+  // 事件 Commit（C++ 信号廉价），web 的 apply → 全文档序列化 + React 重渲染远慢于
+  // 高频 pointermove（可达数百 Hz）——逐个排队会让松开鼠标后画面按队列把中间位置
+  // 慢慢回放；中间目标一律丢弃，仅最终位置生效（源码异步渲染同样丢弃中间结果）
+  const dragCommitRef = useRef<SerialLatest<[() => unknown]> | null>(null)
+  if (!dragCommitRef.current)
+    dragCommitRef.current = serialLatest((commit: () => unknown) => commit())
+  const scheduleDragCommit = (commit: () => unknown) => dragCommitRef.current!(commit)
+  const flushDragCommit = () => dragCommitRef.current!.flush()
+  // <video> 元素同一时刻只保留一个在途 seek：拖动/跟随产生的目标远快于解复用 + 解码，
+  // 逐个下发会让浏览器按顺序把中间位置解码呈现（"眼睁睁看着图像从 a 慢慢走到 b"）。
+  // 在途期间新目标只覆盖待发槽位（中间位置丢弃），seeked 后补发最新目标——与源码
+  // async_video_provider 的版本号弃帧（新请求覆盖 frame_number，旧请求被丢弃）同语义
+  const videoSeekRef = useRef<number | null>(null)
+  const pumpVideoSeek = useCallback(() => {
+    const video = videoRef.current
+    const target = videoSeekRef.current
+    if (!video || target === null || video.seeking) return
+    videoSeekRef.current = null
+    const clamped = Math.max(0, Math.min(video.duration * 1000 || target, target))
+    video.currentTime = clamped / 1000
+  }, [])
+  const requestVideoSeek = useCallback(
+    (timeMs: number) => {
+      videoSeekRef.current = timeMs
+      pumpVideoSeek()
+    },
+    [pumpVideoSeek],
+  )
   // ---- 矢量裁剪工具状态 ----
   const [vclip, setVclip] = useState<VClipState | null>(null)
   const vclipRef = useRef<VClipState | null>(null)
@@ -1010,6 +1064,18 @@ export function PreviewPane({
     onDetectedFpsRef.current = onDetectedFps
     onKeyframesChangeRef.current = onKeyframesChange
   })
+
+  // 视频播放出声与音频栏共用同一音量增益（源码唯一 audio player；<video>.volume
+  // 上限 1.0，经 WebAudio 增益才能覆盖 Aegisub 三次方曲线 >1 的放大区）
+  useEffect(() => {
+    const el = videoRef.current
+    if (el !== gainVideoRef.current) {
+      if (gainVideoRef.current) detachElementGain(gainVideoRef.current)
+      gainVideoRef.current = el
+    }
+    if (el) setElementGain(el, playbackGain)
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- videoRef 挂载随 media.url/wcActive 条件渲染
+  }, [media?.url, wcActive, playbackGain])
 
   /** 短暂静音播放采样帧间隔后暂停并回到原位置，得到容器真实 fps。
    *  外部 seek（auto seek/滑块）或暂停会立即让位：不回跳位置、尽快暂停，
@@ -2102,9 +2168,10 @@ export function PreviewPane({
 
   useEffect(() => {
     const video = videoRef.current
+    // 音频栏拖动等外部寻址：走单在途 seek 通道（新目标覆盖待发，中间位置丢弃）
     if (video && !playing && Math.abs(ptsToMs(video.currentTime) - currentTimeMs) > 40)
-      video.currentTime = currentTimeMs / 1000
-  }, [currentTimeMs, playing])
+      requestVideoSeek(currentTimeMs)
+  }, [currentTimeMs, playing, requestVideoSeek])
 
   // WebCodecs 源：暂停状态跟随外部时间（音频栏拖动等）；播放中由源自己上报
   useEffect(() => {
@@ -2132,6 +2199,8 @@ export function PreviewPane({
     // 模式/错误的复位在渲染期完成；这里只销毁旧源（媒体更换或通道切换）
     wcSourceRef.current?.destroy()
     wcSourceRef.current = null
+    // 通道/媒体更换：丢弃上一元素的待发 seek 目标
+    videoSeekRef.current = null
   }, [media, wcActive])
 
   useEffect(() => {
@@ -2176,6 +2245,12 @@ export function PreviewPane({
           if (opened.source) {
             wcSourceRef.current = opened.source
             logInfo('video', 'WebCodecs 回退视频已打开')
+            // 打开即呈首帧的 <video preload="metadata"> 语义仅适用于刚加载媒体
+            // （currentTimeMs=0）；手动切换/回退时外部时间线已在中途，新源从首帧
+            // 起步必须对齐当前播放头，否则画面停在首帧（如黑场开头）造成"切换后
+            // 无法渲染"的观感
+            const target = currentRef.current
+            if (Math.abs(opened.source.currentTime - target) > 60) opened.source.seek(target)
           } else if (opened.reason) {
             logError('video', `WebCodecs 回退打开失败：${opened.reason}`)
             setWcError(opened.reason)
@@ -2227,7 +2302,8 @@ export function PreviewPane({
       onTimeChange(clamped)
       return
     }
-    if (videoRef.current) videoRef.current.currentTime = clamped / 1000
+    // 原生 <video>：经单在途通道下发（拖动期间中间目标被丢弃，仅最新目标生效）
+    if (videoRef.current) requestVideoSeek(clamped)
     onTimeChange(clamped)
   }
 
@@ -2306,7 +2382,7 @@ export function PreviewPane({
     const actionSeek = (timeMs: number) => {
       const clamped = Math.max(0, Math.min(duration() || timeMs, timeMs))
       if (wcSource) wcSource.seek(clamped)
-      else if (video) video.currentTime = clamped / 1000
+      else if (video) requestVideoSeek(clamped)
       onTimeChange(clamped)
     }
     switch (mediaAction.type) {
@@ -2340,7 +2416,7 @@ export function PreviewPane({
     }
     // windowZoom/onWindowZoomChange 经 ref 读取且不入依赖：mediaAction 从不清除，
     // 依赖它们会让过期 action（如 reset-pan）在每次窗口缩放变化时重放，锁死缩放
-  }, [durationMs, media, mediaAction, onTimeChange])
+  }, [durationMs, media, mediaAction, onTimeChange, requestVideoSeek])
 
   const hitTest = (x: number, y: number): HitBox | null => {
     const stage = stageRef.current
@@ -3254,6 +3330,8 @@ export function PreviewPane({
                 onPlay={() => setPlaying(true)}
                 onPause={() => setPlaying(false)}
                 onEnded={() => setPlaying(false)}
+                // 在途 seek 完成 → 补发被覆盖期间保留的最新目标（弃中间位置）
+                onSeeked={() => pumpVideoSeek()}
                 // 浏览器解不了容器/编解码（mkv 等）→ 自动切 WebCodecs（手动强制原生时不切，仅记录）
                 onError={() => {
                   const mediaError = videoRef.current?.error

@@ -8,18 +8,15 @@
  * 注意：web-demuxer 的 d.ts 无 default export（只能 named import），
  * info.streams 类型不精确，需断言为 WebAVStream[]。
  */
-import { WebDemuxer, AVSeekFlag, AVMediaType } from 'web-demuxer'
+import { WebDemuxer, AVMediaType } from 'web-demuxer'
 import type { WebAVStream, WebMediaInfo } from 'web-demuxer'
 import demuxerWasmAsset from 'web-demuxer/wasm?url'
 
-import { ptsToMs } from '../core/vfr'
+import type { PeaksWorkerResponse } from './peaks.worker'
 
 // web-demuxer 的 worker 由 blob URL 创建（内嵌 base64 脚本），blob: 无层次路径，
 // worker 内 fetch 相对/根相对 URL 会 "Failed to parse URL" —— 必须先解析为绝对 URL
 const demuxerWasmUrl = new URL(demuxerWasmAsset, globalThis.location.href).href
-
-export { AVSeekFlag, AVMediaType }
-export type { WebAVStream, WebMediaInfo }
 
 export interface DemuxProbe {
   demuxer: WebDemuxer
@@ -72,6 +69,9 @@ export function needsDemuxFallback(name: string): boolean {
  * video_provider_ffmpegsource.cpp 的 TimecodesVector：逐帧 `(PTS * TimeBase->Num) /
  * TimeBase->Den`（毫秒截断）后 Framerate(TimecodesVector) 建表，源码视频的"帧率"
  * 实为逐帧时间码表而非标量 CFR。
+ *
+ * 扫描在 peaks.worker 后台线程执行（FFMS2 索引线程语义）：数万视频包的 read 循环
+ * 不再占用主线程，与拖动/渲染并行；isStale 命中时立即 terminate。
  */
 export async function extractVideoKeyframes(
   file: File,
@@ -79,40 +79,32 @@ export async function extractVideoKeyframes(
   isStale: () => boolean,
   onFrameTimes?: (framesMs: number[]) => void,
 ): Promise<void> {
-  const demuxer = new WebDemuxer({ wasmFilePath: demuxerWasmUrl })
+  const worker = new Worker(new URL('./peaks.worker.ts', import.meta.url), { type: 'module' })
   try {
-    await demuxer.load(file)
-    if (isStale()) return
-    const info = await demuxer.getMediaInfo()
-    const streams = (info.streams ?? []) as WebAVStream[]
-    if (!streams.some((stream) => stream.codec_type === AVMediaType.AVMEDIA_TYPE_VIDEO)) return
-    const found: number[] = []
-    const frameTimes: number[] = []
-    let reported = 0
-    const reader = demuxer.readMediaPacket('video').getReader()
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (isStale()) return
-      // (int)((PTS * TimeBase->Num) / TimeBase->Den)：毫秒截断（浮点补偿见 ptsToMs）
-      frameTimes.push(ptsToMs(value.timestamp))
-      if (value.keyframe) {
-        found.push(ptsToMs(value.timestamp))
-        if (found.length - reported >= 32) {
-          reported = found.length
-          onProgress(found.slice())
+    await new Promise<void>((resolve, reject) => {
+      worker.onmessage = ({ data }: MessageEvent<PeaksWorkerResponse>) => {
+        if (isStale()) {
+          worker.terminate()
+          resolve()
+          return
+        }
+        if (data.type === 'keyframes') onProgress(data.timesMs)
+        else if (data.type === 'frameTimes') onFrameTimes?.(data.framesMs)
+        else if (data.type === 'scan-done') {
+          worker.terminate()
+          resolve()
+        } else if (data.type === 'error') {
+          worker.terminate()
+          reject(new Error(data.message))
         }
       }
-    }
-    if (isStale()) return
-    if (found.length > reported) onProgress(found.slice())
-    // 包按封装（解码）顺序到来，B 帧会乱序；FFMS2 索引按显示序——升序排序后建表。
-    // 全 0 / 单包的畸形容器不产出（调用方回退 CFR 探测）
-    if (onFrameTimes && frameTimes.length >= 2) {
-      const sorted = [...frameTimes].sort((a, b) => a - b)
-      if (sorted[sorted.length - 1] > 0) onFrameTimes(sorted)
-    }
+      worker.onerror = (event) => {
+        worker.terminate()
+        reject(new Error(event.message || 'Video scan worker failed to load'))
+      }
+      worker.postMessage({ kind: 'video-scan', file })
+    })
   } finally {
-    demuxer.destroy()
+    worker.terminate()
   }
 }

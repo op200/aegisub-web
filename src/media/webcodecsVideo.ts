@@ -22,6 +22,9 @@ export interface WebCodecsVideoEvents {
 
 const FRAME_BUFFER_HIGH = 24 // 已解码帧缓冲上限（内存背压）
 const DECODE_QUEUE_HIGH = 32 // 解码器排队上限
+// seek 泵帧水位：未 close 的 VideoFrame 持有硬解 surface（D3D11 池约 20 个），
+// 耗尽后解码器停止输出，目标帧永远到不了——必须远低于该阈值并及时丢弃
+const SEEK_FRAME_HIGH = 12
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
@@ -43,8 +46,12 @@ export class WebCodecsVideoSource {
   private streamDone = false
   private readingAhead = false
   private seekJob: Promise<void> = Promise.resolve()
+  /** 寻址代次：被取代的在途 seek 提前退出（见 seek 的版本号弃帧） */
+  private seekVersion = 0
   private raf = 0
   private playingState = false
+  /** 用户播放意图：seek 期间渲染循环暂停，完成后据此恢复（被取代的 seek 不丢意图） */
+  private playIntent = false
   private playStartMs = 0
   private playStartWall = 0
   private currentTimeUs = 0
@@ -202,7 +209,9 @@ export class WebCodecsVideoSource {
   }
 
   play(): void {
-    if (this.destroyed || this.playingState) return
+    if (this.destroyed) return
+    this.playIntent = true
+    if (this.playingState) return
     if (this.streamDone && !this.frames.length) {
       // 播放到结尾后再播放：重新 seek 到当前位置起流，随后继续播放
       this.seek(this.currentTimeMs)
@@ -224,6 +233,7 @@ export class WebCodecsVideoSource {
       if (this.streamDone && !this.frames.length) {
         // 流结束且缓冲耗尽：停在结尾
         this.playingState = false
+        this.playIntent = false
         this.events.onPlaying(false)
         if (this.durationMs > 0) {
           this.currentTimeUs = this.durationMs * 1000
@@ -237,6 +247,7 @@ export class WebCodecsVideoSource {
   }
 
   pause(): void {
+    this.playIntent = false
     if (!this.playingState) return
     this.playingState = false
     cancelAnimationFrame(this.raf)
@@ -249,26 +260,65 @@ export class WebCodecsVideoSource {
   seek(timeMs: number): void {
     if (this.destroyed) return
     const target = Math.max(0, Math.min(this.duration || timeMs, timeMs))
-    this.seekJob = this.seekJob.then(() => this.doSeek(target + this.baseMs)).catch(() => undefined)
+    // 版本号弃帧（async_video_provider.cpp RequestFrame 语义）：每次寻址递增代次，
+    // 被取代的在途 job 在安全点提前退出——拖动产生的目标远快于解复用 + 解码，
+    // 逐个执行会把中间位置解码呈现（"图像从 a 慢慢走到 b"），丢弃后仅最新目标生效
+    const version = ++this.seekVersion
+    this.seekJob = this.seekJob
+      .then(() => {
+        // 排队期间已有更新目标 → 本次请求被取代，直接丢弃
+        if (version !== this.seekVersion) return
+        return this.doSeek(target + this.baseMs, version)
+      })
+      .catch(() => undefined)
   }
 
-  private async doSeek(targetMs: number): Promise<void> {
-    const wasPlaying = this.playingState
+  private async doSeek(targetMs: number, version: number): Promise<void> {
+    const superseded = () => this.destroyed || version !== this.seekVersion
+    const abandon = () => {
+      this.closeAllFrames()
+    }
+    // 播放意图（而非瞬时渲染状态）决定是否恢复播放：被取代/中止的 seek 不会丢失意图
+    const wasPlaying = this.playIntent
     this.playingState = false
     cancelAnimationFrame(this.raf)
     this.events.onPlaying(false)
     const targetUs = Math.round(targetMs * 1000)
     await this.restartReader(targetMs / 1000)
+    if (superseded()) {
+      abandon()
+      return
+    }
     this.closeAllFrames()
     // 解码到出现 ≥ 目标时间的帧（起点为关键帧，之间全部可用于绘制）
     for (;;) {
-      if (this.destroyed) return
+      if (superseded()) {
+        abandon()
+        return
+      }
       if (this.frames.some((frame) => frame.timestamp >= targetUs)) break
+      // 帧背压：目标之前的帧不参与最终绘制，超水位即丢弃释放硬解 surface
+      if (this.frames.length >= SEEK_FRAME_HIGH) this.dropFramesBefore(targetUs)
+      // 解码队列水位：等输出消化再喂，避免整个文件被泵进队列
+      while (this.decoder.decodeQueueSize >= DECODE_QUEUE_HIGH && !superseded()) await sleep(4)
       const ok = await this.pumpChunk()
       if (!ok) break
       if (this.decoder.decodeQueueSize > 0 && !this.frames.length) await sleep(0)
     }
-    while (this.decoder.decodeQueueSize > 0 && !this.destroyed) await sleep(4)
+    // B 帧乱序（解码序 ≠ 显示序）：显示序 ≤ 目标的帧可能在 ≥ 目标的帧之后才输出，
+    // 等队列消化再绘制；期间同样需要帧背压，否则 surface 耗尽队列永远消化不完
+    while (this.decoder.decodeQueueSize > 0 && !superseded()) {
+      const crowded = this.frames.length >= SEEK_FRAME_HIGH
+      this.dropFramesBefore(targetUs)
+      // 丢弃无效（输出帧全部 ≥ 目标）：剩余队列帧最终都会被 closeAllFrames 丢弃
+      if (crowded && this.frames.length >= SEEK_FRAME_HIGH) break
+      await sleep(4)
+    }
+    // 被取代：不绘制、不恢复播放（最新目标自己的 job 会完成呈现）
+    if (superseded()) {
+      abandon()
+      return
+    }
     // 目标时间早于首帧时（如 seek 0）也至少显示首帧（<video> seek 语义）
     const firstTs = this.frames[0]?.timestamp
     this.drawUpTo(Math.max(targetUs, firstTs ?? targetUs))
@@ -373,6 +423,18 @@ export class WebCodecsVideoSource {
     } finally {
       this.readingAhead = false
     }
+  }
+
+  /** 丢弃 targetUs 之前除最后一帧外的帧（drawUpTo 只需 ≤ 目标的最后一帧）；
+   *  close 释放硬解 surface，让被阻塞的解码输出恢复 */
+  private dropFramesBefore(targetUs: number): void {
+    let keepIndex = -1
+    for (let index = 0; index < this.frames.length; index++) {
+      if (this.frames[index].timestamp < targetUs) keepIndex = index
+      else break
+    }
+    for (let index = 0; index < keepIndex; index++) this.frames[index].close()
+    if (keepIndex > 0) this.frames.splice(0, keepIndex)
   }
 
   /** 绘制 ≤ displayUs 的最后一帧，丢弃更早的帧（保留之后的供后续绘制） */

@@ -37,5 +37,21 @@ export type CoreRequest =
 export interface CoreResponse {
   id: number
   result?: CoreState | Uint8Array | SearchMatch[] | number
+  /**
+   * 仅文本提交（视觉工具拖动逐帧改 \pos 等，或编辑框逐键输入）的增量结果：
+   * 整份文档 structuredClone 在拖动时是主线程每帧最大单项开销（实测 5-13ms），
+   * 此路径让主线程按 id 只替换受影响 cue 的 text，未变 cue 保持对象身份
+   */
+  delta?: CoreTextDelta
   error?: string
+}
+
+/** 见 CoreResponse.delta：apply 命令全部为 updateCue+仅 text 时的轻量结果 */
+export interface CoreTextDelta {
+  revision: number
+  changes: { id: string; text: string }[]
+  canUndo: boolean
+  canRedo: boolean
+  undoLabel: string
+  redoLabel: string
 }

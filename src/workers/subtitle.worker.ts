@@ -5,7 +5,13 @@ import { createDocument } from '../core/defaults'
 import { exportSubtitle } from '../core/format'
 import { TypeScriptCoreRuntime } from '../core/runtime'
 import type { CoreCommand, CoreState, SubtitleDocument, SubtitleFormat } from '../core/types'
-import type { CoreRequest, CoreResponse, SearchMatch, SearchSettings } from './protocol'
+import type {
+  CoreRequest,
+  CoreResponse,
+  CoreTextDelta,
+  SearchMatch,
+  SearchSettings,
+} from './protocol'
 
 /**
  * WASM 核心模块接口（Emscripten 导出，见 wasm/aegisub_core_api.h）。
@@ -216,6 +222,32 @@ async function getActiveRuntime(): Promise<CoreRuntime> {
   return runtime ?? tsFallback
 }
 
+/**
+ * apply 的轻量响应判定：命令全部是 updateCue 且补丁仅有 text 时，文档差异只有
+ * 这些 cue 的 text 与 revision，主线程按 id 合并即可（不必跨线程克隆整份文档）。
+ * text 直接取命令补丁——runtime.applyCommand 就是 Object.assign(cue, patch)，
+ * 补丁值即结果值；目标 id 不存在时两侧同样是无操作。
+ */
+function textOnlyDelta(commands: CoreCommand[], state: CoreState): CoreTextDelta | null {
+  const changes: { id: string; text: string }[] = []
+  for (const command of commands) {
+    if (command.type !== 'updateCue') return null
+    const patch = command.patch as Record<string, unknown>
+    const keys = Object.keys(patch)
+    if (keys.length !== 1 || keys[0] !== 'text' || typeof patch.text !== 'string') return null
+    changes.push({ id: command.id, text: patch.text })
+  }
+  if (!changes.length) return null
+  return {
+    revision: state.document.revision,
+    changes,
+    canUndo: state.canUndo,
+    canRedo: state.canRedo,
+    undoLabel: state.undoLabel,
+    redoLabel: state.redoLabel,
+  }
+}
+
 self.onmessage = (event: MessageEvent<CoreRequest>) => {
   const request = event.data
   // init：记录绝对 base 并触发 WASM 加载（CoreClient 构造后首条消息，无响应）
@@ -248,9 +280,13 @@ self.onmessage = (event: MessageEvent<CoreRequest>) => {
         case 'restore':
           response.result = active.restore(request.document)
           break
-        case 'apply':
-          response.result = active.apply(request.commands, request.label)
+        case 'apply': {
+          const state = active.apply(request.commands, request.label)
+          const delta = textOnlyDelta(request.commands, state)
+          if (delta) response.delta = delta
+          else response.result = state
           break
+        }
         case 'undo':
           response.result = active.undo()
           break

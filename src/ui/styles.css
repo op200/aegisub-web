@@ -711,6 +711,12 @@ button:disabled {
   margin: 0;
   accent-color: var(--blue);
 }
+/* HorizontalZoom 是源码里唯一没有 wxSL_INVERSE 的竖向滑条（min 在顶、max 在底，
+   audio_box.cpp：SetHorizontalZoom(-position)，zoom 大=放大 → "上滚放大、下滚缩小"），
+   与 VerticalZoom/Volume 的 INVERSE 方向相反；html range 用 direction: ltr 反转 */
+.vert-slider-min-top {
+  direction: ltr;
+}
 .waveform {
   position: relative;
   width: 100%;

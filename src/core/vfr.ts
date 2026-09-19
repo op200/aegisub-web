@@ -325,6 +325,21 @@ export function serializeTimecodes(framerate: Framerate, length = -1): string {
   return lines.join('\n') + '\n'
 }
 
+/**
+ * 保留首帧偏移的 v2 导出变体（arch1t3cht fork b7d228c0ce "Stop shifting timecodes
+ * to start at 0ms" 语义）：表内写原始 PTS 值（帧 0 = 视频首帧偏移，不减 front）。
+ * numerator/last 与归一化版本数值相同（back-front 差值不变），fork 的表尾外推公式
+ * 同形——外推帧复用归一化 Framerate 的 timeAtFrame 即可。
+ */
+export function serializeTimecodesKeepOffset(raw: number[], length = -1): string {
+  const lines = ['# timecode format v2']
+  const rate = Framerate.fromTimecodes(raw) // 仅用于表尾外推
+  const total = length > raw.length ? length : raw.length
+  for (let frame = 0; frame < total; frame++)
+    lines.push(String(frame < raw.length ? raw[frame] : rate.timeAtFrame(frame, 'exact')))
+  return lines.join('\n') + '\n'
+}
+
 /** 编码文本为 UTF-8 字节数（edit/line/split/estimate 的时长分配权重） */
 export function utf8ByteLength(text: string): number {
   let bytes = 0

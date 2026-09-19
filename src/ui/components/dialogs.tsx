@@ -1908,3 +1908,86 @@ export function LanguageDialog({ onClose }: { onClose: () => void }) {
     </Dialog>
   )
 }
+
+// ---------------------------------------------------------------------------
+// 视频首帧偏移（web 专属：主线归一化语义的载入提醒与导出保留偏移选择，
+// 见 vfr.ts serializeTimecodesKeepOffset 注释）
+// ---------------------------------------------------------------------------
+
+/** 载入视频时首帧偏移显著（> 每帧时长 1/5）的提醒 */
+export function VideoOffsetNoticeDialog({
+  offsetMs,
+  frameDurationMs,
+  onClose,
+}: {
+  offsetMs: number
+  frameDurationMs: number
+  onClose: () => void
+}) {
+  return (
+    <Dialog
+      title={tPlain('Video first-frame offset')}
+      onClose={onClose}
+      footer={<button onClick={onClose}>{t('OK')}</button>}
+    >
+      <div className="dialog-fields">
+        <p>
+          {tFmt(
+            'The first frame of this video starts at %s ms (frame duration ≈ %s ms).',
+            String(offsetMs),
+            frameDurationMs.toFixed(2),
+          )}
+        </p>
+        <p>
+          {tPlain(
+            'Timecodes are normalized to start at 0 ms when loaded (upstream Aegisub semantics). You can keep this offset when exporting timecodes.',
+          )}
+        </p>
+      </div>
+    </Dialog>
+  )
+}
+
+/** 导出时间码时视频存在首帧偏移：让用户选择保留偏移或归一化到 0 */
+export function TimecodesOffsetDialog({
+  offsetMs,
+  onChoice,
+  onClose,
+}: {
+  offsetMs: number
+  onChoice: (keepOffset: boolean) => void
+  onClose: () => void
+}) {
+  return (
+    <Dialog
+      title={tPlain('Save Timecodes File...')}
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={() => onChoice(true)}>{tPlain('Keep offset')}</button>
+          <button onClick={() => onChoice(false)}>{tPlain('Normalize to 0')}</button>
+          <button onClick={onClose}>{t('Cancel')}</button>
+        </>
+      }
+    >
+      <div className="dialog-fields">
+        <p>
+          {tFmt(
+            'The video has a first-frame offset of %s ms. Keep it in the exported timecodes file?',
+            String(offsetMs),
+          )}
+        </p>
+        <p>
+          {tPlain(
+            'Keep offset: times start at the raw first-frame PTS (arch1t3cht fork behavior).',
+          )}
+        </p>
+        <p>
+          {tPlain(
+            'Normalize to 0: subtract the offset so frame 0 starts at 0 ms (upstream Aegisub behavior).',
+          )}
+        </p>
+      </div>
+    </Dialog>
+  )
+}

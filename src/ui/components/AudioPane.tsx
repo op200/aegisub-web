@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { getOptionInt, setOption } from '../../config/options'
 import type { SubtitleCue } from '../../core/types'
+import { detachElementGain, setElementGain } from '../../media/elementGain'
 import { WebCodecsAudioPlayer } from '../../media/webcodecsAudio'
 import type { MediaSource } from '../../platform/types'
 import { aegisubIconUrl, commandIcon } from '../aegisubIcons'
@@ -39,8 +40,14 @@ interface AudioPaneProps {
   /** 双击网格行的 ScrollToActiveLine 请求（App nonce，Waveform 无条件滚到活动行） */
   scrollToActiveLine: number
   onDurationChange: (durationMs: number) => void
-  onPatchCue: (id: string, patch: Partial<Omit<SubtitleCue, 'id'>>, label: string) => void
+  onPatchCue: (
+    id: string,
+    patch: Partial<Omit<SubtitleCue, 'id'>>,
+    label: string,
+  ) => Promise<unknown> | void
   onCommand: (id: string) => void
+  /** 音量增益上报（源码唯一 audio player 同时供视频播放出声，视频侧共用同一增益） */
+  onPlaybackGainChange: (gain: number) => void
 }
 
 /** 音频工具栏中的开关型按钮 */
@@ -69,12 +76,19 @@ export function AudioPane(props: AudioPaneProps) {
     onViewChange,
   } = props
   // 滑块初值来自 Options（audio_box.cpp 构造时 OPT_GET），拖动时防抖写回（OPT_SET）
-  const [hZoom, setHZoom] = useState(() => getOptionInt('Audio/Zoom/Horizontal')) // 0 → -50..30 滑块
+  // 水平缩放滑条位置 = -zoom（audio_box.cpp: HorizontalZoom 初值 -OPT_GET(...)，
+  // SetHorizontalZoom(-position)），Options 里存的是 zoom_level 本身，故需取负
+  const [hZoom, setHZoom] = useState(() => -getOptionInt('Audio/Zoom/Horizontal')) // 0 → -50..30 滑块
   const [vZoom, setVZoom] = useState(() => getOptionInt('Audio/Zoom/Vertical')) // 0..100
   const [volume, setVolume] = useState(() => getOptionInt('Audio/Volume'))
   const linked = props.options.verticalLink
   const displayedVolume = linked ? vZoom : volume
+  // 音量增益（audio_box.cpp OnVolume/OnVerticalZoom/OnAudioOpen：SetVolume(pow(mid(1,pos,100)/50,3))，
+  // 1.0 为不变量，>1 允许增益放大）
+  const volumeGain = Math.pow(Math.max(1, Math.min(100, displayedVolume)) / 50, 3)
   const audioRef = useRef<HTMLAudioElement>(null)
+  // 当前接线的音频元素（<audio> 随 wcAudioMode 切换会被替换，替换时拆掉旧节点的增益路由）
+  const gainElRef = useRef<HTMLMediaElement | null>(null)
   const playEndRef = useRef<number | null>(null)
   const syntheticContextRef = useRef<AudioContext | null>(null)
   const syntheticSourceRef = useRef<AudioBufferSourceNode | null>(null)
@@ -112,7 +126,7 @@ export function AudioPane(props: AudioPaneProps) {
   }, [])
 
   const startSyntheticAudio = useCallback(
-    async (kind: 'blank' | 'noise', volumePercent: number) => {
+    async (kind: 'blank' | 'noise', gain: number) => {
       stopSyntheticAudio()
       const generation = syntheticGenerationRef.current
       const previousContext = syntheticContextRef.current
@@ -137,13 +151,13 @@ export function AudioPane(props: AudioPaneProps) {
         }
       }
       const source = context.createBufferSource()
-      const gain = context.createGain()
-      syntheticGainRef.current = gain
-      gain.gain.value = Math.max(0, Math.min(1, volumePercent / 100))
+      const gainNode = context.createGain()
+      syntheticGainRef.current = gainNode
+      gainNode.gain.value = gain
       source.buffer = buffer
       source.loop = true
-      source.connect(gain)
-      gain.connect(context.destination)
+      source.connect(gainNode)
+      gainNode.connect(context.destination)
       source.start()
       syntheticSourceRef.current = source
       return true
@@ -236,7 +250,7 @@ export function AudioPane(props: AudioPaneProps) {
     const wc = wcPlayerRef.current
     const cue = selectedCue
     const setWcVolume = () => {
-      wc?.setVolume(Math.max(0, Math.min(1, (linked ? vZoom : volume) / 100)))
+      wc?.setVolume(volumeGain)
     }
     const wcEndMs = (startMs: number, endMs: number | null) => {
       const target = endMs ?? (durationMs > startMs ? durationMs : startMs + 600000)
@@ -255,7 +269,7 @@ export function AudioPane(props: AudioPaneProps) {
         audio.currentTime = clamped / 1000
         void audio.play()
       } else if (media?.syntheticAudio) {
-        void startSyntheticAudio(media.syntheticAudio.kind, linked ? vZoom : volume)
+        void startSyntheticAudio(media.syntheticAudio.kind, volumeGain)
           .then((started) => {
             if (started) onPlayingChange(true)
           })
@@ -281,7 +295,7 @@ export function AudioPane(props: AudioPaneProps) {
             stopSyntheticAudio()
             onPlayingChange(false)
           } else {
-            void startSyntheticAudio(media.syntheticAudio.kind, linked ? vZoom : volume)
+            void startSyntheticAudio(media.syntheticAudio.kind, volumeGain)
               .then((started) => {
                 if (started) onPlayingChange(true)
               })
@@ -319,7 +333,6 @@ export function AudioPane(props: AudioPaneProps) {
   }, [
     currentTimeMs,
     durationMs,
-    linked,
     media,
     mediaAction,
     onPlayingChange,
@@ -328,8 +341,7 @@ export function AudioPane(props: AudioPaneProps) {
     selectedCue,
     startSyntheticAudio,
     stopSyntheticAudio,
-    volume,
-    vZoom,
+    volumeGain,
   ])
 
   useEffect(() => {
@@ -395,17 +407,30 @@ export function AudioPane(props: AudioPaneProps) {
   const zoomLevel = -hZoom
   const amplitude = Math.pow(Math.max(1, Math.min(100, vZoom)) / 50, 3)
 
+  // 音量套用：audio_box.cpp OnAudioOpen 在音频打开时按滑条值 SetVolume——
+  // <audio> 元素随媒体加载才挂载，必须依赖 media.url 在挂载后补套用，
+  // 否则刷新后播放音量一直是元素默认的 1.0（滑条位置本身已恢复）。
+  // <audio> 的音量走 WebAudio 增益（element.volume 上限 1.0，三次方曲线 50 以上
+  // 全是 >1 的增益区，直接赋值会整段死区——表现为"音量滑条无法控制音量"）
   useEffect(() => {
-    if (audioRef.current) audioRef.current.volume = Math.max(0, Math.min(1, displayedVolume / 100))
-    if (syntheticGainRef.current)
-      syntheticGainRef.current.gain.value = Math.max(0, Math.min(1, displayedVolume / 100))
-    wcPlayerRef.current?.setVolume(Math.max(0, Math.min(1, displayedVolume / 100)))
-  }, [displayedVolume])
+    const el = audioRef.current
+    if (el !== gainElRef.current) {
+      if (gainElRef.current) detachElementGain(gainElRef.current)
+      gainElRef.current = el
+    }
+    if (el) setElementGain(el, volumeGain)
+    if (syntheticGainRef.current) syntheticGainRef.current.gain.value = volumeGain
+    wcPlayerRef.current?.setVolume(volumeGain)
+    props.onPlaybackGainChange(volumeGain)
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- media.url 仅为 <audio> 挂载触发（OnAudioOpen 语义）
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.media?.url, volumeGain, wcAudioMode, props.onPlaybackGainChange])
 
   // 滑块值写回 Options（audio_box.cpp OnXXXScroll 的 OPT_SET；防抖避免拖动期高频持久化）
+  // 水平缩放写回的是 zoom_level（= -滑条位置），与源码 SetHorizontalZoom 一致
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      setOption('Audio/Zoom/Horizontal', Math.round(hZoom))
+      setOption('Audio/Zoom/Horizontal', -Math.round(hZoom))
       setOption('Audio/Zoom/Vertical', Math.round(vZoom))
       setOption('Audio/Volume', Math.round(displayedVolume))
     }, 250)
@@ -456,7 +481,9 @@ export function AudioPane(props: AudioPaneProps) {
           zoomLevel={zoomLevel}
           amplitude={amplitude}
           onWheelZoom={(delta) =>
-            setHZoom((current) => Math.max(-50, Math.min(30, current + delta)))
+            // AudioBox::OnMouseWheel 把 zoom_delta 加在 zoom_level 上（滚轮上滚 = 放大），
+            // 滑条位置 = -zoom（SetHorizontalZoom），故这里对 hZoom 取负
+            setHZoom((current) => Math.max(-50, Math.min(30, current - delta)))
           }
           onVideoSeek={props.onVideoSeek}
           onDurationChange={props.onDurationChange}
@@ -465,7 +492,7 @@ export function AudioPane(props: AudioPaneProps) {
         <div className="audio-vert" aria-label={tPlain('Audio zoom and volume')}>
           <input
             type="range"
-            className="vert-slider"
+            className="vert-slider vert-slider-min-top"
             min={-50}
             max={30}
             value={hZoom}

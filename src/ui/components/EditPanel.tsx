@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { getOptionBool, getOptionInt, getOptionString, setOption } from '../../config/options'
 import {
@@ -81,6 +81,525 @@ function longestVisibleLine(text: string, ignoreWhitespace: boolean, ignorePunct
 function stripPlainText(text: string) {
   return [...text.matchAll(/\{[^}]*\}/g)].map(([block]) => block).join('')
 }
+
+/** 静态子树（Comment/Style/Actor/Effect、时间/边距、格式工具栏）拖动期间不重建：
+ *  subs_edit_box.cpp OnCommit 对 COMMIT_DIAG_TEXT 只执行 edit_ctrl->SetTextTo +
+ *  UpdateCharacterCount，其余控件一律不刷新；这里用 memo 复现该语义。
+ *  事件处理器经 handlers ref 转发（每次父渲染在 layout effect 中换成最新闭包，
+ *  子组件跳渲染也不会拿到陈旧 draft/cue） */
+interface EditRowHandlers {
+  /** 合并写草稿（函数式更新：拖动期间不持有渲染期 draft，避免回写陈旧 text） */
+  patchDraft: (patch: Partial<SubtitleCue>) => void
+  commit: (field: keyof SubtitleCue, value: SubtitleCue[keyof SubtitleCue], label: string) => void
+  commitField: (
+    field: 'actor' | 'effect' | 'marginL' | 'marginR' | 'marginV',
+    value: string | number,
+    label: string,
+  ) => void
+  commitTimes: (patch: { startMs?: number; endMs: number }) => void
+  commitTimeKeystroke: (field: 'startMs' | 'endMs', value: number) => void
+  setTime: (
+    field: 'startMs' | 'endMs',
+    text: string,
+    parser: (value: string) => number | null,
+  ) => void
+  timeSession: () => { id: string; startMs: number; endMs: number }
+  clearTimeSession: () => void
+  setEditingField: (field: keyof SubtitleCue | null) => void
+  toggleOverrideTag: (key: StyleToggleKey) => void
+  openFontPicker: () => void
+  openColorPicker: (key: ColorTagKey) => void
+  applyColor: (hex: string) => void
+  onCommand: (id: string) => void
+  onEditStyle: () => void
+  onFrameModeChange: (value: boolean) => void
+  toggleShowOriginal: (value: boolean) => void
+}
+
+/** handlers 在 layout effect 中赋值（首次绘制前必已就绪），故 current 可视为非空 */
+interface HandlersRef {
+  current: EditRowHandlers
+}
+
+function sameList<T>(a: readonly T[], b: readonly T[]) {
+  return a === b || (a.length === b.length && a.every((value, index) => value === b[index]))
+}
+
+interface EditTopRowProps {
+  cueId: string
+  comment: boolean
+  style: string
+  actor: string
+  effect: string
+  styles: SubtitleStyle[]
+  actors: string[]
+  effects: string[]
+  handlers: HandlersRef
+}
+
+const EditTopRow = memo(
+  function EditTopRow({
+    cueId,
+    comment,
+    style,
+    actor,
+    effect,
+    styles,
+    actors,
+    effects,
+    handlers,
+  }: EditTopRowProps) {
+    return (
+      <>
+        <label className="comment-toggle">
+          <input
+            type="checkbox"
+            checked={comment}
+            onChange={(event) => {
+              const value = event.target.checked
+              handlers.current.patchDraft({ comment: value })
+              handlers.current.commit('comment', value, 'comment change')
+            }}
+          />
+          {tPlain('Comment')}
+        </label>
+        <label className="edit-style">
+          <select
+            value={style}
+            onChange={(event) => {
+              const value = event.target.value
+              handlers.current.patchDraft({ style: value })
+              handlers.current.commit('style', value, 'style change')
+            }}
+          >
+            {styles.map((item) => (
+              <option key={item.id}>{item.name}</option>
+            ))}
+          </select>
+        </label>
+        {/* 源码 Edit 按钮直接打开当前行样式的编辑对话框（subs_edit_box.cpp，样式缺失时禁用） */}
+        <button
+          className="edit-edit-btn"
+          onClick={() => handlers.current.onEditStyle()}
+          disabled={!styles.some((item) => item.name === style)}
+          title={tPlain('Edit style')}
+        >
+          {tPlain('Edit')}
+        </button>
+        <label className="edit-actor">
+          <input
+            list={`edit-actor-values-${cueId}`}
+            placeholder={tPlain('Actor')}
+            value={actor}
+            onFocus={() => handlers.current.setEditingField('actor')}
+            onChange={(event) => {
+              const value = event.target.value
+              handlers.current.patchDraft({ actor: value })
+              handlers.current.commitField('actor', value, 'actor change')
+            }}
+            onBlur={(event) => {
+              handlers.current.setEditingField(null)
+              handlers.current.commitField('actor', event.target.value, 'actor change')
+            }}
+          />
+          <datalist id={`edit-actor-values-${cueId}`}>
+            {actors.map((value) => (
+              <option key={value} value={value} />
+            ))}
+          </datalist>
+        </label>
+        <label className="edit-effect">
+          <input
+            list={`edit-effect-values-${cueId}`}
+            placeholder={tPlain('Effect')}
+            value={effect}
+            onFocus={() => handlers.current.setEditingField('effect')}
+            onChange={(event) => {
+              const value = event.target.value
+              handlers.current.patchDraft({ effect: value })
+              handlers.current.commitField('effect', value, 'effect change')
+            }}
+            onBlur={(event) => {
+              handlers.current.setEditingField(null)
+              handlers.current.commitField('effect', event.target.value, 'effect change')
+            }}
+          />
+          <datalist id={`edit-effect-values-${cueId}`}>
+            {effects.map((value) => (
+              <option key={value} value={value} />
+            ))}
+          </datalist>
+        </label>
+      </>
+    )
+  },
+  (a, b) =>
+    a.cueId === b.cueId &&
+    a.comment === b.comment &&
+    a.style === b.style &&
+    a.actor === b.actor &&
+    a.effect === b.effect &&
+    a.handlers === b.handlers &&
+    sameList(a.styles, b.styles) &&
+    sameList(a.actors, b.actors) &&
+    sameList(a.effects, b.effects),
+)
+
+interface EditTimesRowProps {
+  layer: number
+  startMs: number
+  endMs: number
+  marginL: number
+  marginR: number
+  marginV: number
+  frameTiming: boolean
+  frameRate: Framerate
+  handlers: HandlersRef
+}
+
+const EditTimesRow = memo(
+  function EditTimesRow({
+    layer,
+    startMs,
+    endMs,
+    marginL,
+    marginR,
+    marginV,
+    frameTiming,
+    frameRate,
+    handlers,
+  }: EditTimesRowProps) {
+    // 帧号模式（timeedit_ctrl SetByFrame）：Start=FrameAtTime(START)，End=FrameAtTime(END)，时长含首帧
+    const toStartText = (ms: number) =>
+      frameTiming ? String(frameRate.frameAtTime(ms, 'start')) : formatEditorTime(ms)
+    const toEndText = (ms: number) =>
+      frameTiming ? String(frameRate.frameAtTime(ms, 'end')) : formatEditorTime(ms)
+    const parseFrameInput = (text: string, kind: 'start' | 'end'): number | null => {
+      const value = Number(text.trim())
+      return Number.isInteger(value) && value >= 0 ? frameRate.timeAtFrame(value, kind) : null
+    }
+    const parseStartInput = (text: string): number | null =>
+      frameTiming ? parseFrameInput(text, 'start') : parseEditorTime(text)
+    const parseEndInput = (text: string): number | null =>
+      frameTiming ? parseFrameInput(text, 'end') : parseEditorTime(text)
+    const durationFrames = Math.max(
+      1,
+      frameRate.frameAtTime(endMs, 'end') - frameRate.frameAtTime(startMs, 'start') + 1,
+    )
+    return (
+      <div className="edit-row edit-row-times">
+        <input
+          className="layer-field"
+          aria-label={tPlain('Layer')}
+          title={tPlain('Layer number')}
+          type="number"
+          min={0}
+          max={999}
+          value={layer}
+          onFocus={() => handlers.current.setEditingField('layer')}
+          onChange={(event) => handlers.current.patchDraft({ layer: Number(event.target.value) })}
+          onBlur={(event) => {
+            handlers.current.setEditingField(null)
+            handlers.current.commit('layer', Number(event.target.value), 'layer change')
+          }}
+        />
+        <input
+          className="time-field"
+          aria-label={tPlain('Start')}
+          title={tPlain('Start time')}
+          value={toStartText(startMs)}
+          onFocus={() => handlers.current.setEditingField('startMs')}
+          onChange={(event) => {
+            const parsed = parseStartInput(event.target.value)
+            if (parsed !== null) handlers.current.commitTimeKeystroke('startMs', parsed)
+          }}
+          onBlur={(event) => {
+            handlers.current.setEditingField(null)
+            handlers.current.setTime('startMs', event.target.value, parseStartInput)
+            handlers.current.clearTimeSession()
+          }}
+        />
+        <input
+          className="time-field"
+          aria-label={tPlain('End')}
+          title={tPlain('End time')}
+          value={toEndText(endMs)}
+          onFocus={() => handlers.current.setEditingField('endMs')}
+          onChange={(event) => {
+            const parsed = parseEndInput(event.target.value)
+            if (parsed !== null) handlers.current.commitTimeKeystroke('endMs', parsed)
+          }}
+          onBlur={(event) => {
+            handlers.current.setEditingField(null)
+            handlers.current.setTime('endMs', event.target.value, parseEndInput)
+            handlers.current.clearTimeSession()
+          }}
+        />
+        <input
+          className="time-field duration-field"
+          aria-label={tPlain('Duration')}
+          title={tPlain('Line duration')}
+          value={
+            frameTiming ? String(durationFrames) : formatEditorTime(Math.max(0, endMs - startMs))
+          }
+          onFocus={() => handlers.current.setEditingField('endMs')}
+          onChange={(event) => {
+            if (frameTiming) {
+              const frames = Number(event.target.value.trim())
+              if (Number.isInteger(frames) && frames >= 1) {
+                const nextEndMs = frameRate.timeAtFrame(
+                  frameRate.frameAtTime(startMs, 'start') + frames - 1,
+                  'end',
+                )
+                // CommitTimes TIME_DURATION：End=Start+时长，更新会话初值 End，不钳制 Start
+                const session = handlers.current.timeSession()
+                session.endMs = nextEndMs
+                handlers.current.patchDraft({ endMs: nextEndMs })
+                handlers.current.commitTimes({ endMs: nextEndMs })
+              }
+              return
+            }
+            const parsed = parseEditorTime(event.target.value)
+            if (parsed !== null) {
+              const nextEndMs = startMs + parsed
+              const session = handlers.current.timeSession()
+              session.endMs = nextEndMs
+              handlers.current.patchDraft({ endMs: nextEndMs })
+              handlers.current.commitTimes({ endMs: nextEndMs })
+            }
+          }}
+          onBlur={(event) => {
+            handlers.current.setEditingField(null)
+            if (frameTiming) return // 帧模式在 onChange 即时提交
+            const parsed = parseEditorTime(event.target.value)
+            if (parsed !== null) {
+              const nextEndMs = startMs + parsed
+              handlers.current.patchDraft({ endMs: nextEndMs })
+              handlers.current.commitTimes({ endMs: nextEndMs })
+            }
+            handlers.current.clearTimeSession()
+          }}
+        />
+        <input
+          className="margin-field"
+          aria-label={tPlain('Left margin')}
+          title={tPlain('Left Margin (0 = default from style)')}
+          type="number"
+          value={marginL}
+          onFocus={() => handlers.current.setEditingField('marginL')}
+          onChange={(event) => {
+            const value = Number(event.target.value)
+            handlers.current.patchDraft({ marginL: value })
+            handlers.current.commitField('marginL', value, 'left margin change')
+          }}
+          onBlur={(event) => {
+            handlers.current.setEditingField(null)
+            handlers.current.commitField(
+              'marginL',
+              Number(event.target.value),
+              'left margin change',
+            )
+          }}
+        />
+        <input
+          className="margin-field"
+          aria-label={tPlain('Right margin')}
+          title={tPlain('Right Margin (0 = default from style)')}
+          type="number"
+          value={marginR}
+          onFocus={() => handlers.current.setEditingField('marginR')}
+          onChange={(event) => {
+            const value = Number(event.target.value)
+            handlers.current.patchDraft({ marginR: value })
+            handlers.current.commitField('marginR', value, 'right margin change')
+          }}
+          onBlur={(event) => {
+            handlers.current.setEditingField(null)
+            handlers.current.commitField(
+              'marginR',
+              Number(event.target.value),
+              'right margin change',
+            )
+          }}
+        />
+        <input
+          className="margin-field"
+          aria-label={tPlain('Vertical margin')}
+          title={tPlain('Vertical Margin (0 = default from style)')}
+          type="number"
+          value={marginV}
+          onFocus={() => handlers.current.setEditingField('marginV')}
+          onChange={(event) => {
+            const value = Number(event.target.value)
+            handlers.current.patchDraft({ marginV: value })
+            handlers.current.commitField('marginV', value, 'vertical margin change')
+          }}
+          onBlur={(event) => {
+            handlers.current.setEditingField(null)
+            handlers.current.commitField(
+              'marginV',
+              Number(event.target.value),
+              'vertical margin change',
+            )
+          }}
+        />
+      </div>
+    )
+  },
+  (a, b) =>
+    a.layer === b.layer &&
+    a.startMs === b.startMs &&
+    a.endMs === b.endMs &&
+    a.marginL === b.marginL &&
+    a.marginR === b.marginR &&
+    a.marginV === b.marginV &&
+    a.frameTiming === b.frameTiming &&
+    a.frameRate === b.frameRate &&
+    a.handlers === b.handlers,
+)
+
+interface EditFormatRowProps {
+  frameTiming: boolean
+  frameRateLoaded: boolean
+  showOriginal: boolean
+  colorPickerRef: { current: HTMLInputElement | null }
+  handlers: HandlersRef
+}
+
+const EditFormatRow = memo(function EditFormatRow({
+  frameTiming,
+  frameRateLoaded,
+  showOriginal,
+  colorPickerRef,
+  handlers,
+}: EditFormatRowProps) {
+  return (
+    <div className="edit-row edit-row-format" aria-label={tPlain('Text formatting tools')}>
+      <button
+        onClick={() => handlers.current.toggleOverrideTag('b')}
+        title={commandTooltip('edit/style/bold', 'Subtitle Edit Box')}
+        aria-label={tPlain('Bold')}
+      >
+        <img src={EDIT_ICON('button_bold')} alt="" width={16} height={16} draggable={false} />
+      </button>
+      <button
+        onClick={() => handlers.current.toggleOverrideTag('i')}
+        title={commandTooltip('edit/style/italic', 'Subtitle Edit Box')}
+        aria-label={tPlain('Italics')}
+      >
+        <img src={EDIT_ICON('button_italics')} alt="" width={16} height={16} draggable={false} />
+      </button>
+      <button
+        onClick={() => handlers.current.toggleOverrideTag('u')}
+        title={commandTooltip('edit/style/underline', 'Subtitle Edit Box')}
+        aria-label={tPlain('Underline')}
+      >
+        <img src={EDIT_ICON('button_underline')} alt="" width={16} height={16} draggable={false} />
+      </button>
+      <button
+        onClick={() => handlers.current.toggleOverrideTag('s')}
+        title={commandTooltip('edit/style/strikeout', 'Subtitle Edit Box')}
+        aria-label={tPlain('Strikeout')}
+      >
+        <img src={EDIT_ICON('button_strikeout')} alt="" width={16} height={16} draggable={false} />
+      </button>
+      <button
+        onClick={() => handlers.current.openFontPicker()}
+        title={commandTooltip('edit/font', 'Subtitle Edit Box')}
+        aria-label={tPlain('Font Face')}
+      >
+        <img src={EDIT_ICON('button_fontname')} alt="" width={16} height={16} draggable={false} />
+      </button>
+      <span className="edit-toolbar-spacer" />
+      <button
+        onClick={() => handlers.current.openColorPicker('c')}
+        title={commandTooltip('edit/color/primary', 'Subtitle Edit Box')}
+        aria-label={tPlain('Primary Color')}
+      >
+        <img src={EDIT_ICON('button_color_one')} alt="" width={16} height={16} draggable={false} />
+      </button>
+      <button
+        onClick={() => handlers.current.openColorPicker('2c')}
+        title={commandTooltip('edit/color/secondary', 'Subtitle Edit Box')}
+        aria-label={tPlain('Secondary Color')}
+      >
+        <img src={EDIT_ICON('button_color_two')} alt="" width={16} height={16} draggable={false} />
+      </button>
+      <button
+        onClick={() => handlers.current.openColorPicker('3c')}
+        title={commandTooltip('edit/color/outline', 'Subtitle Edit Box')}
+        aria-label={tPlain('Outline Color')}
+      >
+        <img
+          src={EDIT_ICON('button_color_three')}
+          alt=""
+          width={16}
+          height={16}
+          draggable={false}
+        />
+      </button>
+      <button
+        onClick={() => handlers.current.openColorPicker('4c')}
+        title={commandTooltip('edit/color/shadow', 'Subtitle Edit Box')}
+        aria-label={tPlain('Shadow Color')}
+      >
+        <img src={EDIT_ICON('button_color_four')} alt="" width={16} height={16} draggable={false} />
+      </button>
+      <input
+        ref={colorPickerRef}
+        type="color"
+        defaultValue="#ffffff"
+        onChange={(event) => handlers.current.applyColor(event.target.value)}
+        aria-hidden="true"
+        tabIndex={-1}
+        className="edit-color-picker"
+      />
+      <span className="edit-toolbar-spacer" />
+      <button
+        onClick={() => handlers.current.onCommand('grid/line/next/create')}
+        title={commandTooltip('grid/line/next/create', 'Subtitle Edit Box')}
+        aria-label={tPlain('Next line')}
+      >
+        <img
+          src={EDIT_ICON('button_audio_commit')}
+          alt=""
+          width={16}
+          height={16}
+          draggable={false}
+        />
+      </button>
+      <span className="edit-time-mode" role="radiogroup" aria-label={tPlain('Time display mode')}>
+        <label>
+          <input
+            type="radio"
+            name="edit-time-mode"
+            checked={!frameTiming}
+            onChange={() => handlers.current.onFrameModeChange(false)}
+          />{' '}
+          {tPlain('Time')}
+        </label>
+        <label>
+          <input
+            type="radio"
+            name="edit-time-mode"
+            disabled={!frameRateLoaded}
+            checked={frameTiming}
+            onChange={() => handlers.current.onFrameModeChange(true)}
+          />{' '}
+          {tPlain('Frame')}
+        </label>
+      </span>
+      <label className="show-original">
+        <input
+          type="checkbox"
+          checked={showOriginal}
+          onChange={(event) => handlers.current.toggleShowOriginal(event.target.checked)}
+        />{' '}
+        {tPlain('Show Original')}
+      </label>
+    </div>
+  )
+})
 
 interface EditPanelProps {
   cue: SubtitleCue | null
@@ -177,6 +696,39 @@ export function EditPanel({
       setOriginalText(cue?.text ?? '')
     }
   }, [cue])
+  // 静态子树处理器转发：每次渲染后在 layout effect（首帧绘制前）替换为最新闭包，
+  // 子组件 memo 跳渲染时事件回调仍读到最新 draft/cue（latest-ref 模式：effect 回调
+  // 在渲染完成后才执行，不存在初始化期访问；无依赖表是刻意的——每次渲染都要刷新）
+  /* oxlint-disable react/immutability, react-hooks/exhaustive-deps */
+  const handlersRef = useRef<EditRowHandlers>(null as unknown as EditRowHandlers)
+  useLayoutEffect(() => {
+    if (!cue || !draft) return
+    handlersRef.current = {
+      patchDraft,
+      commit,
+      commitField,
+      commitTimes,
+      commitTimeKeystroke,
+      setTime,
+      timeSession,
+      clearTimeSession: () => {
+        initialTimesRef.current = null
+      },
+      setEditingField,
+      toggleOverrideTag,
+      openFontPicker,
+      openColorPicker,
+      applyColor,
+      onCommand,
+      onEditStyle,
+      onFrameModeChange,
+      toggleShowOriginal: (value: boolean) => {
+        setShowOriginal(value)
+        setOption('Subtitle/Show Original', value)
+      },
+    }
+  })
+  /* oxlint-enable react/immutability, react-hooks/exhaustive-deps */
   if (!cue || !draft)
     return <section className="edit-panel empty-edit">{tPlain('No line selected')}</section>
 
@@ -186,6 +738,10 @@ export function EditPanel({
     label: string,
   ) => {
     if (cue[field] !== value) onCommit({ [field]: value }, label)
+  }
+  /** 合并写草稿（函数式更新：memo 静态子树的处理器经 ref 调用，不持有渲染期 draft） */
+  const patchDraft = (patch: Partial<SubtitleCue>) => {
+    setDraft((old) => (old ? { ...old, ...patch } : old))
   }
   /** 逐键提交（源码 EVT_TEXT）：以已发送值为准去重（cue prop 可能落后于在途事务，
    *  用陈旧 cue 比较会漏发补丁）；键含行 id，跨行残留只会命中"core 已有该值"的 no-op；
@@ -231,7 +787,7 @@ export function EditPanel({
       session.endMs = value
       patch = { endMs: value, startMs: Math.min(value, session.startMs) }
     }
-    setDraft({ ...draft, ...patch })
+    setDraft((old) => (old ? { ...old, ...patch } : old))
     commitTimes(patch)
   }
   /** 光标处的有效字体（command/edit.cpp font_for_line） */
@@ -278,7 +834,7 @@ export function EditPanel({
       field === 'startMs'
         ? { startMs: value, endMs: Math.max(value, initial.endMs) }
         : { endMs: value, startMs: Math.min(value, initial.startMs) }
-    setDraft({ ...draft, ...patch })
+    setDraft((old) => (old ? { ...old, ...patch } : old))
     commitTimes(patch)
   }
   /** command/edit.cpp toggle_override_tag：光标处读取当前状态后真实切换；
@@ -321,7 +877,7 @@ export function EditPanel({
     }
   }
   const commitText = (text: string, label: string) => {
-    setDraft({ ...draft, text })
+    setDraft((old) => (old ? { ...old, text } : old))
     onCommit({ text }, label)
     requestAnimationFrame(() => editorRef.current?.focus())
   }
@@ -426,22 +982,7 @@ export function EditPanel({
   }
   // 帧号模式（timeedit_ctrl SetByFrame）：Start=FrameAtTime(START)，End=FrameAtTime(END)，时长含首帧
   const frameTiming = frameMode && frameRate.isLoaded()
-  const toStartText = (ms: number) =>
-    frameTiming ? String(frameRate.frameAtTime(ms, 'start')) : formatEditorTime(ms)
-  const toEndText = (ms: number) =>
-    frameTiming ? String(frameRate.frameAtTime(ms, 'end')) : formatEditorTime(ms)
-  const parseFrameInput = (text: string, kind: 'start' | 'end'): number | null => {
-    const value = Number(text.trim())
-    return Number.isInteger(value) && value >= 0 ? frameRate.timeAtFrame(value, kind) : null
-  }
-  const parseStartInput = (text: string): number | null =>
-    frameTiming ? parseFrameInput(text, 'start') : parseEditorTime(text)
-  const parseEndInput = (text: string): number | null =>
-    frameTiming ? parseFrameInput(text, 'end') : parseEditorTime(text)
-  const durationFrames = Math.max(
-    1,
-    frameRate.frameAtTime(draft.endMs, 'end') - frameRate.frameAtTime(draft.startMs, 'start') + 1,
-  )
+  const frameRateLoaded = frameRate.isLoaded()
   const trackCursor = (element: HTMLTextAreaElement) => {
     editCursorState.selectionStart = element.selectionStart
     editCursorState.selectionEnd = element.selectionEnd
@@ -492,81 +1033,17 @@ export function EditPanel({
     >
       {/* 第 1 行：Comment | Style | Edit | Actor | Effect | 字符数（Aegisub top_sizer） */}
       <div className="edit-row edit-row-top">
-        <label className="comment-toggle">
-          <input
-            type="checkbox"
-            checked={draft.comment}
-            onChange={(event) => {
-              setDraft({ ...draft, comment: event.target.checked })
-              commit('comment', event.target.checked, 'comment change')
-            }}
-          />
-          {tPlain('Comment')}
-        </label>
-        <label className="edit-style">
-          <select
-            value={draft.style}
-            onChange={(event) => {
-              setDraft({ ...draft, style: event.target.value })
-              commit('style', event.target.value, 'style change')
-            }}
-          >
-            {styles.map((style) => (
-              <option key={style.id}>{style.name}</option>
-            ))}
-          </select>
-        </label>
-        {/* 源码 Edit 按钮直接打开当前行样式的编辑对话框（subs_edit_box.cpp，样式缺失时禁用） */}
-        <button
-          className="edit-edit-btn"
-          onClick={onEditStyle}
-          disabled={!styles.some((style) => style.name === draft.style)}
-          title={tPlain('Edit style')}
-        >
-          {tPlain('Edit')}
-        </button>
-        <label className="edit-actor">
-          <input
-            list={`edit-actor-values-${cue.id}`}
-            placeholder={tPlain('Actor')}
-            value={draft.actor}
-            onFocus={() => setEditingField('actor')}
-            onChange={(event) => {
-              setDraft({ ...draft, actor: event.target.value })
-              commitField('actor', event.target.value, 'actor change')
-            }}
-            onBlur={() => {
-              setEditingField(null)
-              commitField('actor', draft.actor, 'actor change')
-            }}
-          />
-          <datalist id={`edit-actor-values-${cue.id}`}>
-            {actors.map((value) => (
-              <option key={value} value={value} />
-            ))}
-          </datalist>
-        </label>
-        <label className="edit-effect">
-          <input
-            list={`edit-effect-values-${cue.id}`}
-            placeholder={tPlain('Effect')}
-            value={draft.effect}
-            onFocus={() => setEditingField('effect')}
-            onChange={(event) => {
-              setDraft({ ...draft, effect: event.target.value })
-              commitField('effect', event.target.value, 'effect change')
-            }}
-            onBlur={() => {
-              setEditingField(null)
-              commitField('effect', draft.effect, 'effect change')
-            }}
-          />
-          <datalist id={`edit-effect-values-${cue.id}`}>
-            {effects.map((value) => (
-              <option key={value} value={value} />
-            ))}
-          </datalist>
-        </label>
+        <EditTopRow
+          cueId={cue.id}
+          comment={draft.comment}
+          style={draft.style}
+          actor={draft.actor}
+          effect={draft.effect}
+          styles={styles}
+          actors={actors}
+          effects={effects}
+          handlers={handlersRef}
+        />
         <output
           className={`char-count${characterLimit > 0 && characterCount > characterLimit ? ' over-limit' : ''}`}
           title={tPlain('Number of characters in the longest line of this subtitle')}
@@ -577,327 +1054,25 @@ export function EditPanel({
 
       {/* Aegisub middle_left_sizer；足够宽时会把 middle_right_sizer 接到本行末尾。 */}
       <div className="edit-middle">
-        <div className="edit-row edit-row-times">
-          <input
-            className="layer-field"
-            aria-label={tPlain('Layer')}
-            title={tPlain('Layer number')}
-            type="number"
-            min={0}
-            max={999}
-            value={draft.layer}
-            onFocus={() => setEditingField('layer')}
-            onChange={(event) => setDraft({ ...draft, layer: Number(event.target.value) })}
-            onBlur={() => {
-              setEditingField(null)
-              commit('layer', draft.layer, 'layer change')
-            }}
-          />
-          <input
-            className="time-field"
-            aria-label={tPlain('Start')}
-            title={tPlain('Start time')}
-            value={toStartText(draft.startMs)}
-            onFocus={() => setEditingField('startMs')}
-            onChange={(event) => {
-              const parsed = parseStartInput(event.target.value)
-              if (parsed !== null) commitTimeKeystroke('startMs', parsed)
-            }}
-            onBlur={(event) => {
-              setEditingField(null)
-              setTime('startMs', event.target.value, parseStartInput)
-              initialTimesRef.current = null
-            }}
-          />
-          <input
-            className="time-field"
-            aria-label={tPlain('End')}
-            title={tPlain('End time')}
-            value={toEndText(draft.endMs)}
-            onFocus={() => setEditingField('endMs')}
-            onChange={(event) => {
-              const parsed = parseEndInput(event.target.value)
-              if (parsed !== null) commitTimeKeystroke('endMs', parsed)
-            }}
-            onBlur={(event) => {
-              setEditingField(null)
-              setTime('endMs', event.target.value, parseEndInput)
-              initialTimesRef.current = null
-            }}
-          />
-          <input
-            className="time-field duration-field"
-            aria-label={tPlain('Duration')}
-            title={tPlain('Line duration')}
-            value={
-              frameTiming
-                ? String(durationFrames)
-                : formatEditorTime(Math.max(0, draft.endMs - draft.startMs))
-            }
-            onFocus={() => setEditingField('endMs')}
-            onChange={(event) => {
-              if (frameTiming) {
-                const frames = Number(event.target.value.trim())
-                if (Number.isInteger(frames) && frames >= 1) {
-                  const endMs = frameRate.timeAtFrame(
-                    frameRate.frameAtTime(draft.startMs, 'start') + frames - 1,
-                    'end',
-                  )
-                  // CommitTimes TIME_DURATION：End=Start+时长，更新会话初值 End，不钳制 Start
-                  const session = timeSession()
-                  session.endMs = endMs
-                  setDraft({ ...draft, endMs })
-                  commitTimes({ endMs })
-                }
-                return
-              }
-              const parsed = parseEditorTime(event.target.value)
-              if (parsed !== null) {
-                const endMs = draft.startMs + parsed
-                const session = timeSession()
-                session.endMs = endMs
-                setDraft({ ...draft, endMs })
-                commitTimes({ endMs })
-              }
-            }}
-            onBlur={(event) => {
-              setEditingField(null)
-              if (frameTiming) return // 帧模式在 onChange 即时提交
-              const parsed = parseEditorTime(event.target.value)
-              if (parsed !== null) {
-                const endMs = draft.startMs + parsed
-                setDraft({ ...draft, endMs })
-                commitTimes({ endMs })
-              }
-              initialTimesRef.current = null
-            }}
-          />
-          <input
-            className="margin-field"
-            aria-label={tPlain('Left margin')}
-            title={tPlain('Left Margin (0 = default from style)')}
-            type="number"
-            value={draft.marginL}
-            onFocus={() => setEditingField('marginL')}
-            onChange={(event) => {
-              const value = Number(event.target.value)
-              setDraft({ ...draft, marginL: value })
-              commitField('marginL', value, 'left margin change')
-            }}
-            onBlur={() => {
-              setEditingField(null)
-              commitField('marginL', draft.marginL, 'left margin change')
-            }}
-          />
-          <input
-            className="margin-field"
-            aria-label={tPlain('Right margin')}
-            title={tPlain('Right Margin (0 = default from style)')}
-            type="number"
-            value={draft.marginR}
-            onFocus={() => setEditingField('marginR')}
-            onChange={(event) => {
-              const value = Number(event.target.value)
-              setDraft({ ...draft, marginR: value })
-              commitField('marginR', value, 'right margin change')
-            }}
-            onBlur={() => {
-              setEditingField(null)
-              commitField('marginR', draft.marginR, 'right margin change')
-            }}
-          />
-          <input
-            className="margin-field"
-            aria-label={tPlain('Vertical margin')}
-            title={tPlain('Vertical Margin (0 = default from style)')}
-            type="number"
-            value={draft.marginV}
-            onFocus={() => setEditingField('marginV')}
-            onChange={(event) => {
-              const value = Number(event.target.value)
-              setDraft({ ...draft, marginV: value })
-              commitField('marginV', value, 'vertical margin change')
-            }}
-            onBlur={() => {
-              setEditingField(null)
-              commitField('marginV', draft.marginV, 'vertical margin change')
-            }}
-          />
-        </div>
+        <EditTimesRow
+          layer={draft.layer}
+          startMs={draft.startMs}
+          endMs={draft.endMs}
+          marginL={draft.marginL}
+          marginR={draft.marginR}
+          marginV={draft.marginV}
+          frameTiming={frameTiming}
+          frameRate={frameRate}
+          handlers={handlersRef}
+        />
 
-        <div className="edit-row edit-row-format" aria-label={tPlain('Text formatting tools')}>
-          <button
-            onClick={() => toggleOverrideTag('b')}
-            title={commandTooltip('edit/style/bold', 'Subtitle Edit Box')}
-            aria-label={tPlain('Bold')}
-          >
-            <img src={EDIT_ICON('button_bold')} alt="" width={16} height={16} draggable={false} />
-          </button>
-          <button
-            onClick={() => toggleOverrideTag('i')}
-            title={commandTooltip('edit/style/italic', 'Subtitle Edit Box')}
-            aria-label={tPlain('Italics')}
-          >
-            <img
-              src={EDIT_ICON('button_italics')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <button
-            onClick={() => toggleOverrideTag('u')}
-            title={commandTooltip('edit/style/underline', 'Subtitle Edit Box')}
-            aria-label={tPlain('Underline')}
-          >
-            <img
-              src={EDIT_ICON('button_underline')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <button
-            onClick={() => toggleOverrideTag('s')}
-            title={commandTooltip('edit/style/strikeout', 'Subtitle Edit Box')}
-            aria-label={tPlain('Strikeout')}
-          >
-            <img
-              src={EDIT_ICON('button_strikeout')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <button
-            onClick={openFontPicker}
-            title={commandTooltip('edit/font', 'Subtitle Edit Box')}
-            aria-label={tPlain('Font Face')}
-          >
-            <img
-              src={EDIT_ICON('button_fontname')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <span className="edit-toolbar-spacer" />
-          <button
-            onClick={() => openColorPicker('c')}
-            title={commandTooltip('edit/color/primary', 'Subtitle Edit Box')}
-            aria-label={tPlain('Primary Color')}
-          >
-            <img
-              src={EDIT_ICON('button_color_one')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <button
-            onClick={() => openColorPicker('2c')}
-            title={commandTooltip('edit/color/secondary', 'Subtitle Edit Box')}
-            aria-label={tPlain('Secondary Color')}
-          >
-            <img
-              src={EDIT_ICON('button_color_two')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <button
-            onClick={() => openColorPicker('3c')}
-            title={commandTooltip('edit/color/outline', 'Subtitle Edit Box')}
-            aria-label={tPlain('Outline Color')}
-          >
-            <img
-              src={EDIT_ICON('button_color_three')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <button
-            onClick={() => openColorPicker('4c')}
-            title={commandTooltip('edit/color/shadow', 'Subtitle Edit Box')}
-            aria-label={tPlain('Shadow Color')}
-          >
-            <img
-              src={EDIT_ICON('button_color_four')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <input
-            ref={colorPickerRef}
-            type="color"
-            defaultValue="#ffffff"
-            onChange={(event) => applyColor(event.target.value)}
-            aria-hidden="true"
-            tabIndex={-1}
-            className="edit-color-picker"
-          />
-          <span className="edit-toolbar-spacer" />
-          <button
-            onClick={() => onCommand('grid/line/next/create')}
-            title={commandTooltip('grid/line/next/create', 'Subtitle Edit Box')}
-            aria-label={tPlain('Next line')}
-          >
-            <img
-              src={EDIT_ICON('button_audio_commit')}
-              alt=""
-              width={16}
-              height={16}
-              draggable={false}
-            />
-          </button>
-          <span
-            className="edit-time-mode"
-            role="radiogroup"
-            aria-label={tPlain('Time display mode')}
-          >
-            <label>
-              <input
-                type="radio"
-                name="edit-time-mode"
-                checked={!frameTiming}
-                onChange={() => onFrameModeChange(false)}
-              />{' '}
-              {tPlain('Time')}
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="edit-time-mode"
-                disabled={!frameRate.isLoaded()}
-                checked={frameTiming}
-                onChange={() => onFrameModeChange(true)}
-              />{' '}
-              {tPlain('Frame')}
-            </label>
-          </span>
-          <label className="show-original">
-            <input
-              type="checkbox"
-              checked={showOriginal}
-              onChange={(event) => {
-                setShowOriginal(event.target.checked)
-                setOption('Subtitle/Show Original', event.target.checked)
-              }}
-            />{' '}
-            {tPlain('Show Original')}
-          </label>
-        </div>
+        <EditFormatRow
+          frameTiming={frameTiming}
+          frameRateLoaded={frameRateLoaded}
+          showOriginal={showOriginal}
+          colorPickerRef={colorPickerRef}
+          handlers={handlersRef}
+        />
       </div>
 
       {showOriginal && (

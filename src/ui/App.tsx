@@ -25,6 +25,7 @@ import {
   parseTimecodes,
   serializeKeyframes,
   serializeTimecodes,
+  serializeTimecodesKeepOffset,
 } from '../core/vfr'
 import { extractVideoKeyframes } from '../media/demux'
 import { BrowserHostAdapter, MEDIA_FILE_TYPES, SUBTITLE_FILE_TYPES } from '../platform/browserHost'
@@ -72,10 +73,12 @@ import {
   SelectLinesDialog,
   ShiftTimesDialog,
   StylingAssistantDialog,
+  TimecodesOffsetDialog,
   TimingProcessorDialog,
   ToolInfoDialog,
   TranslationDialog,
   VideoDetailsDialog,
+  VideoOffsetNoticeDialog,
   useEscapeClose,
   type ExportOptions,
   type SelectLinesSettings,
@@ -299,6 +302,11 @@ export function App() {
   // AudioBox（wxSashWindow）底边 sash：SetSashVisible(wxSASH_BOTTOM) + OnSashDrag 改变
   // 音频栏高度（SetMinSize → 父 Layout），OPT_SET("Audio/Display Height") 持久化
   const [audioBoxHeight, setAudioBoxHeight] = useState(() => getOptionInt('Audio/Display Height'))
+  // 播放音量增益（audio_box.cpp 三次方曲线）：AudioPane 计算并上报，视频播放出声共用
+  // （源码唯一 audio player 同时供视频/音频出声，Volume 滑条对两者都生效）
+  const [playbackGain, setPlaybackGain] = useState(() =>
+    Math.pow(Math.max(1, Math.min(100, getOptionInt('Audio/Volume'))) / 50, 3),
+  )
   const audioSashDragRef = useRef<{
     startY: number
     startHeight: number
@@ -390,10 +398,26 @@ export function App() {
   // 视频自带关键帧（ms；解复用扫描/WebCodecs 读流上报，帧号随帧率派生）
   const [videoKeyframeTimes, setVideoKeyframeTimes] = useState<number[]>([])
   const keyframeScanIdRef = useRef(0) // 换视频/关视频时作废旧的后台扫描
+  // 后台扫描的追踪句柄：保存时间码/关键帧前必须等它完成（Aegisub 保存的是 provider
+  // 逐帧表，CFR 回退与 WC 渐进关键帧都不是完整索引，保存值必然与源码不一致）
+  const videoScanRef = useRef<{
+    id: number
+    promise: Promise<void>
+    done: boolean
+    keyframeTimes: number[]
+    frameTimes: number[] | null
+  } | null>(null)
   const [timecodes, setTimecodes] = useState<Framerate | null>(null)
   const [timecodesFromFile, setTimecodesFromFile] = useState(false)
   // 视频自带逐帧时间码表（ms；FFMS2 TimecodesVector 语义，解复用扫描上报）
   const [videoFrameTimes, setVideoFrameTimes] = useState<number[] | null>(null)
+  // 首帧偏移感知 UI：载入提醒（每视频一次）+ 导出时间码时保留偏移选择
+  const [videoOffsetNotice, setVideoOffsetNotice] = useState<{
+    offsetMs: number
+    frameDurationMs: number
+  } | null>(null)
+  const offsetNoticeShownRef = useRef<File | undefined>(undefined)
+  const [timecodesOffsetAsk, setTimecodesOffsetAsk] = useState<number | null>(null)
   const [frameMode, setFrameMode] = useState(false) // 网格/编辑框帧号模式
   // 最近文件（mru.cpp）与探测到的真实视频帧率
   const [recentLists, setRecentLists] = useState<RecentLists>(() => ({
@@ -1048,19 +1072,47 @@ export function App() {
     keyframeScanIdRef.current += 1
     const scanId = keyframeScanIdRef.current
     const scanFile = file.file
+    // 载入偏移提醒：偏移 > 每帧时长(1000/fps)的 1/5（如 24fps → 8.33ms）时弹窗，
+    // 每次载入最多一次；本项目按主线语义归一化（首帧记 0），弹窗指引导出可保留偏移
+    const maybeNoticeVideoOffset = (table: number[]) => {
+      if (offsetNoticeShownRef.current === scanFile) return
+      offsetNoticeShownRef.current = scanFile
+      if (table.length < 2) return
+      const offsetMs = table[0]
+      if (offsetMs <= 0) return
+      const fps = Framerate.fromTimecodes(table).fps()
+      if (Number.isFinite(fps) && fps > 0 && offsetMs > 1000 / fps / 5)
+        setVideoOffsetNotice({ offsetMs, frameDurationMs: 1000 / fps })
+    }
     if (scanFile) {
-      void (async () => {
+      const scan: NonNullable<typeof videoScanRef.current> = {
+        id: scanId,
+        promise: null as unknown as Promise<void>,
+        done: false,
+        keyframeTimes: [],
+        frameTimes: null,
+      }
+      videoScanRef.current = scan
+      scan.promise = (async () => {
+        let latest: number[] = []
+        let latestFrames: number[] | null = null
         const cached = await loadCachedKeyframes(scanFile)
         if (keyframeScanIdRef.current !== scanId) return
         if (cached) {
-          setVideoKeyframeTimes(cached.keyframeTimesMs)
+          latest = cached.keyframeTimesMs ?? []
           // v2 条目附带逐帧时间码表；v1 旧条目（undefined）继续走扫描补全
           if (cached.frameTimesMs && cached.frameTimesMs.length >= 2)
-            setVideoFrameTimes(cached.frameTimesMs)
-          if (cached.frameTimesMs) return
+            latestFrames = cached.frameTimesMs
+          setVideoKeyframeTimes(latest)
+          if (latestFrames) {
+            setVideoFrameTimes(latestFrames)
+            maybeNoticeVideoOffset(latestFrames)
+            scan.done = true
+            scan.keyframeTimes = latest
+            scan.frameTimes = latestFrames
+            return
+          }
         }
-        let latest: number[] = []
-        let latestFrames: number[] | null = null
         await extractVideoKeyframes(
           scanFile,
           (times) => {
@@ -1070,13 +1122,20 @@ export function App() {
           () => keyframeScanIdRef.current !== scanId,
           (frames) => {
             latestFrames = frames
-            if (keyframeScanIdRef.current === scanId) setVideoFrameTimes(frames)
+            if (keyframeScanIdRef.current === scanId) {
+              setVideoFrameTimes(frames)
+              maybeNoticeVideoOffset(frames)
+            }
           },
-        ).catch(() => {
-          // 容器打不开（罕见封装）时保持无关键帧/无表，不影响视频播放
+        ).catch((error: unknown) => {
+          // 容器打不开（罕见封装）时保持无关键帧/无表，不影响视频播放；日志便于诊断
+          console.error('keyframe scan failed:', error)
         })
         if (keyframeScanIdRef.current !== scanId) return
         if (latest.length > 0) void storeCachedKeyframes(scanFile, latest, latestFrames ?? [])
+        scan.done = true
+        scan.keyframeTimes = latest
+        scan.frameTimes = latestFrames
       })()
     }
     // 旧视频 URL 若仍被保留的音频引用（Video/Open Audio 关闭时）不能释放
@@ -1127,9 +1186,36 @@ export function App() {
     await openKeyframesHandle(file)
   }
 
+  /** 保存时间码/关键帧前确保逐帧索引就绪：后台扫描对大文件可能要数十秒，未完成时
+   *  同步等一次（源码 ffms2 打开视频即建全量索引，保存时必然可用）。返回 null 表示
+   *  无视频文件或无关联扫描（保存走现有回退路径）。 */
+  const ensureVideoIndex = async (): Promise<{
+    keyframeTimes: number[]
+    frameTimes: number[] | null
+  } | null> => {
+    const scan = videoScanRef.current
+    if (!scan || scan.id !== keyframeScanIdRef.current) return null
+    if (!scan.done) setStatus(tPlain('Indexing video...'))
+    await scan.promise
+    return { keyframeTimes: scan.keyframeTimes, frameTimes: scan.frameTimes }
+  }
+
   const saveKeyframes = async () => {
     const base = core?.document.sourceName.replace(/\.(ass|ssa|srt)$/i, '') || 'keyframes'
-    const data = new TextEncoder().encode(serializeKeyframes(activeKeyframes))
+    let frames = activeKeyframes
+    if (!keyframesFromFile) {
+      // 源码关键帧帧号来自 provider 全量索引：等扫描完成后按逐帧表换算（ms→下界序号），
+      // CFR 回退换算的帧号会整体错位（扫描未完成时 WC 上报的也只是已读流的部分列表）
+      const index = await ensureVideoIndex()
+      if (index) {
+        const table = index.frameTimes
+        frames =
+          table && table.length >= 2
+            ? index.keyframeTimes.map((ms) => lowerBoundIndex(table, ms))
+            : index.keyframeTimes.map((ms) => frameRate.frameAtTime(ms))
+      }
+    }
+    const data = new TextEncoder().encode(serializeKeyframes(frames))
     await host.saveFile(`${base}.key.txt`, data, {
       description: 'Keyframes',
       accept: { 'text/plain': ['.txt'] },
@@ -1161,17 +1247,44 @@ export function App() {
     await openTimecodesHandle(file)
   }
 
-  const saveTimecodes = async () => {
+  const doSaveTimecodes = async (keepOffset: boolean) => {
+    setTimecodesOffsetAsk(null)
     const base = core?.document.sourceName.replace(/\.(ass|ssa|srt)$/i, '') || 'timecodes'
     // 源码 timecode.cpp：provider ? provider->GetFrameCount() : -1——有视频就传帧数
     // （CFR 时 timecodes 表仅 [0] 哨兵，缺帧数会导出只含 1 行的废文件）
-    const providerFrameCount = videoMedia ? frameCount : -1
-    const data = new TextEncoder().encode(serializeTimecodes(frameRate, providerFrameCount))
+    // 保存值 = provider 逐帧表（FFMS2 TimecodesVector）：表未就绪先等扫描——CFR 回退
+    // 的 numerator/2 四舍五入值与逐帧截断表必然不一致（如 24fps 表为 0,41,83,125…），
+    // 是"保存时间码与 Aegisub 不一致"的根因
+    const index = await ensureVideoIndex()
+    const table = index?.frameTimes
+    const rate = timecodes
+      ? timecodes
+      : table && table.length >= 2
+        ? Framerate.fromTimecodes(table)
+        : frameRate
+    const providerFrameCount = videoMedia ? (table ? table.length : frameCount) : -1
+    // 保留偏移 = 写原始 PTS 表（arch1t3cht fork b7d228c0ce 语义）；默认归一化到 0（主线）
+    const data = new TextEncoder().encode(
+      keepOffset && table && table.length >= 2
+        ? serializeTimecodesKeepOffset(table, providerFrameCount)
+        : serializeTimecodes(rate, providerFrameCount),
+    )
     await host.saveFile(`${base}.timecodes.txt`, data, {
       description: 'Timecodes',
       accept: { 'text/plain': ['.txt'] },
     })
     setStatus(tPlain('Timecodes saved'))
+  }
+
+  const saveTimecodes = async () => {
+    // 仅视频自带逐帧表可能带首帧偏移（外部 timecodes 文件与 CFR 回退在解析/构造时已定形）
+    const index = await ensureVideoIndex()
+    const table = index?.frameTimes
+    if (!timecodes && table && table.length >= 2 && table[0] > 0) {
+      setTimecodesOffsetAsk(table[0])
+      return
+    }
+    await doSaveTimecodes(false)
   }
 
   const closeTimecodes = () => {
@@ -1698,11 +1811,9 @@ export function App() {
               onOpenMedia={() => void openVideo()}
               mediaAction={videoAction}
               onCommand={executeCommand}
-              onPatchCue={(id, patch, label) =>
-                void apply([{ type: 'updateCue', id, patch }], label)
-              }
+              onPatchCue={(id, patch, label) => apply([{ type: 'updateCue', id, patch }], label)}
               onPatchCues={(patches, label) =>
-                void apply(
+                apply(
                   patches.map(({ id, patch }) => ({ type: 'updateCue', id, patch })),
                   label,
                 )
@@ -1729,14 +1840,20 @@ export function App() {
               onDetectedFps={setDetectedFps}
               onPlaybackModeChange={setVideoPlaybackMode}
               decoderOverride={videoDecoderOverride}
+              playbackGain={playbackGain}
               onKeyframesChange={(list) => {
-                // WebCodecs 读流上报的也是时间（ms）；统一走派生换算，文件关键帧优先
-                if (!keyframesFromFile) {
-                  setVideoKeyframeTimes(list)
-                  // 写入关键帧缓存（覆盖解复用扫描未覆盖的 WebCodecs-only 路径）
-                  if (videoMedia?.file && list.length > 0)
-                    void storeCachedKeyframes(videoMedia.file, list)
+                // WebCodecs 读流上报的也是时间（ms）；统一走派生换算，文件关键帧优先。
+                // 后台解复用扫描是全量索引（ffms2 语义）：进行中或已有完整结果时，
+                // 不得被 WebCodecs 渐进列表（只覆盖已读流片段）覆盖——扫描失败才作回退
+                if (keyframesFromFile) return
+                const scan = videoScanRef.current
+                if (scan && scan.id === keyframeScanIdRef.current) {
+                  if (!scan.done || scan.keyframeTimes.length > 0) return
                 }
+                setVideoKeyframeTimes(list)
+                // 写入关键帧缓存（覆盖解复用扫描未覆盖的 WebCodecs-only 路径）
+                if (videoMedia?.file && list.length > 0)
+                  void storeCachedKeyframes(videoMedia.file, list)
               }}
               // video_display.cpp FitClientSizeToVideo：SetMinClientSize = SetMaxClientSize =
               // video×zoom → 显示框锁定尺寸，窗口变窄也不收缩（flex-shrink: 0），溢出由窗口裁剪。
@@ -1785,9 +1902,8 @@ export function App() {
                 scrollToActiveLine={audioScrollRequest}
                 onDurationChange={setAudioDurationMs}
                 onCommand={executeCommand}
-                onPatchCue={(id, patch, label) =>
-                  void apply([{ type: 'updateCue', id, patch }], label)
-                }
+                onPlaybackGainChange={setPlaybackGain}
+                onPatchCue={(id, patch, label) => apply([{ type: 'updateCue', id, patch }], label)}
               />
             )}
             {!isNarrowViewport && displayMode !== 'video_subs' && (
@@ -2139,6 +2255,20 @@ export function App() {
       )}
       {dialog === 'options' && <PreferencesDialog onClose={() => setDialog(null)} />}
       {dialog === 'language' && <LanguageDialog onClose={() => setDialog(null)} />}
+      {videoOffsetNotice && (
+        <VideoOffsetNoticeDialog
+          offsetMs={videoOffsetNotice.offsetMs}
+          frameDurationMs={videoOffsetNotice.frameDurationMs}
+          onClose={() => setVideoOffsetNotice(null)}
+        />
+      )}
+      {timecodesOffsetAsk !== null && (
+        <TimecodesOffsetDialog
+          offsetMs={timecodesOffsetAsk}
+          onChoice={(keep) => void doSaveTimecodes(keep)}
+          onClose={() => setTimecodesOffsetAsk(null)}
+        />
+      )}
     </main>
   )
 }

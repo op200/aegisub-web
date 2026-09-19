@@ -108,8 +108,9 @@ export class WebCodecsAudioPlayer {
     return this.anchorMs + (this.context!.currentTime - this.anchorWhen) * 1000
   }
 
+  /** 音量为放大因子（1.0 不变，>1 增益，对应源码 audio_player SetVolume 语义） */
   setVolume(volume: number): void {
-    this.volume = Math.max(0, Math.min(1, volume))
+    this.volume = Math.max(0, volume)
     if (this.gain) this.gain.gain.value = this.volume
   }
 

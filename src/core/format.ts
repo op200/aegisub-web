@@ -247,6 +247,20 @@ function cueValues(cue: SubtitleCue): Record<string, string> {
   }
 }
 
+/** 逐行 ASS 文本缓存：视觉工具拖动时每帧都要导出整份文档，未变行直接复用。
+ *  主线程 cue 对象不可变（变更来自 worker 的结构化克隆或增量合并产生的新对象），
+ *  故可按对象身份缓存 */
+const cueLineCache = new WeakMap<SubtitleCue, string>()
+
+function cueLine(cue: SubtitleCue): string {
+  const cached = cueLineCache.get(cue)
+  if (cached !== undefined) return cached
+  const values = cueValues(cue)
+  const line = `${cue.comment ? 'Comment' : 'Dialogue'}: ${EVENT_COLUMNS.map((column) => values[column] ?? '').join(',')}`
+  cueLineCache.set(cue, line)
+  return line
+}
+
 export function exportAss(document: SubtitleDocument): string {
   const info = { ScriptType: 'v4.00+', ...document.scriptInfo }
   const lines = [
@@ -261,12 +275,7 @@ export function exportAss(document: SubtitleDocument): string {
     lines.push(`Style: ${STYLE_COLUMNS.map((column) => values[column] ?? '').join(',')}`)
   }
   lines.push('', '[Events]', `Format: ${EVENT_COLUMNS.join(', ')}`)
-  for (const cue of document.cues) {
-    const values = cueValues(cue)
-    lines.push(
-      `${cue.comment ? 'Comment' : 'Dialogue'}: ${EVENT_COLUMNS.map((column) => values[column] ?? '').join(',')}`,
-    )
-  }
+  for (const cue of document.cues) lines.push(cueLine(cue))
   for (const section of document.passthroughSections)
     lines.push('', `[${section.name}]`, ...section.lines)
   return `\uFEFF${lines.join('\r\n')}\r\n`

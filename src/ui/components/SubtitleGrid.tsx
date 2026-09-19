@@ -1,6 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { getOptionBool, getOptionInt, getOptionString } from '../../config/options'
+import {
+  getOptionBool,
+  getOptionInt,
+  getOptionString,
+  useOptionsVersion,
+} from '../../config/options'
 import { formatEditorTime } from '../../core/time'
 import type { SubtitleCue } from '../../core/types'
 import type { Framerate } from '../../core/vfr'
@@ -112,84 +117,97 @@ function headerFont(): string {
 }
 
 let measureCtx: CanvasRenderingContext2D | null = null
-function textWidth(text: string, font: string = gridFont()): number {
+// measureText 缓存：按字体分层，避免每次查询都拼接 key 字符串（拖动期间每帧对全部行
+// 实测 3 列，拼串分配带来可见 GC）；文本×字体组合有限，超上限整表清空防膨胀。
+// 注意 font 必须由调用方传入（默认参数里的 gridFont() 会在每次调用时重新求值，
+// 拖动期间全表扫描会放大成数万次选项查询）
+const textWidthCache = new Map<string, Map<string, number>>()
+let textWidthCacheSize = 0
+function textWidth(text: string, font: string): number {
   if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d')
   if (!measureCtx) return 0
-  measureCtx.font = font
-  return measureCtx.measureText(text).width
-}
-function maxTextWidth(values: string[]): number {
-  let max = 0
-  for (const value of values) {
-    if (!value) continue
-    max = Math.max(max, textWidth(value))
+  let byFont = textWidthCache.get(font)
+  if (!byFont) {
+    byFont = new Map()
+    textWidthCache.set(font, byFont)
   }
-  return max
+  const cached = byFont.get(text)
+  if (cached !== undefined) return cached
+  measureCtx.font = font
+  const width = measureCtx.measureText(text).width
+  if (textWidthCacheSize >= 65536) {
+    textWidthCache.clear()
+    textWidthCacheSize = 0
+    byFont = new Map()
+    textWidthCache.set(font, byFont)
+  }
+  byFont.set(text, width)
+  textWidthCacheSize += 1
+  return width
 }
-
 /**
  * Aegisub GridColumn::UpdateWidth：width = 10 + max(内容宽, 表头宽)。
  * web 移植按真实渲染占用取值：单元格 6+6（居中列 2+2）内边距 + 1px 右边框，
  * 表头按 12px/600 实测（翻译后 CJK 列名更宽，须保证不换行）；
  * 内容为空（Layer/边距全 0）时列宽为 0 → 列折叠隐藏。
  * 帧模式下 Start/End 列宽按最大帧号计算（grid_column.cpp）。
+ * 拖动期间每帧都会走到这里，故单趟遍历各列取值（不建中间数组、不额外分配字符串）。
  */
 function computeGridWidths(
   cues: SubtitleCue[],
   frameRate?: Framerate,
   frameMode?: boolean,
 ): { widths: number[]; fixedWidth: number } {
-  const maxFrameText =
-    frameMode && frameRate?.isLoaded()
-      ? String(Math.max(...cues.map((cue) => frameRate.frameAtTime(cue.endMs, 'end')), 0))
-      : ''
+  const withFrames = !!frameMode && !!frameRate?.isLoaded()
+  // 拖动期间本函数每帧对全表扫描，字体取一次、宽度查询记账化（单值比较而非重复查缓存）
+  const font = gridFont()
+  let maxLayer = 0
+  let maxL = 0
+  let maxR = 0
+  let maxV = 0
+  let maxFrame = 0
+  let maxStyleW = 0
+  let maxActorW = 0
+  let maxEffectW = 0
+  for (const cue of cues) {
+    if (cue.layer > maxLayer) maxLayer = cue.layer
+    if (cue.marginL > maxL) maxL = cue.marginL
+    if (cue.marginR > maxR) maxR = cue.marginR
+    if (cue.marginV > maxV) maxV = cue.marginV
+    if (withFrames && frameRate) {
+      const frame = frameRate.frameAtTime(cue.endMs, 'end')
+      if (frame > maxFrame) maxFrame = frame
+    }
+    if (cue.style) {
+      const width = textWidth(cue.style, font)
+      if (width > maxStyleW) maxStyleW = width
+    }
+    if (cue.actor) {
+      const width = textWidth(cue.actor, font)
+      if (width > maxActorW) maxActorW = width
+    }
+    if (cue.effect) {
+      const width = textWidth(cue.effect, font)
+      if (width > maxEffectW) maxEffectW = width
+    }
+  }
+  const maxFrameText = withFrames ? String(maxFrame) : ''
+  const maxByKey: Record<string, number> = {
+    number: textWidth(cues.length ? String(cues.length) : '1', font),
+    layer: maxLayer ? textWidth(String(maxLayer), font) : 0,
+    start: maxFrameText ? textWidth(maxFrameText, font) : textWidth('0:00:00.00', font),
+    end: maxFrameText ? textWidth(maxFrameText, font) : textWidth('0:00:00.00', font),
+    cps: textWidth('999', font),
+    style: maxStyleW,
+    actor: maxActorW,
+    effect: maxEffectW,
+    marginL: maxL ? textWidth(String(maxL), font) : 0,
+    marginR: maxR ? textWidth(String(maxR), font) : 0,
+    marginV: maxV ? textWidth(String(maxV), font) : 0,
+  }
   const widths = GRID_COLUMNS.map((column) => {
     if (column.fill) return column.width
-    let content = 0
-    switch (column.key) {
-      case 'number':
-        content = textWidth(cues.length ? String(cues.length) : '1')
-        break
-      case 'layer': {
-        const max = cues.reduce((m, cue) => Math.max(m, cue.layer), 0)
-        content = max ? textWidth(String(max)) : 0
-        break
-      }
-      case 'start':
-      case 'end':
-        content = maxFrameText ? textWidth(maxFrameText) : textWidth('0:00:00.00')
-        break
-      case 'cps':
-        content = textWidth('999')
-        break
-      case 'style':
-        content = maxTextWidth(cues.map((cue) => cue.style))
-        break
-      case 'actor':
-        content = maxTextWidth(cues.map((cue) => cue.actor))
-        break
-      case 'effect':
-        content = maxTextWidth(cues.map((cue) => cue.effect))
-        break
-      case 'marginL':
-      case 'marginR':
-      case 'marginV': {
-        const index = column.key === 'marginL' ? 0 : column.key === 'marginR' ? 1 : 2
-        const max = cues.reduce(
-          (m, cue) =>
-            Math.max(
-              m,
-              cue.marginL * 0 +
-                (index === 0 ? cue.marginL : index === 1 ? cue.marginR : cue.marginV),
-            ),
-          0,
-        )
-        content = max ? textWidth(String(max)) : 0
-        break
-      }
-      default:
-        content = 0
-    }
+    const content = maxByKey[column.key] ?? 0
     if (!content) return 0
     const headerNeed = textWidth(tPlain(column.label), headerFont()) + 13
     const contentNeed = content + (column.centered ? 5 : 13)
@@ -246,6 +264,144 @@ function cellValue(
       return ''
   }
 }
+
+/** 行 memo 比较用：cue 字段逐个比较（文档每帧经 worker structuredClone 回传，身份必变） */
+function cueEquals(a: SubtitleCue, b: SubtitleCue): boolean {
+  if (a === b) return true
+  if (a.id !== b.id || a.text !== b.text || a.comment !== b.comment) return false
+  if (a.startMs !== b.startMs || a.endMs !== b.endMs || a.layer !== b.layer) return false
+  if (a.style !== b.style || a.actor !== b.actor || a.effect !== b.effect) return false
+  if (a.marginL !== b.marginL || a.marginR !== b.marginR || a.marginV !== b.marginV) return false
+  const aExtra = Object.keys(a.extra)
+  const bExtra = Object.keys(b.extra)
+  if (aExtra.length !== bExtra.length) return false
+  return aExtra.every((key) => a.extra[key] === b.extra[key])
+}
+
+function sameWidths(a: number[], b: number[]): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  return a.every((value, index) => value === b[index])
+}
+
+interface GridRowProps {
+  cue: SubtitleCue
+  index: number
+  active: boolean
+  selected: boolean
+  activeAtTime: boolean
+  textMode: GridTagsMode
+  frameMode: boolean
+  frameRate: Framerate
+  widths: number[]
+  hiddenColumns: Set<string>
+  /** Preferences 版本号：CPS 阈值等选项变化时强制行重渲染 */
+  optionsVersion: number
+  onSelect: (id: string, modifiers: { toggle: boolean; range: boolean }) => void
+  onOpenContextMenu: (x: number, y: number) => void
+}
+
+/**
+ * 单行（base_grid.cpp 的行渲染）：文档每帧都换新对象，若整表重渲染则是拖动主线程
+ * 头号开销；行级 memo 后每帧只有内容真正变化的行重建（源码 COMMIT_DIAG_TEXT 也
+ * 只 RefreshRect 受影响行的文本矩形）
+ */
+const GridRow = memo(
+  function GridRow({
+    cue,
+    index,
+    active,
+    selected,
+    activeAtTime,
+    textMode,
+    frameMode,
+    frameRate,
+    widths,
+    hiddenColumns,
+    onSelect,
+    onOpenContextMenu,
+  }: GridRowProps) {
+    const isHidden = (column: GridColumnDef, colIndex: number) =>
+      hiddenColumns.has(column.key) || (!column.fill && widths[colIndex] === 0)
+    const cellStyle = (column: GridColumnDef, colIndex: number) =>
+      column.fill
+        ? { flex: '1 1 0%', minWidth: column.width }
+        : { width: isHidden(column, colIndex) ? 0 : widths[colIndex] }
+    const cps = cpsOf(cue)
+    return (
+      <div
+        className={`subtitle-row grid-columns${selected ? ' selected' : ''}${active ? ' active' : ''}${activeAtTime ? ' at-time' : ''}${cue.comment ? ' comment' : ''}`}
+        style={{ transform: `translateY(${index * ROW_HEIGHT}px)` }}
+        role="row"
+        aria-rowindex={index + 1}
+        onContextMenu={(event) => {
+          event.preventDefault()
+          // 未选中行先选中再弹菜单（base_grid.cpp OnContextMenu）
+          if (!selected) onSelect(cue.id, { toggle: false, range: false })
+          onOpenContextMenu(event.clientX, event.clientY)
+        }}
+      >
+        <span className="row-number" style={{ width: widths[0] }}>
+          {index + 1}
+        </span>
+        {GRID_COLUMNS.slice(1).map((column, colOffset) => {
+          const colIndex = colOffset + 1
+          const cls = `${column.fill ? 'grid-fill' : ''}${isHidden(column, colIndex) ? ' grid-hidden' : ''}`
+          if (column.key === 'cps') {
+            // 超过 CPS Error Threshold 时用 Colour/Subtitle Grid/CPS Error 着色
+            const cpsError = getOptionInt('Subtitle/Character Counter/CPS Error Threshold')
+            const over = cps !== null && cps > cpsError
+            return (
+              <span
+                className={`grid-cell-centered grid-cps ${cls}${over ? ' cps-error' : ''}`}
+                style={cellStyle(column, colIndex)}
+                key={column.key}
+              >
+                {cps ?? ''}
+              </span>
+            )
+          }
+          if (column.key === 'text') {
+            const shown = displayText(cue.text, textMode)
+            return (
+              <span
+                className={`cue-text ${cls}`}
+                style={cellStyle(column, colIndex)}
+                key={column.key}
+                title={cue.text}
+              >
+                {shown || '\u00a0'}
+              </span>
+            )
+          }
+          return (
+            <span
+              className={`${column.centered ? 'grid-cell-centered' : ''} ${cls}`}
+              style={cellStyle(column, colIndex)}
+              key={column.key}
+            >
+              {cellValue(cue, column.key, frameRate, frameMode)}
+            </span>
+          )
+        })}
+      </div>
+    )
+  },
+  (prev, next) =>
+    prev.index === next.index &&
+    prev.active === next.active &&
+    prev.selected === next.selected &&
+    prev.activeAtTime === next.activeAtTime &&
+    prev.textMode === next.textMode &&
+    prev.frameMode === next.frameMode &&
+    prev.frameRate === next.frameRate &&
+    prev.hiddenColumns === next.hiddenColumns &&
+    prev.optionsVersion === next.optionsVersion &&
+    prev.onSelect === next.onSelect &&
+    prev.onOpenContextMenu === next.onOpenContextMenu &&
+    sameWidths(prev.widths, next.widths) &&
+    cueEquals(prev.cue, next.cue),
+)
 
 /** 按标签显示模式渲染文本（Aegisub Subtitle/Grid/Hide Overrides：0 显示 / 1 简化 / 2 隐藏） */
 function displayText(text: string, mode: GridTagsMode): string {
@@ -333,6 +489,19 @@ export function SubtitleGrid({
 
   // 语言切换时重算列宽：翻译后列名宽度不同（App 根部已订阅，此处取版本号进 memo 依赖）
   const localeVersion = useLocaleVersion()
+  // Preferences 提交后重渲染（CPS 阈值等行内选项）；行 memo 后经 props 下传触发
+  const optionsVersion = useOptionsVersion()
+  // 行 memo 用的稳定回调：实现放 ref，调用时取最新 props（App 传的回调多为内联箭头）
+  const rowHandlersRef = useRef({ onSelect })
+  useEffect(() => {
+    rowHandlersRef.current.onSelect = onSelect
+  }, [onSelect])
+  const rowSelect = useCallback(
+    (id: string, modifiers: { toggle: boolean; range: boolean }) =>
+      rowHandlersRef.current.onSelect(id, modifiers),
+    [],
+  )
+  const openRowContextMenu = useCallback((x: number, y: number) => setContext({ x, y }), [])
 
   // Aegisub GridColumn::UpdateWidth：内容驱动列宽（Text 列填充剩余）
   const { widths, fixedWidth } = useMemo(
@@ -553,67 +722,23 @@ export function SubtitleGrid({
                     getOptionBool('Subtitle/Grid/Highlight Subtitles in Frame') &&
                     frameRate.frameAtTime(cue.startMs, 'start') <= frameNow &&
                     frameRate.frameAtTime(cue.endMs, 'end') >= frameNow
-                  const cps = cpsOf(cue)
                   return (
-                    <div
+                    <GridRow
                       key={cue.id}
-                      className={`subtitle-row grid-columns${selectedIds.has(cue.id) ? ' selected' : ''}${cue.id === activeId ? ' active' : ''}${activeAtTime ? ' at-time' : ''}${cue.comment ? ' comment' : ''}`}
-                      style={{ transform: `translateY(${index * ROW_HEIGHT}px)` }}
-                      role="row"
-                      aria-rowindex={index + 1}
-                      onContextMenu={(event) => {
-                        event.preventDefault()
-                        if (!selectedIds.has(cue.id))
-                          onSelect(cue.id, { toggle: false, range: false })
-                        setContext({ x: event.clientX, y: event.clientY })
-                      }}
-                    >
-                      <span className="row-number" style={{ width: widths[0] }}>
-                        {index + 1}
-                      </span>
-                      {GRID_COLUMNS.slice(1).map((column, colOffset) => {
-                        const colIndex = colOffset + 1
-                        const cls = `${column.fill ? 'grid-fill' : ''}${isHidden(column, colIndex) ? ' grid-hidden' : ''}`
-                        if (column.key === 'cps') {
-                          // 超过 CPS Error Threshold 时用 Colour/Subtitle Grid/CPS Error 着色
-                          const cpsError = getOptionInt(
-                            'Subtitle/Character Counter/CPS Error Threshold',
-                          )
-                          const over = cps !== null && cps > cpsError
-                          return (
-                            <span
-                              className={`grid-cell-centered grid-cps ${cls}${over ? ' cps-error' : ''}`}
-                              style={cellStyle(column, colIndex)}
-                              key={column.key}
-                            >
-                              {cps ?? ''}
-                            </span>
-                          )
-                        }
-                        if (column.key === 'text') {
-                          const shown = displayText(cue.text, textMode)
-                          return (
-                            <span
-                              className={`cue-text ${cls}`}
-                              style={cellStyle(column, colIndex)}
-                              key={column.key}
-                              title={cue.text}
-                            >
-                              {shown || '\u00a0'}
-                            </span>
-                          )
-                        }
-                        return (
-                          <span
-                            className={`${column.centered ? 'grid-cell-centered' : ''} ${cls}`}
-                            style={cellStyle(column, colIndex)}
-                            key={column.key}
-                          >
-                            {cellValue(cue, column.key, frameRate, frameMode)}
-                          </span>
-                        )
-                      })}
-                    </div>
+                      cue={cue}
+                      index={index}
+                      active={cue.id === activeId}
+                      selected={selectedIds.has(cue.id)}
+                      activeAtTime={activeAtTime}
+                      textMode={textMode}
+                      frameMode={frameMode}
+                      frameRate={frameRate}
+                      widths={widths}
+                      hiddenColumns={hiddenColumns}
+                      optionsVersion={optionsVersion}
+                      onSelect={rowSelect}
+                      onOpenContextMenu={openRowContextMenu}
+                    />
                   )
                 })
               })()}

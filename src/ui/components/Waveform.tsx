@@ -11,6 +11,7 @@ import type { SubtitleCue } from '../../core/types'
 import { extractAudioPeaks } from '../../media/audioPeaks'
 import type { MediaSource } from '../../platform/types'
 import { tPlain } from '../i18n'
+import { rafThrottle, serialLatest, type RafThrottled, type SerialLatest } from '../rafThrottle'
 
 interface WaveformProps {
   media: MediaSource | null
@@ -40,7 +41,11 @@ interface WaveformProps {
   onWheelZoom?: (delta: number) => void
   onVideoSeek: (timeMs: number) => void
   onDurationChange: (durationMs: number) => void
-  onPatchCue: (id: string, patch: Partial<Omit<SubtitleCue, 'id'>>, label: string) => void
+  onPatchCue: (
+    id: string,
+    patch: Partial<Omit<SubtitleCue, 'id'>>,
+    label: string,
+  ) => Promise<unknown> | void
 }
 
 interface AudioData {
@@ -270,6 +275,22 @@ export function Waveform({
     | { mode: 'marker'; marker: 'start' | 'end' }
     | null
   >(null)
+
+  // 标记拖动提交走「串行最新目标」通道（对齐 async_video_provider.cpp 的 RequestFrame：
+  // 在途不排队、新目标覆盖待发槽位、pointerup 冲刷最终值）。apply → worker 往返 +
+  // 全应用重渲染远慢于 pointermove 频率（125Hz+），逐个排队会让松开鼠标后画面按队列
+  // 把中间位置慢慢回放；中间目标一律丢弃，只保留最新
+  const patchCueRef = useRef(onPatchCue)
+  patchCueRef.current = onPatchCue
+  const markerCommitRef = useRef<SerialLatest<
+    [string, Partial<Omit<SubtitleCue, 'id'>>, string]
+  > | null>(null)
+  if (!markerCommitRef.current)
+    markerCommitRef.current = serialLatest((id, patch, label) =>
+      patchCueRef.current(id, patch, label),
+    )
+  const scrollThrottleRef = useRef<RafThrottled | null>(null)
+  if (!scrollThrottleRef.current) scrollThrottleRef.current = rafThrottle()
 
   // ---- 音频数据加载（合成音频走 worker；真实媒体走 extractAudioPeaks，流式渐进上报） ----
   useEffect(() => {
@@ -1091,13 +1112,13 @@ export function Waveform({
         if (best !== null) time = Math.round(best)
       }
       if (drag.marker === 'start') {
-        onPatchCue(
+        markerCommitRef.current!(
           selectedCue.id,
           { startMs: Math.min(time, selectedCue.endMs) },
           'Adjust start time',
         )
       } else {
-        onPatchCue(
+        markerCommitRef.current!(
           selectedCue.id,
           { endMs: Math.max(time, selectedCue.startMs) },
           'Adjust end time',
@@ -1112,11 +1133,14 @@ export function Waveform({
       const shaft = Math.max(1, size.w - thumbW)
       target = ((x - thumbW / 2) / shaft) * maxScroll
     }
-    setScrollLeft(Math.min(Math.max(0, target), maxScroll))
+    scrollThrottleRef.current!(() => setScrollLeft(Math.min(Math.max(0, target), maxScroll)))
   }
 
   const handlePointerUp = () => {
     dragRef.current = null
+    // 冲刷挂起的最终提交（快速拖动在一帧内完成时不丢最后一次 patch）
+    markerCommitRef.current?.flush()
+    scrollThrottleRef.current?.flush()
   }
 
   return (
