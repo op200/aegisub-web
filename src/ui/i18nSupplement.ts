@@ -220,5 +220,6 @@ export const WEB_SUPPLEMENT: Record<string, Record<string, string>> = {
     'Web core': 'Web 核心',
     Width: '宽度',
     'Wrap Style': '换行样式',
+    Yes: '是',
   },
 }

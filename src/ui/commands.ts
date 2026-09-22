@@ -60,9 +60,17 @@ export const COMMANDS: Record<string, CommandInfo> = {
     help: 'Open a subtitles file',
     shortcuts: { Default: ['Ctrl-O'] },
   },
+  'subtitle/open/charset': {
+    label: 'Open Subtitles with Charset...',
+    help: 'Open a subtitles file with a specific file encoding',
+  },
   'subtitle/open/video': {
     label: 'Open Subtitles from Video',
     help: 'Open the subtitles from the current video file',
+  },
+  'subtitle/open/autosave': {
+    label: 'Open Autosaved Subtitles...',
+    help: 'Open a previous version of a file which was autosaved by Aegisub',
   },
   'subtitle/save': {
     label: 'Save Subtitles',
@@ -556,6 +564,11 @@ export const COMMANDS: Record<string, CommandInfo> = {
     help: 'Rotate subtitles on their X and Y axes',
     shortcuts: { Video: ['F'] },
   },
+  'video/tool/perspective': {
+    label: 'Apply 3D Perspective',
+    help: "Rotate and shear subtitles to make them fit a given quad's perspective",
+    shortcuts: { Video: ['G'] },
+  },
   'video/tool/scale': {
     label: 'Scale',
     help: 'Scale subtitles on X and Y axes',
@@ -570,6 +583,35 @@ export const COMMANDS: Record<string, CommandInfo> = {
     label: 'Vector Clip',
     help: 'Clip subtitles to a vectorial area',
     shortcuts: { Video: ['J'] },
+  },
+  // 3D 透视子设置（vis_tool.cpp visual_mode_perspective_*）：仅菜单项，无热键
+  'video/tool/perspective/plane': {
+    label: 'Show Surrounding Plane',
+    help: 'Toggles showing a second quad for the ambient 3D plane.',
+  },
+  'video/tool/perspective/lock_outer': {
+    label: 'Lock Outer Quad',
+    help: 'When the surrounding plane is also visible, switches which quad is locked. If inactive, the inner quad can only be resized without changing the perspective plane. If active, this holds for the outer quad instead.',
+  },
+  'video/tool/perspective/grid': {
+    label: 'Show Grid',
+    help: 'Toggles showing a 3D grid in the visual perspective tool',
+  },
+  'video/tool/perspective/orgmode/center': {
+    label: '\\org Mode: Center',
+    help: 'Puts \\org at the center of the perspective quad',
+  },
+  'video/tool/perspective/orgmode/nofax': {
+    label: '\\org Mode: No \\fax',
+    help: 'Finds a value for \\org where \\fax can be zero, if possible. Use this mode if your event contains line breaks.',
+  },
+  'video/tool/perspective/orgmode/keep': {
+    label: '\\org Mode: Keep',
+    help: 'Fixes the position of \\org',
+  },
+  'video/tool/perspective/orgmode/cycle': {
+    label: 'Cycle \\org mode',
+    help: 'Cycles through the three \\org modes',
   },
   'video/tool/vclip/drag': { label: 'Drag', help: 'Drag control points' },
   'video/tool/vclip/line': { label: 'Line', help: 'Append a line' },

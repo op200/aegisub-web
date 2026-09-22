@@ -334,7 +334,15 @@ export const DEFAULT_CONFIG = {
       },
     },
     'Translation Assistant': { 'Skip Whitespace': true },
-    Visual: { Autohide: false },
+    Visual: {
+      // video/tool/perspective（fork feature 分支）：Outer=显示环绕平面、
+      // Outer Locked=锁定外框、Grid=3D 网格，Org Mode 取 PERSP_ORGMODE_* 位值
+      // （0=center、16=no-\fax、32=keep）
+      Perspective: { Outer: false, 'Outer Locked': false, Grid: false, 'Org Mode': 0 },
+      // 特征柄命中半径（visual_feature.cpp：DRAG_SMALL_CIRCLE 判定 3*size）
+      'Shape Handle Size': 3,
+      Autohide: false,
+    },
   },
   Version: { 'Last Version': 4040, 'Next Check': 0 },
   Video: {

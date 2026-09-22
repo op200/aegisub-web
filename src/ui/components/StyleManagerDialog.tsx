@@ -1,7 +1,6 @@
 import { ArrowDown, ArrowUp, ChevronsDown, ChevronsUp, Copy, Plus, Trash2 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 
-import { getOptionString, setOption } from '../../config/options'
 import { createDefaultStyle } from '../../core/defaults'
 import type { SubtitleStyle } from '../../core/types'
 import {
@@ -11,22 +10,27 @@ import {
   type StyleCatalog,
   uniqueStyleName,
 } from '../../storage/styleCatalogStore'
-import { assColorToCss, assColorToHex, hexToAssColor } from '../color'
 import { tPlain } from '../i18n'
 import { useEscapeClose } from './dialogs'
+import { StyleEditorDialog } from './StyleEditorDialog'
 
 interface Props {
   styles: SubtitleStyle[]
   activeStyleName: string
-  /** 挂载即打开当前行样式的编辑面板（编辑框 Edit 按钮语义，源码 DialogStyleEditor） */
-  autoEdit?: boolean
   onClose: () => void
   // label 覆写用于跨表复制（源码 dialog_style_manager.cpp CopyToCurrent = "style copy"），
   // 编辑面板保存/新建经 DialogStyleEditor 统一 "style change"
   onAdd: (style: SubtitleStyle, label?: string) => void
-  onUpdate: (id: string, patch: Partial<Omit<SubtitleStyle, 'id'>>, label?: string) => void
+  onUpdate: (
+    id: string,
+    patch: Partial<Omit<SubtitleStyle, 'id'>>,
+    label?: string,
+    rename?: { from: string; to: string } | null,
+  ) => void
   onDelete: (ids: string[]) => void
   onReorder: (ids: string[]) => void
+  /** 源码 StyleRenamer::NeedsReplace（当前脚本内该样式是否存在引用） */
+  hasReferences?: (name: string) => boolean
 }
 
 type EditorTarget = {
@@ -76,12 +80,12 @@ function reorder(
 export function StyleManagerDialog({
   styles,
   activeStyleName,
-  autoEdit,
   onClose,
   onAdd,
   onUpdate,
   onDelete,
   onReorder,
+  hasReferences,
 }: Props) {
   // ESC 关闭（嵌套 StyleEditor 后挂载于栈顶，先于主窗响应）
   useEscapeClose(onClose)
@@ -92,18 +96,20 @@ export function StyleManagerDialog({
   const active = styles.find((style) => style.name === activeStyleName) ?? styles[0]
   const [currentSelected, setCurrentSelected] = useState<string[]>(active ? [active.id] : [])
   const [editor, setEditor] = useState<EditorTarget>(null)
+  // 当前脚本侧编辑目标：WASM 核心的样式 id 即样式名（改名后随之变化），
+  // 故先按 id 再按最近应用的名字回退解析，保证改名后仍指向同一样式（源码持 AssStyle*）
+  const editorCurrent =
+    editor?.side === 'current'
+      ? (styles.find((item) => item.id === editor.originalId) ??
+        styles.find((item) => item.name === editor.style.name) ??
+        null)
+      : null
   // activeStyleName 变化时跟随当前选中（渲染期更新模式）
   const [prevActiveId, setPrevActiveId] = useState(active?.id ?? null)
   if ((active?.id ?? null) !== prevActiveId) {
     setPrevActiveId(active?.id ?? null)
     setCurrentSelected(active ? [active.id] : [])
   }
-  // Edit 按钮（编辑框）直达当前样式编辑，等价源码直接 ShowModal DialogStyleEditor
-  useEffect(() => {
-    if (autoEdit && active)
-      setEditor({ side: 'current', style: structuredClone(active), originalId: active.id })
-    // oxlint-disable-next-line react-hooks/exhaustive-deps -- 仅按挂载时的活动行样式初始化
-  }, [])
   const saveCatalogs = (next: StyleCatalog[]) => {
     setCatalogs(next)
     saveStyleCatalogs(next)
@@ -244,12 +250,16 @@ export function StyleManagerDialog({
           <button onClick={onClose}>{tPlain('Close')}</button>
         </footer>
         {editor && (
-          <StyleEditor
+          <StyleEditorDialog
+            nested
             style={editor.style}
             existing={editor.side === 'storage' ? catalog.styles : styles}
-            onCancel={() => setEditor(null)}
-            onApply={(style) => {
+            originalId={editor.side === 'current' ? editorCurrent?.id : editor.originalId}
+            storage={editor.side === 'storage'}
+            hasReferences={hasReferences}
+            onApply={(style, rename) => {
               if (editor.side === 'storage') {
+                // 源码 store->push_back 接管同一对象：新建后身份即为该样式
                 updateCatalogStyles(
                   editor.originalId
                     ? catalog.styles.map((item) =>
@@ -257,10 +267,22 @@ export function StyleManagerDialog({
                       )
                     : [...catalog.styles, style],
                 )
-              } else if (editor.originalId) onUpdate(editor.originalId, style)
-              else onAdd(style)
-              setEditor(null)
+                setEditor((current) =>
+                  current
+                    ? { ...current, style, originalId: current.originalId ?? style.id }
+                    : current,
+                )
+              } else if (editor.originalId) {
+                // 用解析到的最新 id 提交（WASM 核心改名后 id 随样式名变化）
+                const target = editorCurrent ?? styles.find((item) => item.id === editor.originalId)
+                if (target) onUpdate(target.id, style, undefined, rename)
+                setEditor((current) => (current ? { ...current, style } : current))
+              } else {
+                onAdd(style)
+                setEditor((current) => (current ? { ...current, style } : current))
+              }
             }}
+            onClose={() => setEditor(null)}
           />
         )}
       </section>
@@ -332,210 +354,5 @@ function StyleList(props: {
         </button>
       </div>
     </fieldset>
-  )
-}
-
-function StyleEditor({
-  style,
-  existing,
-  onCancel,
-  onApply,
-}: {
-  style: SubtitleStyle
-  existing: SubtitleStyle[]
-  onCancel: () => void
-  onApply: (style: SubtitleStyle) => void
-}) {
-  // ESC 关闭编辑器（栈顶优先于主窗）
-  useEscapeClose(onCancel)
-  const [draft, setDraft] = useState(structuredClone(style))
-  // 预览文本（dialog_style_editor.cpp PreviewText：OPT_GET 初值 + 析构 OPT_SET）
-  const [previewText, setPreviewText] = useState(() =>
-    getOptionString('Tool/Style Editor/Preview Text'),
-  )
-  const previewTextRef = useRef('')
-  useEffect(() => {
-    previewTextRef.current = previewText
-  })
-  useEffect(
-    () => () => {
-      setOption('Tool/Style Editor/Preview Text', previewTextRef.current)
-    },
-    [],
-  )
-  const patch = <K extends keyof SubtitleStyle>(key: K, value: SubtitleStyle[K]) =>
-    setDraft((current) => ({ ...current, [key]: value }))
-  const valid = !existing.some(
-    (item) => item.id !== style.id && item.name.toLowerCase() === draft.name.trim().toLowerCase(),
-  )
-  const color = (
-    key: 'primaryColor' | 'secondaryColor' | 'outlineColor' | 'backColor',
-    label: string,
-  ) => (
-    <label className="style-color-field">
-      <span style={{ background: assColorToCss(draft[key]) }} />
-      {tPlain(label)}
-      <input
-        type="color"
-        value={assColorToHex(draft[key])}
-        onChange={(e) => patch(key, hexToAssColor(e.target.value, draft[key]))}
-      />
-    </label>
-  )
-  return (
-    <div className="dialog-backdrop nested">
-      <section className="app-dialog style-editor-dialog">
-        <header>
-          <strong>{tPlain('Style Editor')}</strong>
-        </header>
-        <div className="style-editor-grid">
-          <fieldset>
-            <legend>{tPlain('Style name')}</legend>
-            <input value={draft.name} onChange={(e) => patch('name', e.target.value)} />
-          </fieldset>
-          <fieldset>
-            <legend>{tPlain('Font')}</legend>
-            <label>
-              {tPlain('Face')}
-              <input value={draft.fontName} onChange={(e) => patch('fontName', e.target.value)} />
-            </label>
-            <label>
-              {tPlain('Size')}
-              <input
-                type="number"
-                min={0}
-                max={10000}
-                value={draft.fontSize}
-                onChange={(e) => patch('fontSize', +e.target.value)}
-              />
-            </label>
-            <div className="style-checks">
-              {(['bold', 'italic', 'underline', 'strikeout'] as const).map((k) => (
-                <label key={k}>
-                  <input
-                    type="checkbox"
-                    checked={draft[k]}
-                    onChange={(e) => patch(k, e.target.checked)}
-                  />
-                  {k}
-                </label>
-              ))}
-            </div>
-          </fieldset>
-          <fieldset>
-            <legend>{tPlain('Colors')}</legend>
-            {color('primaryColor', 'Primary')}
-            {color('secondaryColor', 'Secondary')}
-            {color('outlineColor', 'Outline')}
-            {color('backColor', 'Shadow')}
-          </fieldset>
-          <fieldset>
-            <legend>{tPlain('Margins')}</legend>
-            {(['marginL', 'marginR', 'marginV'] as const).map((k) => (
-              <label key={k}>
-                {k}
-                <input
-                  type="number"
-                  min={-9999}
-                  max={99999}
-                  value={draft[k]}
-                  onChange={(e) => patch(k, +e.target.value)}
-                />
-              </label>
-            ))}
-          </fieldset>
-          <fieldset>
-            <legend>{tPlain('Alignment')}</legend>
-            <div className="alignment-grid">
-              {[7, 8, 9, 4, 5, 6, 1, 2, 3].map((n) => (
-                <button
-                  className={draft.alignment === n ? 'pressed' : ''}
-                  onClick={() => patch('alignment', n)}
-                  key={n}
-                >
-                  {n}
-                </button>
-              ))}
-            </div>
-          </fieldset>
-          <fieldset>
-            <legend>{tPlain('Outline')}</legend>
-            <label>
-              {tPlain('Outline')}
-              <input
-                type="number"
-                min={0}
-                max={1000}
-                step={0.1}
-                value={draft.outline}
-                onChange={(e) => patch('outline', +e.target.value)}
-              />
-            </label>
-            <label>
-              {tPlain('Shadow')}
-              <input
-                type="number"
-                min={0}
-                max={1000}
-                step={0.1}
-                value={draft.shadow}
-                onChange={(e) => patch('shadow', +e.target.value)}
-              />
-            </label>
-            <label>
-              {tPlain('Border style')}
-              <select
-                value={draft.borderStyle}
-                onChange={(e) => patch('borderStyle', +e.target.value)}
-              >
-                <option value={1}>{tPlain('Outline')}</option>
-                <option value={3}>{tPlain('Opaque box')}</option>
-                <option value={4}>{tPlain('Shadow box')}</option>
-              </select>
-            </label>
-          </fieldset>
-          <fieldset>
-            <legend>{tPlain('Miscellaneous')}</legend>
-            {(['scaleX', 'scaleY', 'spacing', 'angle', 'encoding'] as const).map((k) => (
-              <label key={k}>
-                {k}
-                <input type="number" value={draft[k]} onChange={(e) => patch(k, +e.target.value)} />
-              </label>
-            ))}
-          </fieldset>
-          <fieldset className="style-preview">
-            <legend>{tPlain('Preview')}</legend>
-            {/* PreviewText 输入框（dialog_style_editor.cpp）：\N 换行语义 */}
-            <input
-              value={previewText}
-              onChange={(event) => setPreviewText(event.target.value)}
-              aria-label={tPlain('Preview text')}
-            />
-            <div
-              style={{
-                fontFamily: draft.fontName,
-                fontSize: Math.min(48, draft.fontSize),
-                fontWeight: draft.bold ? 'bold' : 'normal',
-                fontStyle: draft.italic ? 'italic' : 'normal',
-                color: assColorToCss(draft.primaryColor),
-                WebkitTextStroke: `${draft.outline}px ${assColorToCss(draft.outlineColor)}`,
-                whiteSpace: 'pre-line',
-              }}
-            >
-              {previewText.replace(/\\N/g, '\n')}
-            </div>
-          </fieldset>
-        </div>
-        <footer>
-          <button
-            disabled={!valid || !draft.name.trim()}
-            onClick={() => onApply({ ...draft, name: draft.name.trim() })}
-          >
-            {tPlain('OK')}
-          </button>
-          <button onClick={onCancel}>{tPlain('Cancel')}</button>
-        </footer>
-      </section>
-    </div>
   )
 }

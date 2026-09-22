@@ -1,4 +1,5 @@
 import type { SearchMatch, SearchSettings } from '../workers/protocol'
+import { blockText, parseBlocks } from './assTags'
 import { createCue, createDefaultStyle, makeId } from './defaults'
 import { exportSubtitle, parseSubtitle } from './format'
 import type {
@@ -274,13 +275,29 @@ export class TypeScriptCoreRuntime {
       }
       case 'updateStyle': {
         const style = this.document.styles.find((item) => item.id === command.id)
-        if (style) {
-          const previousName = style.name
-          Object.assign(style, command.patch)
-          if (command.patch.name && command.patch.name !== previousName) {
-            for (const cue of this.document.cues)
-              if (cue.style === previousName) cue.style = command.patch.name
+        if (style) Object.assign(style, command.patch)
+        break
+      }
+      // dialog_style_editor.cpp StyleRenamer::Replace：仅显式改名时同步脚本引用
+      // （源码重命名询问选“否”则不改；样式管理器覆盖复制也不改，两者都不带 COMMIT_DIAG_FULL）
+      case 'renameStyleReferences': {
+        const { from, to } = command
+        for (const cue of this.document.cues) {
+          if (cue.style === from) cue.style = to
+          if (!cue.text.includes('\\r')) continue
+          const blocks = parseBlocks(cue.text)
+          let changed = false
+          for (const block of blocks) {
+            if (block.type !== 'override') continue
+            for (const tag of block.tags) {
+              // 源码 ProcessTag：标签名 \r 且参数文本（已去空白）等于原样式名
+              if (tag.name === '\\r' && tag.params.trim() === from) {
+                tag.params = to
+                changed = true
+              }
+            }
           }
+          if (changed) cue.text = blocks.map(blockText).join('')
         }
         break
       }

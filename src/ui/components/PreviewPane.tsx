@@ -6,13 +6,17 @@ import {
   getOptionBool,
   getOptionInt,
   getOptionString,
+  setOption,
   useOptionsVersion,
 } from '../../config/options'
+import { blockText, parseBlocks } from '../../core/assTags'
 import {
   defaultLinePosition,
+  findTagInBlocks,
   floatToString,
   formatG4,
   readVisualOverrides,
+  removeOverride,
   setOverride,
   setPosition,
   readVectorClip,
@@ -226,6 +230,7 @@ const VISUAL_TOOLS = [
   ['video/tool/drag', 'visual_move'],
   ['video/tool/rotate/z', 'visual_rotatez'],
   ['video/tool/rotate/xy', 'visual_rotatexy'],
+  ['video/tool/perspective', 'visual_perspective'],
   ['video/tool/scale', 'visual_scale'],
   ['video/tool/clip', 'visual_clip'],
   ['video/tool/vector_clip', 'visual_vector_clip'],
@@ -295,6 +300,8 @@ function visualToolColors() {
 interface GlMapperOptions {
   /** gl.SetOrigin（显示像素） */
   origin: [number, number]
+  /** 最先应用的 SetScale（perspective 网格：bbox 高 / spacing / 4 的 glScale） */
+  preScale?: { x: number; y: number }
   /** 旋转前的 SetScale（rotatexy：100·video/script，即脚本像素→显示像素） */
   baseScale?: { x: number; y: number }
   /** 角度（度） */
@@ -324,11 +331,18 @@ function makeGlMapper(o: GlMapperOptions): (x: number, y: number, z?: number) =>
   const fay = o.shear?.y ?? 0
   const bsx = o.baseScale?.x ?? 1
   const bsy = o.baseScale?.y ?? 1
+  const psx = o.preScale?.x ?? 1
+  const psy = o.preScale?.y ?? 1
   return (px, py, pz = 0) => {
-    // SetShear(fax, fay) 列主序矩阵 {1,fay,0,0 | fax,1,0,0}：x' = x + fax·y；y' = fay·x + y
-    let x = px + fax * py
-    let y = fay * px + py
+    // gl.SetScale(100*glScale)（perspective 网格）在顶点上最先生效
+    let x = px * psx
+    let y = py * psy
     let z = pz
+    // SetShear(fax, fay) 列主序矩阵 {1,fay,0,0 | fax,1,0,0}：x' = x + fax·y；y' = fay·x + y
+    const sx0 = x + fax * y
+    const sy0 = fay * x + y
+    x = sx0
+    y = sy0
     // SetScale(fsc)
     x *= fscX
     y *= fscY
@@ -484,6 +498,1025 @@ function splinePolylines(spline: Spline): Vec2[][] {
   return paths
 }
 
+// ---------------------------------------------------------------------------
+// 3D 透视工具（visual_tool_perspective.cpp，fork arch1t3cht feature 分支）
+// ---------------------------------------------------------------------------
+
+/** visual_tool_perspective.h VisualToolPerspectiveSetting 位掩码 */
+const PERSP_OUTER = 1
+const PERSP_LOCK_OUTER = 2
+const PERSP_GRID = 4
+// 照抄 vtp.h：PERSP_LAST 是 SetSubTool 里 ToggleTool 循环的上界（web 端按钮声明式渲染，无循环）
+// oxlint-disable-next-line no-unused-vars
+const PERSP_LAST = 8
+const PERSP_ORGMODE_CENTER = 0
+const PERSP_ORGMODE_NOFAX = 16
+const PERSP_ORGMODE_KEEP = 32
+const PERSP_ORGMODE = 48
+
+/** visual_tool_perspective.cpp default_screen_z（web 不建模 layout res，比值恒为 1） */
+const PERSP_SCREEN_Z = 312.5
+
+/** 子工具条位开关（SetToolbar 顺序：plane / lock_outer / grid，orgmode 按钮另写） */
+const PERSP_SUBTOOLS: { id: string; bit: number }[] = [
+  { id: 'video/tool/perspective/plane', bit: PERSP_OUTER },
+  { id: 'video/tool/perspective/lock_outer', bit: PERSP_LOCK_OUTER },
+  { id: 'video/tool/perspective/grid', bit: PERSP_GRID },
+]
+
+/** \org 模式 → 图标所对应的命令（orgmode 按钮图标随模式变化，点击一律 cycle） */
+const PERSP_ORG_COMMANDS: Record<number, string> = {
+  [PERSP_ORGMODE_CENTER]: 'video/tool/perspective/orgmode/center',
+  [PERSP_ORGMODE_NOFAX]: 'video/tool/perspective/orgmode/nofax',
+  [PERSP_ORGMODE_KEEP]: 'video/tool/perspective/orgmode/keep',
+}
+
+/** 特征组（VisualToolPerspectiveFeatureType） */
+const FEATURE_INNER = 0
+const FEATURE_OUTER = 1
+const FEATURE_CENTER = 2
+const FEATURE_ORG = 3
+
+interface V3 {
+  x: number
+  y: number
+  z: number
+}
+
+const v3 = (x: number, y: number, z: number): V3 => ({ x, y, z })
+const addV3 = (a: V3, b: V3): V3 => v3(a.x + b.x, a.y + b.y, a.z + b.z)
+const subV3 = (a: V3, b: V3): V3 => v3(a.x - b.x, a.y - b.y, a.z - b.z)
+const mulV3 = (a: V3, s: number): V3 => v3(a.x * s, a.y * s, a.z * s)
+const crossV3 = (a: V3, b: V3): V3 =>
+  v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+const lenV3 = (a: V3): number => Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
+/** vector3d.cpp RotateX */
+const rotateX3 = (a: V3, angle: number): V3 =>
+  v3(
+    a.x,
+    a.y * Math.cos(angle) - a.z * Math.sin(angle),
+    a.y * Math.sin(angle) + a.z * Math.cos(angle),
+  )
+/** vector3d.cpp RotateY */
+const rotateY3 = (a: V3, angle: number): V3 =>
+  v3(
+    a.x * Math.cos(angle) - a.z * Math.sin(angle),
+    a.y,
+    a.x * Math.sin(angle) + a.z * Math.cos(angle),
+  )
+/** vector3d.cpp RotateZ */
+const rotateZ3 = (a: V3, angle: number): V3 =>
+  v3(
+    a.x * Math.cos(angle) - a.y * Math.sin(angle),
+    a.x * Math.sin(angle) + a.y * Math.cos(angle),
+    a.z,
+  )
+
+const addV = (a: Vec2, b: Vec2): Vec2 => vec(a.x + b.x, a.y + b.y)
+const subV = (a: Vec2, b: Vec2): Vec2 => vec(a.x - b.x, a.y - b.y)
+const mulV = (a: Vec2, s: number): Vec2 => vec(a.x * s, a.y * s)
+const divV = (a: Vec2, b: Vec2): Vec2 => vec(a.x / b.x, a.y / b.y)
+const dotV = (a: Vec2, b: Vec2): number => a.x * b.x + a.y * b.y
+const lenV = (a: Vec2): number => Math.hypot(a.x, a.y)
+const sqLenV = (a: Vec2): number => a.x * a.x + a.y * a.y
+/** vector2d.cpp Unit：零向量回退 (0,0) */
+const unitV = (a: Vec2): Vec2 => {
+  const len = lenV(a)
+  return len === 0 ? vec(0, 0) : vec(a.x / len, a.y / len)
+}
+/** vector2d.cpp SingleAxis */
+const singleAxisV = (a: Vec2): Vec2 => (Math.abs(a.x) < Math.abs(a.y) ? vec(0, a.y) : vec(a.x, 0))
+
+/** visual_tool_perspective.cpp Solve2x2（含主元交换的 LU 分解） */
+function solve2x2(
+  a11: number,
+  a12: number,
+  a21: number,
+  a22: number,
+  b1: number,
+  b2: number,
+): [number, number] {
+  if (Math.abs(a11) < Math.abs(a21)) {
+    const tb = b1
+    b1 = b2
+    b2 = tb
+    const t1 = a11
+    a11 = a21
+    a21 = t1
+    const t2 = a12
+    a12 = a22
+    a22 = t2
+  }
+  a21 = a21 / a11
+  a22 = a22 - a21 * a12
+  const z1 = b1
+  const z2 = b2 - a21 * z1
+  const x2 = z2 / a22
+  const x1 = (z1 - a12 * x2) / a11
+  return [x1, x2]
+}
+
+/** QuadMidpoint：对角线交点 */
+function quadMidpoint(quad: Vec2[]): Vec2 {
+  const diag1 = subV(quad[2], quad[0])
+  const diag2 = subV(quad[1], quad[3])
+  const b = subV(quad[3], quad[0])
+  const [la1] = solve2x2(diag1.x, diag2.x, diag1.y, diag2.y, b.x, b.y)
+  return addV(quad[0], mulV(diag1, la1))
+}
+
+interface QuadRel {
+  x1: number
+  y1: number
+  x2: number
+  x3: number
+  x4: number
+  y2: number
+  y3: number
+  y4: number
+}
+
+/** UnwrapQuadRel：以 quad[0] 为原点展开其余三角 */
+function unwrapQuadRel(quad: Vec2[]): QuadRel {
+  const x1 = quad[0].x
+  const y1 = quad[0].y
+  return {
+    x1,
+    y1,
+    x2: quad[1].x - x1,
+    x3: quad[2].x - x1,
+    x4: quad[3].x - x1,
+    y2: quad[1].y - y1,
+    y3: quad[2].y - y1,
+    y4: quad[3].y - y1,
+  }
+}
+
+/** XYToUV（Mathematica 导出的四次有理式，逐字移植） */
+function xyToUv(quad: Vec2[], xy: Vec2): Vec2 {
+  const { x1, y1, x2, x3, x4, y2, y3, y4 } = unwrapQuadRel(quad)
+  const x = xy.x - x1
+  const y = xy.y - y1
+  const u = -(
+    ((x3 * y2 - x2 * y3) *
+      (x4 * y - x * y4) *
+      (x4 * (-y2 + y3) + x3 * (y2 - y4) + x2 * (-y3 + y4))) /
+    (x3 * x3 * (x4 * y2 * y2 * (-y + y4) + y4 * (x * y2 * (y2 - y4) + x2 * (y - y2) * y4)) +
+      x3 *
+        (x4 * x4 * y2 * y2 * (y - y3) +
+          2 * x4 * (x2 * y * y3 * (y2 - y4) + x * y2 * (-y2 + y3) * y4) +
+          x2 * y4 * (x2 * (-y + y3) * y4 + 2 * x * y2 * (-y3 + y4))) +
+      y3 *
+        (x * x4 * x4 * y2 * (y2 - y3) +
+          x2 * x4 * x4 * (y2 * y3 + y * (-2 * y2 + y3)) -
+          x2 * x2 * (x4 * y * (y3 - 2 * y4) + x4 * y3 * y4 + x * y4 * (-y3 + y4))))
+  )
+  const v =
+    ((x2 * y - x * y2) *
+      (x4 * y3 - x3 * y4) *
+      (x4 * (y2 - y3) + x2 * (y3 - y4) + x3 * (-y2 + y4))) /
+    (x3 *
+      (x4 * x4 * y2 * y2 * (-y + y3) +
+        x2 * y4 * (2 * x * y2 * (y3 - y4) + x2 * (y - y3) * y4) -
+        2 * x4 * (x2 * y * y3 * (y2 - y4) + x * y2 * (-y2 + y3) * y4)) +
+      x3 * x3 * (x4 * y2 * y2 * (y - y4) + y4 * (x2 * (-y + y2) * y4 + x * y2 * (-y2 + y4))) +
+      y3 *
+        (x * x4 * x4 * y2 * (-y2 + y3) +
+          x2 * x4 * x4 * (2 * y * y2 - y * y3 - y2 * y3) +
+          x2 * x2 * (x4 * y * (y3 - 2 * y4) + x4 * y3 * y4 + x * y4 * (-y3 + y4))))
+  return vec(u, v)
+}
+
+/** UVToXY（Mathematica 导出的有理式，逐字移植） */
+function uvToXy(quad: Vec2[], uv: Vec2): Vec2 {
+  const { x1, y1, x2, x3, x4, y2, y3, y4 } = unwrapQuadRel(quad)
+  const u = uv.x
+  const v = uv.y
+  const d =
+    x4 * ((-1 + u + v) * y2 + y3 - v * y3) +
+    x3 * (y2 - u * y2 + (-1 + v) * y4) +
+    x2 * ((-1 + u) * y3 - (-1 + u + v) * y4)
+  const x = (v * x4 * (x3 * y2 - x2 * y3) + u * x2 * (x4 * y3 - x3 * y4)) / d
+  const y = (v * y4 * (x3 * y2 - x2 * y3) + u * y2 * (x4 * y3 - x3 * y4)) / d
+  return vec(x + x1, y + y1)
+}
+
+/** MakeRect：左上/右上/右下/左下 */
+function makeRect(a: Vec2, b: Vec2): Vec2[] {
+  return [vec(a.x, a.y), vec(b.x, a.y), vec(b.x, b.y), vec(a.x, b.y)]
+}
+
+interface PerspFeature {
+  key: string
+  group: number
+  index: number
+  type: 'big-triangle' | 'small-circle'
+  pos: Vec2
+  /** StartDrag 记录的位置（HasMoved 判定） */
+  start: Vec2
+  layer: number
+}
+
+interface PerspState {
+  /** 当前活动行 id（环境平面映射的键） */
+  cueId: string
+  settings: number
+  angleX: number
+  angleY: number
+  angleZ: number
+  fax: number
+  fay: number
+  align: number
+  bbox: [Vec2, Vec2]
+  fsc: Vec2
+  org: Vec2
+  pos: Vec2
+  bord: Vec2
+  shad: Vec2
+  /** 内框四角在外框 UV 空间中的矩形（默认 0.25..0.75） */
+  c1: Vec2
+  c2: Vec2
+  centerf: PerspFeature
+  orgf: PerspFeature | null
+  inner: PerspFeature[]
+  outer: PerspFeature[]
+  oldInner: Vec2[]
+  oldOuter: Vec2[]
+  features: PerspFeature[]
+  active: string | null
+  selected: Set<string>
+  dragStart: Vec2 | null
+  dragging: boolean
+  selChanged: boolean
+  ctrlDown: boolean
+  shiftDown: boolean
+  altDown: boolean
+}
+
+/** 环境平面（AmbientPlane）持久化。 */
+// 偏差说明：源码把外框四角以 "_aegi_perspective_ambient_plane" 键写入 ASS 的
+// Extradata（随文件保存），并写到全部选中行。web 侧没有 Extradata 通道，且不应把
+// 工具的内部状态写进字幕文本，故改用会话内的 Map<cueId, 四角脚本坐标>。后果：
+// 环境平面在刷新页面/重新打开文件后不保留（源码可保留），且只跟随活动行而非全部选中行。
+const perspAmbientPlane = new Map<string, Vec2[]>()
+
+/** 特征柄命中半径选项（visual_feature.cpp Tool/Visual/Shape Handle Size） */
+function perspHandleSize(): number {
+  return getOptionInt('Tool/Visual/Shape Handle Size')
+}
+
+/** visual_feature.cpp VisualDraggableFeature::IsMouseOver */
+function perspIsMouseOver(feature: PerspFeature, mouse: Vec2): boolean {
+  const dx = mouse.x - feature.pos.x
+  const dy = mouse.y - feature.pos.y
+  if (feature.type === 'big-triangle') {
+    if (dy < -10 || dy > 6) return false
+    const offset = dy - 6
+    return 16 * dx + 9 * offset < 0 && 16 * dx - 9 * offset > 0
+  }
+  return dx * dx + dy * dy < 3 * perspHandleSize()
+}
+
+const perspHasOuterBits = (settings: number) => (settings & PERSP_OUTER) !== 0
+const perspOuterLockedBits = (settings: number) =>
+  perspHasOuterBits(settings) && (settings & PERSP_LOCK_OUTER) !== 0
+const perspOrgModeBits = (settings: number) => settings & PERSP_ORGMODE
+const perspHasOrgfBits = (settings: number) => perspOrgModeBits(settings) === PERSP_ORGMODE_KEEP
+
+const perspHasOuter = (state: PerspState) => perspHasOuterBits(state.settings)
+const perspOuterLocked = (state: PerspState) => perspOuterLockedBits(state.settings)
+
+/** 透视工具所需的坐标换算环境（显示像素 = 相对视频舞台的 CSS 像素） */
+interface PerspEnv {
+  playResX: number
+  playResY: number
+  /** 源码 screenZ()：不建模 layout res，恒为 default_screen_z */
+  screenZ: number
+  rect: { left: number; top: number; width: number; height: number }
+  fromScript: (p: Vec2) => Vec2
+  toScript: (p: Vec2) => Vec2
+  clientToStage: (clientX: number, clientY: number) => Vec2
+}
+
+/** 逐行文本量取（visual_tool.cpp GetLineBaseExtents 的文本分支）。 */
+// 偏差说明：源码走 Automation4::CalculateTextExtents（真实字体度量），web 用
+// canvas measureText 近似；量取失败时回退源码的兜底估算 fontsize*len / fontsize。
+let perspMeasureCtx: CanvasRenderingContext2D | null | undefined
+function perspTextExtents(
+  lines: string[],
+  fontSize: number,
+  fontName: string,
+  bold: boolean,
+  italic: boolean,
+): { width: number; height: number } {
+  if (perspMeasureCtx === undefined) {
+    perspMeasureCtx = document.createElement('canvas').getContext('2d')
+  }
+  let width = 0
+  let height = 0
+  for (const line of lines) {
+    let lineWidth: number
+    let lineHeight: number
+    const ctx = perspMeasureCtx
+    if (ctx) {
+      ctx.font = `${italic ? 'italic ' : ''}${bold ? '700 ' : '400 '}${fontSize}px "${fontName}", sans-serif`
+      const metrics = ctx.measureText(line)
+      lineWidth =
+        Math.abs(metrics.actualBoundingBoxLeft) + Math.abs(metrics.actualBoundingBoxRight) ||
+        metrics.width
+      lineHeight = fontSize * 1.2
+    } else {
+      lineWidth = fontSize * line.length
+      lineHeight = fontSize
+    }
+    width = Math.max(width, lineWidth)
+    height += lineHeight
+  }
+  return { width, height }
+}
+
+/** visual_tool.cpp GetLineBaseExtents */
+function perspBaseExtents(cue: SubtitleCue, style: SubtitleStyle | undefined): [Vec2, Vec2] {
+  const blocks = parseBlocks(cue.text)
+  const ptag = findTagInBlocks(blocks, '\\p')
+  const level = ptag ? Math.trunc(Number.parseFloat(ptag.params) || 0) : 0
+  if (ptag && level !== 0) {
+    // Spline::SetScale(level) → scale = 1 << (level-1)，DecodeFromAss 按 FromScript 除以 scale
+    const drawing = blocks
+      .filter((block) => block.type === 'drawing')
+      .map((block) => blockText(block))
+      .join('')
+    const spline = new Spline()
+    spline.decode(drawing)
+    if (!spline.curves.length) return [vec(0, 0), vec(0, 0)]
+    const scale = 2 ** (level - 1)
+    let left = Infinity
+    let top = Infinity
+    let right = -Infinity
+    let bot = -Infinity
+    for (const curve of spline.curves) {
+      // spline_curve.cpp AnchorPoints
+      const anchors =
+        curve.type === 'point'
+          ? [curve.p1]
+          : curve.type === 'line'
+            ? [curve.p1, curve.p2]
+            : [curve.p1, curve.p2, curve.p3, curve.p4]
+      for (const point of anchors) {
+        left = Math.min(left, point.x / scale)
+        top = Math.min(top, point.y / scale)
+        right = Math.max(right, point.x / scale)
+        bot = Math.max(bot, point.y / scale)
+      }
+    }
+    return [vec(left, top), vec(right, bot)]
+  }
+  let fontSize = style?.fontSize ?? 0
+  let fontName = style?.fontName ?? 'Arial'
+  const fsTag = findTagInBlocks(blocks, '\\fs')
+  if (fsTag) {
+    const value = Number.parseFloat(fsTag.params)
+    if (Number.isFinite(value)) fontSize = value
+  }
+  const fnTag = findTagInBlocks(blocks, '\\fn')
+  if (fnTag) fontName = fnTag.params
+  const extents = perspTextExtents(
+    plainText(cue.text),
+    fontSize,
+    fontName,
+    style?.bold ?? false,
+    style?.italic ?? false,
+  )
+  return [vec(0, 0), vec(extents.width, extents.height)]
+}
+
+/** MakeFeatures：重建特征列表（center / [org] / inner[4] / [outer[4]]） */
+function perspMakeFeatures(state: PerspState): void {
+  state.inner = []
+  state.outer = []
+  state.orgf = null
+  state.features = []
+  state.active = null
+  state.selected = new Set()
+  state.centerf = {
+    key: 'center',
+    group: FEATURE_CENTER,
+    index: 0,
+    type: 'big-triangle',
+    pos: vec(0, 0),
+    start: vec(0, 0),
+    layer: 0,
+  }
+  state.features.push(state.centerf)
+  if (perspHasOrgfBits(state.settings)) {
+    state.orgf = {
+      key: 'org',
+      group: FEATURE_ORG,
+      index: 0,
+      type: 'big-triangle',
+      pos: vec(0, 0),
+      start: vec(0, 0),
+      layer: 0,
+    }
+    state.features.push(state.orgf)
+  }
+  for (let i = 0; i < 4; i++) {
+    const inner: PerspFeature = {
+      key: `inner:${i}`,
+      group: FEATURE_INNER,
+      index: i,
+      type: 'small-circle',
+      pos: vec(0, 0),
+      start: vec(0, 0),
+      layer: 0,
+    }
+    state.inner.push(inner)
+    state.features.push(inner)
+    if (perspHasOuterBits(state.settings)) {
+      const outer: PerspFeature = {
+        key: `outer:${i}`,
+        group: FEATURE_OUTER,
+        index: i,
+        type: 'small-circle',
+        pos: vec(0, 0),
+        start: vec(0, 0),
+        layer: 0,
+      }
+      state.outer.push(outer)
+      state.features.push(outer)
+    }
+  }
+}
+
+/** UpdateInner：内框四角 = 外框 UV 空间中 c1..c2 矩形的像 */
+function perspUpdateInner(state: PerspState): void {
+  const uv = makeRect(state.c1, state.c2)
+  const quad = state.outer.map((feature) => feature.pos)
+  for (let i = 0; i < 4; i++) state.inner[i].pos = uvToXy(quad, uv[i])
+}
+
+/** UpdateOuter：外框四角 = 内框 UV 空间中 [-c1/(c2-c1), (1-c1)/(c2-c1)] 矩形的像 */
+function perspUpdateOuter(state: PerspState): void {
+  if (!perspHasOuter(state)) return
+  const uv = makeRect(
+    vec(-state.c1.x / (state.c2.x - state.c1.x), -state.c1.y / (state.c2.y - state.c1.y)),
+    vec((1 - state.c1.x) / (state.c2.x - state.c1.x), (1 - state.c1.y) / (state.c2.y - state.c1.y)),
+  )
+  const quad = state.inner.map((feature) => feature.pos)
+  for (let i = 0; i < 4; i++) state.outer[i].pos = uvToXy(quad, uv[i])
+}
+
+/** SetFeaturePositions：center 取内框对角线交点，org 取 \org 的显示位置 */
+function perspSetFeaturePositions(state: PerspState, env: PerspEnv): void {
+  state.centerf.pos = quadMidpoint(state.inner.map((feature) => feature.pos))
+  if (state.orgf) state.orgf.pos = env.fromScript(state.org)
+}
+
+/** SaveFeaturePositions：记录本次拖拽前的四角位置（old_inner/old_outer） */
+function perspSaveFeaturePositions(state: PerspState): void {
+  state.oldInner = state.inner.map((feature) => ({ ...feature.pos }))
+  if (perspHasOuter(state)) state.oldOuter = state.outer.map((feature) => ({ ...feature.pos }))
+}
+
+/** SaveOuterToLines：把外框四角存进环境平面映射（见 perspAmbientPlane 偏差说明） */
+function perspSaveOuterToLines(state: PerspState, env: PerspEnv): void {
+  if (!perspHasOuter(state)) return
+  const corners = state.outer.map((feature) => env.toScript(feature.pos))
+  if (corners.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return
+  perspAmbientPlane.set(state.cueId, corners)
+}
+
+/** TextToPersp：从活动行的标签值推导内框四角，并恢复环境平面 */
+function perspTextToPersp(state: PerspState, env: PerspEnv): void {
+  const textWidth = Math.max(state.bbox[1].x - state.bbox[0].x, 1)
+  const textHeight = Math.max(state.bbox[1].y - state.bbox[0].y, 1)
+  let shiftX = 0
+  let shiftY = 0
+  switch ((state.align - 1) % 3) {
+    case 1:
+      shiftX = -textWidth / 2
+      break
+    case 2:
+      shiftX = -textWidth
+      break
+    default:
+      break
+  }
+  switch (Math.trunc((state.align - 1) / 3)) {
+    case 0:
+      shiftY = -textHeight
+      break
+    case 1:
+      shiftY = -textHeight / 2
+      break
+    default:
+      break
+  }
+  const screenZ = env.screenZ
+  const textRect = makeRect(state.bbox[0], state.bbox[1])
+  for (let i = 0; i < 4; i++) {
+    const point = textRect[i]
+    // 源码两行都用剪切前的 p.X()，故先算两份再赋值
+    const px = point.x + point.y * state.fax
+    const py = point.x * state.fay + point.y
+    let x = ((px + shiftX) * state.fsc.x) / 100
+    let y = ((py + shiftY) * state.fsc.y) / 100
+    x += state.pos.x - state.org.x
+    y += state.pos.y - state.org.y
+    let q = v3(x, y, 0)
+    q = rotateZ3(q, (-state.angleZ * Math.PI) / 180)
+    q = rotateX3(q, (-state.angleX * Math.PI) / 180)
+    q = rotateY3(q, (state.angleY * Math.PI) / 180)
+    q = mulV3(q, screenZ / (q.z + screenZ))
+    state.inner[i].pos = env.fromScript(vec(q.x + state.org.x, q.y + state.org.y))
+  }
+
+  const savedOuter = perspAmbientPlane.get(state.cueId)
+  if (savedOuter) {
+    const d1 = xyToUv(savedOuter, env.toScript(state.inner[0].pos))
+    const d2 = xyToUv(savedOuter, env.toScript(state.inner[2].pos))
+    if (
+      Number.isFinite(d1.x) &&
+      Number.isFinite(d1.y) &&
+      Number.isFinite(d2.x) &&
+      Number.isFinite(d2.y)
+    ) {
+      state.c1 = d1
+      state.c2 = d2
+    }
+  }
+  perspUpdateOuter(state)
+}
+
+/** WrapSetOverride：值与默认值（或其相反数）相同则删除标签，否则写入 %.Nf */
+function perspWrapSetOverride(
+  text: string,
+  tag: string,
+  value: number,
+  precision: number,
+  defaultValue = 0,
+): string {
+  const formatted = value.toFixed(precision)
+  const defaultFormatted = defaultValue.toFixed(precision)
+  if (
+    formatted === defaultFormatted ||
+    (defaultValue === 0 && (-value).toFixed(precision) === defaultFormatted)
+  ) {
+    return removeOverride(text, tag)
+  }
+  return setOverride(text, tag, formatted)
+}
+
+/** InnerToText：把内框四角反解为变换标签值；数值无效时返回 null（源码 return false） */
+function perspInnerToText(state: PerspState, env: PerspEnv): PerspValues | null {
+  const q0 = env.toScript(state.inner[0].pos)
+  const q1 = env.toScript(state.inner[1].pos)
+  const q2 = env.toScript(state.inner[2].pos)
+  const q3 = env.toScript(state.inner[3].pos)
+
+  // 找一个投影为该四边形的平行四边形（与平移无关）
+  const diag = subV(q2, q0)
+  const side2 = subV(q1, q2)
+  const side3 = subV(q3, q2)
+  const [z1, z3] = solve2x2(side2.x, side3.x, side2.y, side3.y, -diag.x, -diag.y)
+  const midpoint = quadMidpoint([q0, q1, q2, q3])
+
+  let org = state.org
+  const mode = perspOrgModeBits(state.settings)
+  if (mode === PERSP_ORGMODE_CENTER) {
+    org = midpoint
+  } else if (mode === PERSP_ORGMODE_NOFAX) {
+    const edge1 = subV(q1, q0)
+    const edge3 = subV(q3, q0)
+    // 平移 t（把 q0 移到 t）后四边形能反投影为矩形，t 落在该二次曲线上
+    const a = (1 - z1) * (1 - z3)
+    const b = subV(addV(mulV(edge1, z1), mulV(edge3, z3)), mulV(addV(edge1, edge3), z1 * z3))
+    const c = z1 * z3 * dotV(edge1, edge3) + (z1 - 1) * (z3 - 1) * env.screenZ * env.screenZ
+    // 默认把 \org 放在四边形中心
+    let t = subV(q0, midpoint)
+    if (a === 0) {
+      // 退化：二次曲线退化成直线（b=0 时无解，保留原 t）
+      if (sqLenV(b) !== 0) t = addV(t, mulV(b, (c - dotV(t, b)) / sqLenV(b)))
+    } else {
+      // 二次曲线是圆：配方求圆心与半径
+      const circleCenter = divV(b, vec(2 * a, 2 * a))
+      const sqRadius = (sqLenV(b) / (4 * a) - c) / a
+      if (sqRadius <= 0) {
+        org = circleCenter
+      } else {
+        const radius = Math.sqrt(sqRadius)
+        const center2t = subV(t, circleCenter)
+        t =
+          lenV(center2t) === 0
+            ? addV(circleCenter, vec(radius, 0))
+            : addV(circleCenter, mulV(unitV(center2t), radius))
+      }
+    }
+    org = subV(q0, t)
+  }
+
+  // 以 org 为原点归一化
+  const nq0 = subV(q0, org)
+  const nq1 = subV(q1, org)
+  const nq2 = subV(q2, org)
+  const nq3 = subV(q3, org)
+
+  const screenZ = env.screenZ
+  let r = [
+    v3(nq0.x, nq0.y, screenZ),
+    mulV3(v3(nq1.x, nq1.y, screenZ), z1),
+    mulV3(v3(nq2.x, nq2.y, screenZ), z1 + z3 - 1),
+    mulV3(v3(nq3.x, nq3.y, screenZ), z3),
+  ]
+
+  // 投影到原点的点的 z 坐标
+  const side0 = subV3(r[1], r[0])
+  const side1 = subV3(r[3], r[0])
+  const [orgla0, orgla1] = solve2x2(side0.x, side1.x, side0.y, side1.y, -r[0].x, -r[0].y)
+  const orgz = addV3(addV3(r[0], mulV3(side0, orgla0)), mulV3(side1, orgla1)).z
+
+  // 归一化使原点 z = screenZ，并把屏幕平面移到 z = 0
+  r = r.map((value) => subV3(mulV3(value, screenZ / orgz), v3(0, 0, screenZ)))
+
+  // 求旋转
+  let n = crossV3(subV3(r[1], r[0]), subV3(r[3], r[0]))
+  let roty = Math.atan(n.x / n.z)
+  if (n.z < 0) roty += Math.PI
+  n = rotateY3(n, roty)
+  const rotx = Math.atan(n.y / n.z)
+
+  r = r.map((value) => rotateX3(rotateY3(value, roty), rotx))
+
+  let ab = subV3(r[1], r[0])
+  let rotz = Math.atan(ab.y / ab.x)
+  if (ab.x < 0) rotz += Math.PI
+
+  r = r.map((value) => rotateZ3(value, -rotz))
+
+  // 此时是平面内的水平平行四边形，可读出剪切与尺寸
+  ab = subV3(r[1], r[0])
+  const ad = subV3(r[3], r[0])
+  const rawfax = ad.x / ad.y
+  const quadWidth = lenV3(ab)
+  const quadHeight = Math.abs(ad.y)
+  const scaleX = quadWidth / Math.max(state.bbox[1].x - state.bbox[0].x, 1)
+  const scaleY = quadHeight / Math.max(state.bbox[1].y - state.bbox[0].y, 1)
+  const shiftV = state.align <= 3 ? 1 : state.align <= 6 ? 0.5 : 0
+  const shiftH = state.align % 3 === 0 ? 1 : state.align % 3 === 2 ? 0.5 : 0
+  const pos = addV(
+    subV(addV(org, vec(r[0].x, r[0].y)), vec(state.bbox[0].x * scaleX, state.bbox[0].y * scaleY)),
+    vec(quadWidth * shiftH, quadHeight * shiftV),
+  )
+  const angleX = (rotx * 180) / Math.PI
+  const angleY = (-roty * 180) / Math.PI
+  const angleZ = (-rotz * 180) / Math.PI
+  const oldFsc = state.fsc
+  const fsc = vec(100 * scaleX, 100 * scaleY)
+  const fax = (rawfax * scaleY) / scaleX
+  const bord = vec((state.bord.x * fsc.x) / oldFsc.x, (state.bord.y * fsc.y) / oldFsc.y)
+  const shad = vec((state.shad.x * fsc.x) / oldFsc.x, (state.shad.y * fsc.y) / oldFsc.y)
+
+  const allValues = [
+    fax,
+    fsc.x,
+    fsc.y,
+    angleZ,
+    angleX,
+    angleY,
+    bord.x,
+    bord.y,
+    shad.x,
+    shad.y,
+    org.x,
+    org.y,
+    pos.x,
+    pos.y,
+  ]
+  if (allValues.some((value) => !Number.isFinite(value))) return null
+
+  state.org = org
+  state.pos = pos
+  state.fsc = fsc
+  state.fax = fax
+  state.fay = 0
+  state.angleX = angleX
+  state.angleY = angleY
+  state.angleZ = angleZ
+  state.bord = bord
+  state.shad = shad
+
+  // 写回全部选中行（源码遍历 selectionController->GetSelectedSet）
+  return { bord, shad, fsc, angleX, angleY, angleZ, fax, org, pos }
+}
+
+/** InnerToText 产出的标签值（供调用方写回各行文本） */
+interface PerspValues {
+  bord: Vec2
+  shad: Vec2
+  fsc: Vec2
+  angleX: number
+  angleY: number
+  angleZ: number
+  fax: number
+  org: Vec2
+  pos: Vec2
+}
+
+/** 把 InnerToText 的结果写进一行文本（标签顺序与源码一致） */
+function perspApplyValues(
+  text: string,
+  values: PerspValues,
+  style: SubtitleStyle | undefined,
+): string {
+  let result = text
+  result = perspWrapSetOverride(result, 'fax', values.fax, 6)
+  result = perspWrapSetOverride(result, 'fay', 0, 6)
+  result = perspWrapSetOverride(result, 'fscx', values.fsc.x, 2, style?.scaleX ?? 0)
+  result = perspWrapSetOverride(result, 'fscy', values.fsc.y, 2, style?.scaleY ?? 0)
+  result = perspWrapSetOverride(result, 'frz', values.angleZ, 4, style?.angle ?? 0)
+  result = perspWrapSetOverride(result, 'frx', values.angleX, 4)
+  result = perspWrapSetOverride(result, 'fry', values.angleY, 4)
+  result = removeOverride(result, 'bord')
+  result = removeOverride(result, 'shad')
+  result = perspWrapSetOverride(result, 'xbord', values.bord.x, 2, style?.outline ?? 0)
+  result = perspWrapSetOverride(result, 'ybord', values.bord.y, 2, style?.outline ?? 0)
+  result = perspWrapSetOverride(result, 'xshad', values.shad.x, 2, style?.shadow ?? 0)
+  result = perspWrapSetOverride(result, 'yshad', values.shad.y, 2, style?.shadow ?? 0)
+  result = setOverride(
+    result,
+    'org',
+    `(${floatToString(values.org.x)},${floatToString(values.org.y)})`,
+  )
+  result = setOverride(
+    result,
+    'pos',
+    `(${floatToString(values.pos.x)},${floatToString(values.pos.y)})`,
+  )
+  return result
+}
+
+/** 视觉工具拖拽：VisualToolPerspectiveDraggableFeature::UpdateDrag + VisualDraggableFeature::UpdateDrag */
+function perspFeatureUpdateDrag(
+  state: PerspState,
+  feature: PerspFeature,
+  delta: Vec2,
+  singleAxis: boolean,
+): void {
+  let d = delta
+  let axisLock = singleAxis
+  // Ctrl+Alt 的单轴约束在后面的手动吸附里处理
+  if (state.ctrlDown && state.altDown) axisLock = false
+  if (
+    axisLock &&
+    !(feature.group === FEATURE_CENTER && !(perspHasOuter(state) && !perspOuterLocked(state)))
+  ) {
+    // 吸附到四边形透视平面内的两条轴
+    const quad = state.oldInner
+    const posUV = xyToUv(quad, feature.pos)
+    const axis1 = unitV(subV(uvToXy(quad, addV(posUV, vec(1, 0))), feature.pos))
+    const axis2 = unitV(subV(uvToXy(quad, addV(posUV, vec(0, 1))), feature.pos))
+    const snap1 = mulV(axis1, dotV(d, axis1))
+    const snap2 = mulV(axis2, dotV(d, axis2))
+    d = sqLenV(subV(snap1, d)) <= sqLenV(subV(snap2, d)) ? snap1 : snap2
+    axisLock = false
+  }
+  if (axisLock) d = singleAxisV(d)
+  feature.pos = addV(feature.start, d)
+}
+
+/** 视觉工具 UpdateDrag：由四角位置反解变换系数；返回值供调用方写回各行文本 */
+function perspUpdateDrag(
+  state: PerspState,
+  env: PerspEnv,
+  feature: PerspFeature,
+): PerspValues | null {
+  if (feature === state.centerf) {
+    const oldCenter = quadMidpoint(state.inner.map((item) => item.pos))
+    if (perspHasOuter(state) && !perspOuterLocked(state)) {
+      const quad = state.outer.map((item) => item.pos)
+      const oldUv = xyToUv(quad, oldCenter)
+      const newUv = xyToUv(quad, state.centerf.pos)
+      const diff = subV(newUv, oldUv)
+      state.c1 = addV(state.c1, diff)
+      state.c2 = addV(state.c2, diff)
+      perspUpdateInner(state)
+    } else {
+      const diff = subV(state.centerf.pos, oldCenter)
+      for (let i = 0; i < 4; i++) state.inner[i].pos = addV(state.inner[i].pos, diff)
+      perspUpdateOuter(state)
+    }
+  } else if (perspHasOrgfBits(state.settings) && feature === state.orgf) {
+    state.org = env.toScript(feature.pos)
+  }
+
+  let changedQuad: PerspFeature[] = []
+  let changedQuadOld: Vec2[] = []
+  if (feature.group === FEATURE_INNER) {
+    changedQuad = state.inner
+    changedQuadOld = state.oldInner
+  } else if (perspHasOuter(state) && feature.group === FEATURE_OUTER) {
+    changedQuad = state.outer
+    changedQuadOld = state.oldOuter
+  }
+
+  if (changedQuad.length && !state.ctrlDown) {
+    // 非凸四边形时对角线交点不在内部，此时放弃本次拖拽
+    const diag1 = subV(changedQuad[2].pos, changedQuad[0].pos)
+    const diag2 = subV(changedQuad[1].pos, changedQuad[3].pos)
+    const b = subV(changedQuad[3].pos, changedQuad[0].pos)
+    const [la1, la2] = solve2x2(diag1.x, diag2.x, diag1.y, diag2.y, b.x, b.y)
+    if (la1 < 0 || la1 > 1 || -la2 < 0 || -la2 > 1) {
+      perspTextToPersp(state, env)
+      return null
+    }
+  }
+
+  const i = feature.index
+
+  if (state.ctrlDown && changedQuad.length) {
+    // Ctrl：整体变形（保持平面），可叠加 Alt 吸附
+    if (state.altDown) {
+      if (state.shiftDown) {
+        // Alt+Shift：吸附到最近的原角点
+        let bestSnap = -1
+        let minDist = -1
+        for (let j = 0; j < 4; j++) {
+          const dist = sqLenV(subV(feature.pos, changedQuadOld[j]))
+          if (bestSnap === -1 || dist < minDist) {
+            bestSnap = j
+            minDist = dist
+          }
+        }
+        feature.pos = { ...changedQuadOld[bestSnap] }
+      } else {
+        // Alt：吸附到两条对角方向之一
+        const center = quadMidpoint(changedQuadOld)
+        const diff = subV(feature.pos, center)
+        const snapDirection1 = unitV(subV(changedQuadOld[0], center))
+        const snapDirection2 = unitV(subV(changedQuadOld[1], center))
+        const snap1 = mulV(snapDirection1, dotV(diff, snapDirection1))
+        const snap2 = mulV(snapDirection2, dotV(diff, snapDirection2))
+        feature.pos = addV(
+          center,
+          sqLenV(subV(snap1, diff)) <= sqLenV(subV(snap2, diff)) ? snap1 : snap2,
+        )
+      }
+    }
+
+    const relUv = subV(xyToUv(changedQuadOld, feature.pos), vec(0.5, 0.5))
+    for (let j = 0; j < 4; j++) {
+      const flipi = vec(i === 1 || i === 2 ? -1 : 1, i >= 2 ? -1 : 1)
+      const flipj = vec(j === 1 || j === 2 ? -1 : 1, j >= 2 ? -1 : 1)
+      changedQuad[j].pos = uvToXy(
+        changedQuadOld,
+        addV(vec(0.5, 0.5), vec(relUv.x * flipi.x * flipj.x, relUv.y * flipi.y * flipj.y)),
+      )
+    }
+
+    if (perspHasOuter(state)) {
+      if (feature.group === FEATURE_INNER) {
+        if (!perspOuterLocked(state)) {
+          const quad = state.outer.map((item) => item.pos)
+          state.c1 = xyToUv(quad, state.inner[0].pos)
+          state.c2 = xyToUv(quad, state.inner[2].pos)
+          perspUpdateInner(state)
+        } else {
+          perspUpdateOuter(state)
+        }
+      } else if (feature.group === FEATURE_OUTER) {
+        if (perspOuterLocked(state)) {
+          const quad = state.outer.map((item) => item.pos)
+          state.c1 = xyToUv(quad, state.inner[0].pos)
+          state.c2 = xyToUv(quad, state.inner[2].pos)
+          perspUpdateOuter(state)
+        } else {
+          perspUpdateInner(state)
+        }
+      }
+    }
+  } else if (changedQuad.length && perspHasOuter(state)) {
+    // 常规：拖动单个角点
+    if (feature.group === FEATURE_INNER) {
+      if (!perspOuterLocked(state)) {
+        const newUv = xyToUv(
+          state.outer.map((item) => item.pos),
+          feature.pos,
+        )
+        state.c1 = vec(i === 0 || i === 3 ? newUv.x : state.c1.x, i < 2 ? newUv.y : state.c1.y)
+        state.c2 = vec(i === 0 || i === 3 ? state.c2.x : newUv.x, i < 2 ? state.c2.y : newUv.y)
+        perspUpdateInner(state)
+      } else {
+        perspUpdateOuter(state)
+      }
+    } else if (feature.group === FEATURE_OUTER) {
+      if (perspOuterLocked(state)) {
+        let d1 = vec(
+          -state.c1.x / (state.c2.x - state.c1.x),
+          -state.c1.y / (state.c2.y - state.c1.y),
+        )
+        let d2 = vec(
+          (1 - state.c1.x) / (state.c2.x - state.c1.x),
+          (1 - state.c1.y) / (state.c2.y - state.c1.y),
+        )
+        const newUv = xyToUv(
+          state.inner.map((item) => item.pos),
+          feature.pos,
+        )
+        d1 = vec(i === 0 || i === 3 ? newUv.x : d1.x, i < 2 ? newUv.y : d1.y)
+        d2 = vec(i === 0 || i === 3 ? d2.x : newUv.x, i < 2 ? d2.y : newUv.y)
+        state.c1 = vec(-d1.x / (d2.x - d1.x), -d1.y / (d2.y - d1.y))
+        state.c2 = vec((1 - d1.x) / (d2.x - d1.x), (1 - d1.y) / (d2.y - d1.y))
+        perspUpdateOuter(state)
+      } else {
+        perspUpdateInner(state)
+      }
+    }
+  }
+
+  // 尾部（源码 UpdateDrag）：InnerToText 失败则 TextToPersp 重建，随后同步特征位置
+  const values = perspInnerToText(state, env)
+  if (!values) perspTextToPersp(state, env)
+  perspSetFeaturePositions(state, env)
+  return values
+}
+
+/** 读出 OPT 中的子工具设置（构造函数：settings 由 4 个选项拼出） */
+function perspReadSettings(): number {
+  let settings = 0
+  if (getOptionBool('Tool/Visual/Perspective/Outer')) settings |= PERSP_OUTER
+  if (getOptionBool('Tool/Visual/Perspective/Outer Locked')) settings |= PERSP_LOCK_OUTER
+  if (getOptionBool('Tool/Visual/Perspective/Grid')) settings |= PERSP_GRID
+  settings |= getOptionInt('Tool/Visual/Perspective/Org Mode')
+  return settings
+}
+
+/** DoRefresh：TextToPersp + SetFeaturePositions + SaveFeaturePositions */
+function perspDoRefresh(state: PerspState, env: PerspEnv): void {
+  perspTextToPersp(state, env)
+  perspSetFeaturePositions(state, env)
+  perspSaveFeaturePositions(state)
+}
+
+/** 构造函数 + MakeFeatures + DoRefresh：由活动行建立完整工具状态 */
+function perspMakeState(
+  settings: number,
+  cue: SubtitleCue,
+  style: SubtitleStyle | undefined,
+  env: PerspEnv,
+): PerspState {
+  const overrides = readVisualOverrides(cue.text, style)
+  const pos =
+    overrides.pos ??
+    (overrides.move
+      ? vec(overrides.move.x1, overrides.move.y1)
+      : defaultLinePosition(cue, style, { x: env.playResX, y: env.playResY }))
+  const state: PerspState = {
+    cueId: cue.id,
+    settings,
+    angleX: overrides.rotationX,
+    angleY: overrides.rotationY,
+    angleZ: overrides.rotationZ,
+    fax: overrides.fax,
+    fay: overrides.fay,
+    align: overrides.alignment,
+    bbox: perspBaseExtents(cue, style),
+    fsc: vec(overrides.scaleX, overrides.scaleY),
+    org: overrides.org ?? pos,
+    pos,
+    bord: vec(overrides.outlineX, overrides.outlineY),
+    shad: vec(overrides.shadowX, overrides.shadowY),
+    c1: vec(0.25, 0.25),
+    c2: vec(0.75, 0.75),
+    centerf: {
+      key: 'center',
+      group: FEATURE_CENTER,
+      index: 0,
+      type: 'big-triangle',
+      pos: vec(0, 0),
+      start: vec(0, 0),
+      layer: 0,
+    },
+    orgf: null,
+    inner: [],
+    outer: [],
+    oldInner: [],
+    oldOuter: [],
+    features: [],
+    active: null,
+    selected: new Set(),
+    dragStart: null,
+    dragging: false,
+    selChanged: false,
+    ctrlDown: false,
+    shiftDown: false,
+    altDown: false,
+  }
+  perspMakeFeatures(state)
+  // DoRefresh：TextToPersp + SetFeaturePositions + SaveFeaturePositions
+  perspDoRefresh(state, env)
+  return state
+}
+
 function plainText(text: string): string[] {
   return text
     .replace(/\{[^}]*}/g, '')
@@ -601,6 +1634,24 @@ interface VideoSliderProps {
 function signedMs(value: number): string {
   return `${value < 0 ? '-' : '+'}${Math.abs(Math.trunc(value))}ms`
 }
+
+/**
+ * 元素时间轴（原始 PTS，秒）→ 应用时间轴（归一化帧率表，ms）。
+ * 口径必须与帧表构造一致：帧表 = 各帧原始 PTS 经 ptsToMs 截断后再减首帧的截断值；
+ * 若改成"先相减再截断"（ptsToMs(t - offset)），浮点尾差会结果相差 1ms，
+ * 使 currentFrame 落到前一帧（VideoPosition/网格帧列错位）。
+ */
+function elementToAppMs(seconds: number, firstFrameOffsetSec: number): number {
+  return Math.max(0, ptsToMs(seconds) - ptsToMs(firstFrameOffsetSec))
+}
+
+/**
+ * 应用时间轴（帧表时间 + 首帧偏移）→ 元素时间轴时的前移量（ms）。
+ * 帧表把原始 PTS 截断到整数 ms，故"帧表时间 + 偏移"可能仍比目标帧的原始 PTS 早
+ * 不到 1ms，而 <video> seek 取"PTS ≤ 目标的最后一帧"就会退回前一帧；前移 1ms 补偿
+ * （帧间隔远大于 1ms，不会越入下一帧）。偏移本身取自 rVFC 的浮点秒，不参与截断。
+ */
+const SEEK_TRUNCATION_LEAD_MS = 1
 
 /** 自定义 Seek 滑块，与 video_slider.cpp 绘制一致（轨道 + 箭头游标 + 关键帧刻度 + 底部选区条） */
 function VideoSliderControl({
@@ -1036,13 +2087,28 @@ export function PreviewPane({
   // 在途期间新目标只覆盖待发槽位（中间位置丢弃），seeked 后补发最新目标——与源码
   // async_video_provider 的版本号弃帧（新请求覆盖 frame_number，旧请求被丢弃）同语义
   const videoSeekRef = useRef<number | null>(null)
+  // 原生 <video> 时间轴首帧偏移（秒，保留浮点精度）：容器首帧 PTS ≠ 0（mkv 时延 /
+  // MP4 start_time）时，元素时间轴（currentTime / rVFC mediaTime）以原始 PTS 为基准，
+  // 而应用时间轴（帧率表）已归一化到首帧 = 0（FFMS2 normalize_timecodes 语义）。
+  // 两轴必须经该偏移换算，否则跳转到时间 a 时元素呈现"包含 a 的原始时间"对应帧——
+  // 帧对齐跳转（行首/滑块/逐帧）恒定比 Aegisub 少 1 帧，偏移更大时少 2 帧及以上。
+  // 取值 = 元素呈现的首帧 mediaTime（元素自身时间轴上的首帧时间，见 onLoadedMetadata
+  // 校准）；不可截断成整数 ms，否则 seek（帧表时间 + 偏移）会差不到 1ms 落到前一帧；
+  // rVFC 不可用时保持 0（退化为不换算，与修复前一致）
+  const firstFrameOffsetSecRef = useRef(0)
   const pumpVideoSeek = useCallback(() => {
     const video = videoRef.current
     const target = videoSeekRef.current
     if (!video || target === null || video.seeking) return
     videoSeekRef.current = null
-    const clamped = Math.max(0, Math.min(video.duration * 1000 || target, target))
-    video.currentTime = clamped / 1000
+    const offset = firstFrameOffsetSecRef.current
+    const offsetMs = ptsToMs(offset)
+    const max =
+      Number.isFinite(video.duration) && video.duration > 0
+        ? video.duration * 1000 - offsetMs
+        : target
+    const clamped = Math.max(0, Math.min(max, target))
+    video.currentTime = (clamped + SEEK_TRUNCATION_LEAD_MS) / 1000 + offset
   }, [])
   const requestVideoSeek = useCallback(
     (timeMs: number) => {
@@ -1054,6 +2120,9 @@ export function PreviewPane({
   // ---- 矢量裁剪工具状态 ----
   const [vclip, setVclip] = useState<VClipState | null>(null)
   const vclipRef = useRef<VClipState | null>(null)
+  // ---- 3D 透视工具状态（visual_tool_perspective.cpp）----
+  const [persp, setPersp] = useState<PerspState | null>(null)
+  const perspRef = useRef<PerspState | null>(null)
   // 真实帧率探测：每个媒体只探测一次（requestVideoFrameCallback 采样 mediaTime 间隔中位数）
   const fpsProbedRef = useRef<string | null>(null)
   const onDetectedFpsRef = useRef(onDetectedFps)
@@ -1061,6 +2130,7 @@ export function PreviewPane({
   useEffect(() => {
     currentRef.current = currentTimeMs
     vclipRef.current = vclip
+    perspRef.current = persp
     onDetectedFpsRef.current = onDetectedFps
     onKeyframesChangeRef.current = onKeyframesChange
   })
@@ -1202,6 +2272,30 @@ export function PreviewPane({
       top: rect.top - bounds.top,
       width: Math.max(1, rect.width),
       height: Math.max(1, rect.height),
+    }
+  }
+
+  /** 透视工具的坐标换算环境：显示像素 = 相对视频舞台的 CSS 像素 */
+  const perspEnv = (): PerspEnv | null => {
+    const stage = stageRef.current
+    if (!stage) return null
+    const playResY = Number(document.scriptInfo.PlayResY) || 1080
+    const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
+    const rect = mediaRect()
+    const bounds = stage.getBoundingClientRect()
+    return {
+      playResX,
+      playResY,
+      screenZ: PERSP_SCREEN_Z,
+      rect,
+      fromScript: (p) =>
+        vec(rect.left + (p.x / playResX) * rect.width, rect.top + (p.y / playResY) * rect.height),
+      toScript: (p) =>
+        vec(
+          ((p.x - rect.left) / rect.width) * playResX,
+          ((p.y - rect.top) / rect.height) * playResY,
+        ),
+      clientToStage: (clientX, clientY) => vec(clientX - bounds.left, clientY - bounds.top),
     }
   }
 
@@ -1871,6 +2965,93 @@ export function PreviewPane({
           context.fill()
           context.stroke()
         }
+      } else if (visualTool === 'video/tool/perspective' && persp && activeCue) {
+        // visual_tool_perspective.cpp Draw：内外框四边线（有外框时外框虚线 6px + 内框实线）
+        // → DrawAllFeatures → 可选网格（Copied and modified from visual_tool_rotatexy.cpp）
+        const state = persp
+        context.strokeStyle = colors.lines
+        context.lineWidth = 2
+        const seg = (a: Vec2, b: Vec2) => {
+          context.beginPath()
+          context.moveTo(a.x, a.y)
+          context.lineTo(b.x, b.y)
+          context.stroke()
+        }
+        for (let i = 0; i < 4; i++) {
+          const next = (i + 1) % 4
+          if (perspHasOuter(state)) {
+            context.setLineDash([6, 6])
+            seg(state.outer[i].pos, state.outer[next].pos)
+            context.setLineDash([])
+            seg(state.inner[i].pos, state.inner[next].pos)
+          } else {
+            context.setLineDash([6, 6])
+            seg(state.inner[i].pos, state.inner[next].pos)
+            context.setLineDash([])
+          }
+        }
+        // DrawAllFeatures：active = Highlight Secondary 0.3、selected = Lines Primary 0.3、
+        // 其余 = Highlight Primary 0.3
+        for (const feature of state.features) {
+          const fill =
+            feature.key === state.active
+              ? colors.activeFill
+              : state.selected.has(feature.key)
+                ? colors.selFill
+                : colors.baseFill
+          drawFeature(
+            feature.pos.x,
+            feature.pos.y,
+            feature.type === 'big-triangle' ? 'triangle' : 'small-circle',
+            fill,
+          )
+        }
+        if ((state.settings & PERSP_GRID) !== 0) {
+          const gridRadius = 15 // 每侧线数
+          const spacing = 20 // 线距
+          const halfLen = spacing * (gridRadius + 1)
+          const fade = 0.9 / gridRadius
+          // glScale = bbox 高 / spacing / 4（SetScale(100*glScale) 内部 /100）
+          const glScale = Math.max(state.bbox[1].y - state.bbox[0].y, 1) / spacing / 4
+          const map = makeGlMapper({
+            origin: [mapX(state.org.x), mapY(state.org.y)],
+            preScale: { x: glScale, y: glScale },
+            baseScale: { x: rect.width / playResX, y: rect.height / playResY },
+            rotX: state.angleX,
+            rotY: state.angleY,
+            rotZ: state.angleZ,
+            fsc: { x: state.fsc.x, y: state.fsc.y },
+            shear: { x: state.fax, y: state.fay },
+          })
+          // 网格中心随内框对角线交点偏移：offset = (ToScriptCoords(center) − org) / glScale
+          const center = quadMidpoint(state.inner.map((feature) => feature.pos))
+          const offset = {
+            x: (((center.x - rect.left) / rect.width) * playResX - state.org.x) / glScale,
+            y: (((center.y - rect.top) / rect.height) * playResY - state.org.y) / glScale,
+          }
+          // 每条线两段（轴心 → 两端），轴心亮 alpha = 1 − |k|·fade、远端透明
+          const gridSeg = (x1: number, y1: number, x2: number, y2: number, alpha: number) => {
+            const from = map(x1 + offset.x, y1 + offset.y)
+            const to = map(x2 + offset.x, y2 + offset.y)
+            const gradient = context.createLinearGradient(from[0], from[1], to[0], to[1])
+            gradient.addColorStop(0, withAlpha(colors.secondary, alpha))
+            gradient.addColorStop(1, withAlpha(colors.secondary, 0))
+            context.strokeStyle = gradient
+            context.beginPath()
+            context.moveTo(from[0], from[1])
+            context.lineTo(to[0], to[1])
+            context.stroke()
+          }
+          context.lineWidth = 2
+          for (let k = -gridRadius; k <= gridRadius; k++) {
+            const p = k * spacing
+            const alpha = 1 - Math.abs(k) * fade
+            gridSeg(p, 0, p, -halfLen, alpha)
+            gridSeg(p, 0, p, halfLen, alpha)
+            gridSeg(0, p, -halfLen, p, alpha)
+            gridSeg(0, p, halfLen, p, alpha)
+          }
+        }
       }
     }
 
@@ -2060,10 +3241,12 @@ export function PreviewPane({
     overscan,
     visualTool,
     vclip,
+    persp,
     hasVideo,
     assRenderer,
     assError,
-    // 平移/内容缩放改变媒体显示框位置，overlay 绘制与 hitbox 需跟随重算
+    // 平移/内容缩放改变媒体显示框位置与尺寸，overlay 绘制与 hitbox 需跟随重算
+    // （窗口缩放会改变 stage 尺寸，由下面的 ResizeObserver 触发重绘，无需入表）
     pan,
     contentZoom,
   ])
@@ -2158,8 +3341,9 @@ export function PreviewPane({
     let frame = 0
     const update = () => {
       // ptsToMs：暂停时 currentTime 即所 seek 的帧 PTS，浮点直接乘 1000 会差 1ms
-      // 导致 currentFrame 落到前一帧（VideoPosition/网格帧列错位）
-      onTimeChange(ptsToMs(video.currentTime))
+      // 导致 currentFrame 落到前一帧（VideoPosition/网格帧列错位）；减去首帧偏移换回
+      // 归一化应用时间轴（元素时间轴以原始 PTS 为基准）
+      onTimeChange(elementToAppMs(video.currentTime, firstFrameOffsetSecRef.current))
       frame = requestAnimationFrame(update)
     }
     frame = requestAnimationFrame(update)
@@ -2168,8 +3352,14 @@ export function PreviewPane({
 
   useEffect(() => {
     const video = videoRef.current
-    // 音频栏拖动等外部寻址：走单在途 seek 通道（新目标覆盖待发，中间位置丢弃）
-    if (video && !playing && Math.abs(ptsToMs(video.currentTime) - currentTimeMs) > 40)
+    // 音频栏拖动等外部寻址：走单在途 seek 通道（新目标覆盖待发，中间位置丢弃）。
+    // 比较在归一化时间轴上进行（元素位置 - 首帧偏移）
+    if (
+      video &&
+      !playing &&
+      Math.abs(elementToAppMs(video.currentTime, firstFrameOffsetSecRef.current) - currentTimeMs) >
+        40
+    )
       requestVideoSeek(currentTimeMs)
   }, [currentTimeMs, playing, requestVideoSeek])
 
@@ -2199,8 +3389,9 @@ export function PreviewPane({
     // 模式/错误的复位在渲染期完成；这里只销毁旧源（媒体更换或通道切换）
     wcSourceRef.current?.destroy()
     wcSourceRef.current = null
-    // 通道/媒体更换：丢弃上一元素的待发 seek 目标
+    // 通道/媒体更换：丢弃上一元素的待发 seek 目标与首帧偏移校准
     videoSeekRef.current = null
+    firstFrameOffsetSecRef.current = 0
   }, [media, wcActive])
 
   useEffect(() => {
@@ -2371,12 +3562,14 @@ export function PreviewPane({
     }
     const currentTime = () => {
       if (wcSource) return wcSource.currentTime
-      if (video) return ptsToMs(video.currentTime)
+      // 元素时间轴 - 首帧偏移 = 归一化应用时间轴
+      if (video) return elementToAppMs(video.currentTime, firstFrameOffsetSecRef.current)
       return 0
     }
     const duration = () => {
       if (wcSource) return durationMs
-      if (video && Number.isFinite(video.duration)) return video.duration * 1000
+      if (video && Number.isFinite(video.duration))
+        return Math.max(0, video.duration * 1000 - ptsToMs(firstFrameOffsetSecRef.current))
       return 0
     }
     const actionSeek = (timeMs: number) => {
@@ -2477,6 +3670,239 @@ export function PreviewPane({
       current ? { ...fresh, mode: current.mode, mouse: current.mouse } : fresh,
     )
   }, [visualTool, activeCue])
+
+  // ---- 3D 透视：激活/刷新（visual_tool_perspective.cpp 构造 + DoRefresh）----
+  // 工具是否已激活：activeCue 刷新（每次提交后）只重跑 DoRefresh 重建四角，子工具模式保留
+  // （源码 settings 仅在构造时按 OPT 读取）。activeCue.text 不入依赖：拖拽提交会抖动。
+  const perspActiveRef = useRef(false)
+  useEffect(() => {
+    if (visualTool !== 'video/tool/perspective') {
+      // 工具切换时销毁透视会话
+      perspActiveRef.current = false
+      // oxlint-disable-next-line react/set-state-in-effect
+      setPersp(null)
+      return
+    }
+    const env = perspEnv()
+    if (!env || !activeCue) {
+      // oxlint-disable-next-line react/set-state-in-effect
+      setPersp(null)
+      return
+    }
+    const style = document.styles.find((item) => item.name === activeCue.style)
+    const settings =
+      perspActiveRef.current && perspRef.current ? perspRef.current.settings : perspReadSettings()
+    perspActiveRef.current = true
+    // oxlint-disable-next-line react/set-state-in-effect
+    setPersp(perspMakeState(settings, activeCue, style, env))
+    // 透视状态里的四角/网格坐标是"屏幕像素"（TextToPersp 由 mediaRect 换算），媒体框一变就必须
+    // 重跑 DoRefresh 才能刷新：窗口缩放（windowZoom）与平移/内容缩放一样会改变媒体框几何，
+    // 缺这一项时缩放视频后辅助线仍画在旧坐标上（留在原地不刷新）
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- activeCue.text 不入依赖（拖拽抖动）
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- activeCue.text 不入依赖（拖拽抖动）
+  }, [visualTool, activeCue?.id, pan, contentZoom, windowZoom])
+
+  /** SetSubTool：位掩码写回 4 个 OPT（源码 optOuter/optOuterLocked/optGrid/optOrgMode） */
+  const perspStoreSettings = (settings: number) => {
+    setOption('Tool/Visual/Perspective/Outer', perspHasOuterBits(settings))
+    setOption('Tool/Visual/Perspective/Outer Locked', perspOuterLockedBits(settings))
+    setOption('Tool/Visual/Perspective/Grid', (settings & PERSP_GRID) !== 0)
+    setOption('Tool/Visual/Perspective/Org Mode', perspOrgModeBits(settings))
+  }
+
+  const perspSetSubTool = (settings: number) => {
+    perspStoreSettings(settings)
+    const state = perspRef.current
+    const env = perspEnv()
+    if (!state || !env) return
+    state.settings = settings
+    // SetSubTool：MakeFeatures（内部 DoRefresh）+ Render
+    perspMakeFeatures(state)
+    perspDoRefresh(state, env)
+    setPersp({ ...state })
+  }
+
+  /** 子工具按钮：orgmode 一律触发 cycle（center→nofax→keep），其余异或切换 */
+  const perspSubToolClick = (id: string) => {
+    const settings = perspRef.current?.settings ?? perspReadSettings()
+    if (id === 'video/tool/perspective/orgmode/center') {
+      // video/tool/perspective/orgmode/cycle
+      const mode = perspOrgModeBits(settings)
+      const nextMode =
+        mode === PERSP_ORGMODE_CENTER
+          ? PERSP_ORGMODE_NOFAX
+          : mode === PERSP_ORGMODE_NOFAX
+            ? PERSP_ORGMODE_KEEP
+            : PERSP_ORGMODE_CENTER
+      perspSetSubTool((settings & ~PERSP_ORGMODE) | nextMode)
+      return
+    }
+    const bit =
+      id === 'video/tool/perspective/plane'
+        ? PERSP_OUTER
+        : id === 'video/tool/perspective/lock_outer'
+          ? PERSP_LOCK_OUTER
+          : PERSP_GRID
+    perspSetSubTool(settings ^ bit)
+  }
+
+  // 子工具条渲染值：工具未激活时回退读 OPT（与源码构造时 settings 读取一致）
+  const perspSettings = persp?.settings ?? perspReadSettings()
+  const perspOrgCommand = PERSP_ORG_COMMANDS[perspSettings & PERSP_ORGMODE]
+  // 源码 SetToolShortHelp：StrDisplay(c) + ". Click to cycle.\n" + GetTooltip("Video")
+  const perspOrgTitle = `${tPlain(COMMANDS[perspOrgCommand]?.label ?? perspOrgCommand)}. ${tPlain('Click to cycle.')}\n${commandTooltip(perspOrgCommand, 'Video')}`
+
+  /** OnMouseEvent 的未拖拽命中检测：layer 最大者优先，同层取列表中较后者 */
+  const perspHitTest = (state: PerspState, mouse: Vec2): PerspFeature | null => {
+    let active: PerspFeature | null = null
+    let maxLayer = -Infinity
+    for (const feature of state.features) {
+      if (perspIsMouseOver(feature, mouse) && feature.layer >= maxLayer) {
+        active = feature
+        maxLayer = feature.layer
+      }
+    }
+    return active
+  }
+
+  /** InnerToText 结果写回全部选中行（源码遍历 selectionController->GetSelectedSet） */
+  const perspCommitValues = (values: PerspValues, label = 'visual typesetting') => {
+    if (!selectedCues.length) return
+    onPatchCues(
+      selectedCues.map((cue) => ({
+        id: cue.id,
+        patch: {
+          text: perspApplyValues(
+            cue.text,
+            values,
+            document.styles.find((item) => item.name === cue.style),
+          ),
+        },
+      })),
+      tPlain(label),
+    )
+  }
+
+  const perspPointerDown = (event: React.PointerEvent<HTMLCanvasElement>): void => {
+    const state = perspRef.current
+    const env = perspEnv()
+    if (!state || !env) return
+    const mouse = env.clientToStage(event.clientX, event.clientY)
+    state.ctrlDown = event.ctrlKey
+    state.shiftDown = event.shiftKey
+    state.altDown = event.altKey
+    const active = perspHitTest(state, mouse)
+    state.active = active?.key ?? null
+    if (active) {
+      if (!state.selected.has(active.key)) {
+        state.selChanged = true
+        if (!event.ctrlKey) state.selected.clear()
+        state.selected.add(active.key)
+      } else {
+        state.selChanged = false
+      }
+      // StartDrag：记录本次拖拽前的四角位置
+      for (const feature of state.features)
+        if (state.selected.has(feature.key)) feature.start = { ...feature.pos }
+      state.dragStart = mouse
+      state.dragging = true
+      event.currentTarget.setPointerCapture(event.pointerId)
+    } else {
+      // 源码：空白处按下清空特征选择；InitializeHold 默认 false → 无 hold
+      if (!event.altKey) state.selected.clear()
+      state.active = null
+    }
+    setPersp({ ...state })
+  }
+
+  const perspPointerMove = (event: React.PointerEvent<HTMLCanvasElement>): void => {
+    const state = perspRef.current
+    const env = perspEnv()
+    if (!state || !env) return
+    const mouse = env.clientToStage(event.clientX, event.clientY)
+    state.ctrlDown = event.ctrlKey
+    state.shiftDown = event.shiftKey
+    state.altDown = event.altKey
+    if (!state.dragging) {
+      // 未拖拽：仅更新悬停高亮（源码每次鼠标事件重算 active_feature 并 Render）
+      const active = perspHitTest(state, mouse)
+      const key = active?.key ?? null
+      if (key !== state.active) {
+        state.active = key
+        setPersp({ ...state })
+      }
+      return
+    }
+    if (!(event.buttons & 1)) return
+    // UpdateDrag：先按位移量移动全部选中特征，再逐个反解变换系数
+    const delta = subV(mouse, state.dragStart ?? mouse)
+    for (const feature of state.features)
+      if (state.selected.has(feature.key))
+        perspFeatureUpdateDrag(state, feature, delta, event.shiftKey)
+    let values: PerspValues | null = null
+    for (const feature of state.features)
+      if (state.selected.has(feature.key)) values = perspUpdateDrag(state, env, feature)
+    // 与其他视觉工具同一「串行最新目标」通道：pointermove 可达数百 Hz，而一次提交要
+    // 走全文档序列化 + apply + flushNow 即时渲染（见 dragCommitRef 注释）——逐个排队会
+    // 在途任务堆积、鼠标停住后画面继续回放中间位置；中间目标一律丢弃，仅最新位置生效
+    if (values) scheduleDragCommit(() => perspCommitValues(values))
+    // 四角/网格随鼠标实时重绘（源码 UpdateDrag 尾部 Render）：只调度 rAF 合流的 overlay
+    // 重绘，不在 pointermove 里 setState——renderOverlay 读的就是被就地改写的
+    // perspRef.current（同一对象引用），而 setState 会让整棵 PreviewPane 每个鼠标事件
+    // 重渲染一次（其余视觉工具 pointermove 只走 scheduleDragCommit，无任何 setState）
+    scheduleOverlayRender()
+  }
+
+  const perspPointerUp = (): void => {
+    const state = perspRef.current
+    if (!state) return
+    if (state.dragging) {
+      state.dragging = false
+      const active = state.active
+        ? (state.features.find((feature) => feature.key === state.active) ?? null)
+        : null
+      const moved = active && (active.pos.x !== active.start.x || active.pos.y !== active.start.y)
+      // 鼠标未移动：调整选中集（源码 HasMoved 判定）；否则 EndDrag（保存四角与环境平面）
+      if (active && !moved) {
+        if (!state.selChanged) {
+          if (state.ctrlDown) state.selected.delete(active.key)
+          else {
+            state.selected.clear()
+            state.selected.add(active.key)
+          }
+        }
+      } else if (active) {
+        perspSaveFeaturePositions(state)
+        const env = perspEnv()
+        if (env) perspSaveOuterToLines(state, env)
+      }
+    }
+    state.active = null
+    state.dragStart = null
+    setPersp({ ...state })
+  }
+
+  /** OnDoubleClick：把离鼠标最近的（外框未锁定时为外框）角点直接移到鼠标处 */
+  const perspDoubleClick = (event: React.MouseEvent<HTMLCanvasElement>): void => {
+    const state = perspRef.current
+    const env = perspEnv()
+    if (!state || !env) return
+    const mouse = env.clientToStage(event.clientX, event.clientY)
+    const quad = perspHasOuter(state) && !perspOuterLocked(state) ? state.outer : state.inner
+    let best = 0
+    let bestDistance = -1
+    for (let i = 0; i < 4; i++) {
+      const distance = lenV(subV(quad[i].pos, mouse))
+      if (bestDistance === -1 || distance < bestDistance) {
+        best = i
+        bestDistance = distance
+      }
+    }
+    quad[best].pos = mouse
+    const values = perspUpdateDrag(state, env, quad[best])
+    if (values) perspCommitValues(values)
+    setPersp({ ...state })
+  }
 
   const scriptTransform = () => {
     const stage = stageRef.current
@@ -2768,6 +4194,10 @@ export function PreviewPane({
       event.currentTarget.setPointerCapture(event.pointerId)
       return
     }
+    if (visualTool === 'video/tool/perspective') {
+      perspPointerDown(event)
+      return
+    }
     const hit = hitTest(event.clientX, event.clientY)
     // 源码语义：drag 工具点击的是特征（属于其所在行）；hold 工具（scale/rotate/clip）
     // 无可点击特征，始终以活动行为基准（InitializeHold），改动经 SetSelectedOverride
@@ -2835,6 +4265,10 @@ export function PreviewPane({
       scheduleOverlayRender()
     if (vclipRef.current) {
       vclipPointerMove(event)
+      return
+    }
+    if (perspRef.current) {
+      perspPointerMove(event)
       return
     }
     const drag = dragRef.current
@@ -2970,6 +4404,10 @@ export function PreviewPane({
   }
 
   const canvasDoubleClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (visualTool === 'video/tool/perspective' && perspRef.current) {
+      perspDoubleClick(event)
+      return
+    }
     if (visualTool !== 'video/tool/cross' || !activeCue) return
     const stage = stageRef.current
     if (!stage) return
@@ -3022,6 +4460,10 @@ export function PreviewPane({
     visualDragRef.current = false
     if (vclipRef.current) {
       vclipPointerUp()
+      return
+    }
+    if (perspRef.current) {
+      perspPointerUp()
       return
     }
     dragRef.current = null
@@ -3233,6 +4675,46 @@ export function PreviewPane({
             )}
           </div>
         )}
+        {visualTool === 'video/tool/perspective' && (
+          <div
+            className="visual-toolbar visual-subtoolbar"
+            aria-label={tPlain('Perspective sub tools')}
+          >
+            <div className="visual-sep" />
+            {PERSP_SUBTOOLS.map(({ id, bit }) => (
+              <button
+                className={`visual-tool${(perspSettings & bit) !== 0 ? ' pressed' : ''}`}
+                title={commandTooltip(id, 'Video')}
+                aria-label={commandTooltip(id, 'Video')}
+                key={id}
+                // 源码 EnableTool(lock_outer, subtool & PERSP_OUTER)：未启用 plane 时禁用
+                disabled={
+                  id === 'video/tool/perspective/lock_outer' && !perspHasOuterBits(perspSettings)
+                }
+                aria-pressed={(perspSettings & bit) !== 0}
+                onClick={() => perspSubToolClick(id)}
+              >
+                <img src={commandIcon(id)} alt="" width={16} height={16} draggable={false} />
+              </button>
+            ))}
+            <button
+              className="visual-tool"
+              title={perspOrgTitle}
+              aria-label={perspOrgTitle}
+              // 源码 ToggleTool(orgmode, false)：org 模式按钮恒不按下
+              aria-pressed={false}
+              onClick={() => perspSubToolClick('video/tool/perspective/orgmode/center')}
+            >
+              <img
+                src={commandIcon(perspOrgCommand)}
+                alt=""
+                width={16}
+                height={16}
+                draggable={false}
+              />
+            </button>
+          </div>
+        )}
         <div
           className="video-stage"
           ref={stageRef}
@@ -3325,6 +4807,24 @@ export function PreviewPane({
                     event.currentTarget.videoWidth,
                     event.currentTarget.videoHeight,
                   )
+                  // 首帧偏移校准（每个元素实例一次）：首帧 present 时的 mediaTime 即元素
+                  // 时间轴上的首帧时间（容器首帧 PTS）。校准后若元素位置与归一化时间轴
+                  // 不符（如中途从 WebCodecs 切回、元素重挂载后仍停在首帧），补一次同步 seek
+                  const host = event.currentTarget
+                  host.requestVideoFrameCallback?.((_now, metadata) => {
+                    if (videoRef.current !== host) return
+                    firstFrameOffsetSecRef.current = metadata.mediaTime
+                    // 时长与元素位置同一时间轴（原始 PTS），同样换算到归一化应用时间轴
+                    if (Number.isFinite(host.duration)) {
+                      const appDuration = Math.max(
+                        0,
+                        host.duration * 1000 - ptsToMs(metadata.mediaTime),
+                      )
+                      setDurationMs(appDuration)
+                      onDurationChange(appDuration)
+                    }
+                    if (host.paused) requestVideoSeek(currentRef.current)
+                  })
                   probeVideoFps(event.currentTarget, media.url)
                 }}
                 onPlay={() => setPlaying(true)}

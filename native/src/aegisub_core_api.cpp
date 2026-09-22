@@ -18,6 +18,7 @@
 #include "ass_parser.h"
 #include "ass_dialogue.h"
 #include "ass_style.h"
+// ass_override.h 无 include guard，由 ass_dialogue.h 一并引入（勿重复包含）
 #include "ass_attachment.h"
 #include "ass_entry.h"
 #include "ass_info.h"
@@ -26,6 +27,7 @@
 #include <libaegisub/cajun/elements.h>
 #include <libaegisub/cajun/writer.h>
 #include <libaegisub/json.h>
+#include <libaegisub/of_type_adaptor.h>
 
 #include <algorithm>
 #include <cctype>
@@ -72,49 +74,96 @@ bool is_srt_name(std::string const& name) {
 
 // ---------------------------------------------------------------------------
 // JSON 工具（cajun：用隐式转换访问，不用 AsXxx()）
+//
+// 注意：cajun 的隐式转换在类型不匹配时抛 json::Exception("Bad cast")，而 wasm
+// 构建未启用 C++ 异常——throw 会 abort 整个模块（try/catch 一并失效，模块此后
+// 不可用）。JS 侧数字不区分整数/浮点（JSON.stringify(48) == "48" 会被解析成
+// Integer、48.5 才是 Double），所以必须按实际类型取值。这里统一先用
+// ConstVisitor 判定类型再取，全程不抛异常。
 // ---------------------------------------------------------------------------
 
+struct JsonProbe final : json::ConstVisitor {
+	enum class Kind { Null, Boolean, Integer, Double, String, Array, Object };
+	Kind kind = Kind::Null;
+	bool boolean = false;
+	int64_t integer = 0;
+	double number = 0;
+	std::string string;
+
+	void Visit(json::Null const&) override { kind = Kind::Null; }
+	void Visit(bool value) override { kind = Kind::Boolean; boolean = value; }
+	void Visit(int64_t value) override { kind = Kind::Integer; integer = value; }
+	void Visit(double value) override { kind = Kind::Double; number = value; }
+	void Visit(json::String const& value) override { kind = Kind::String; string = value; }
+	void Visit(json::Array const&) override { kind = Kind::Array; }
+	void Visit(json::Object const&) override { kind = Kind::Object; }
+};
+
+JsonProbe probe_json(json::UnknownElement const& el) {
+	JsonProbe result;
+	el.Accept(result);
+	return result;
+}
+
+/// 类型确定后的安全取用（类型不匹配返回 nullptr，绝不抛异常）
+json::Object const* as_object(json::UnknownElement const& el) {
+	if (probe_json(el).kind != JsonProbe::Kind::Object) return nullptr;
+	return &static_cast<json::Object const&>(el);
+}
+
 std::string json_str(json::UnknownElement const& el) {
-	try { return std::string(static_cast<json::String const&>(el)); } catch (...) {}
-	try { return std::to_string(static_cast<json::Integer const&>(el)); } catch (...) {}
-	return "";
+	JsonProbe const p = probe_json(el);
+	switch (p.kind) {
+		case JsonProbe::Kind::String: return p.string;
+		case JsonProbe::Kind::Integer: return std::to_string(p.integer);
+		case JsonProbe::Kind::Double: return std::to_string(p.number);
+		case JsonProbe::Kind::Boolean: return p.boolean ? "true" : "false";
+		default: return "";
+	}
 }
 
 int json_int(json::UnknownElement const& el) {
-	try { return static_cast<int>(static_cast<json::Integer const&>(el)); } catch (...) {}
-	try { return static_cast<int>(static_cast<json::Double const&>(el)); } catch (...) {}
-	try { return static_cast<int>(static_cast<json::Boolean const&>(el)); } catch (...) {}
-	return 0;
+	JsonProbe const p = probe_json(el);
+	switch (p.kind) {
+		case JsonProbe::Kind::Integer: return static_cast<int>(p.integer);
+		case JsonProbe::Kind::Double: return static_cast<int>(p.number);
+		case JsonProbe::Kind::Boolean: return p.boolean ? 1 : 0;
+		default: return 0;
+	}
 }
 
 double json_double(json::UnknownElement const& el) {
-	try { return static_cast<double>(static_cast<json::Double const&>(el)); } catch (...) {}
-	try { return static_cast<double>(static_cast<json::Integer const&>(el)); } catch (...) {}
-	return 0;
+	JsonProbe const p = probe_json(el);
+	switch (p.kind) {
+		case JsonProbe::Kind::Double: return p.number;
+		case JsonProbe::Kind::Integer: return static_cast<double>(p.integer);
+		default: return 0;
+	}
 }
 
 bool json_bool(json::UnknownElement const& el) {
-	try { return static_cast<json::Boolean const&>(el); } catch (...) {}
-	try { return static_cast<json::Integer const&>(el) != 0; } catch (...) {}
-	return false;
+	JsonProbe const p = probe_json(el);
+	switch (p.kind) {
+		case JsonProbe::Kind::Boolean: return p.boolean;
+		case JsonProbe::Kind::Integer: return p.integer != 0;
+		default: return false;
+	}
 }
 
 std::string obj_get(json::UnknownElement const& el, char const* key) {
-	try {
-		json::Object const& obj = static_cast<json::Object const&>(el);
-		auto it = obj.find(key);
-		if (it == obj.end()) return "";
-		return json_str(it->second);
-	} catch (...) { return ""; }
+	json::Object const* obj = as_object(el);
+	if (!obj) return "";
+	auto it = obj->find(key);
+	if (it == obj->end()) return "";
+	return json_str(it->second);
 }
 
 int obj_int(json::UnknownElement const& el, char const* key) {
-	try {
-		json::Object const& obj = static_cast<json::Object const&>(el);
-		auto it = obj.find(key);
-		if (it == obj.end()) return 0;
-		return json_int(it->second);
-	} catch (...) { return 0; }
+	json::Object const* obj = as_object(el);
+	if (!obj) return 0;
+	auto it = obj->find(key);
+	if (it == obj->end()) return 0;
+	return json_int(it->second);
 }
 
 // ---------------------------------------------------------------------------
@@ -504,12 +553,8 @@ void apply_update_style(AegisubDocument& doc, json::UnknownElement const& cmd) {
 		if (patch_it == cmd_obj.end()) return;
 		json::Object const& p = static_cast<json::Object const&>(patch_it->second);
 		for (auto const& [key, value] : p) {
-			if (key == "name") {
-				std::string old = style->name;
-				style->name = json_str(value);
-				for (auto& cue : doc.file->Events)
-					if (cue.Style.get() == old) cue.Style = boost::flyweight<std::string>(style->name);
-			} else if (key == "fontName") style->font = json_str(value);
+			if (key == "name") style->name = json_str(value);
+			else if (key == "fontName") style->font = json_str(value);
 			else if (key == "fontSize") style->fontsize = json_double(value);
 			else if (key == "primaryColor") style->primary = agi::Color(json_str(value));
 			else if (key == "secondaryColor") style->secondary = agi::Color(json_str(value));
@@ -533,6 +578,45 @@ void apply_update_style(AegisubDocument& doc, json::UnknownElement const& cmd) {
 			else if (key == "encoding") style->encoding = json_int(value);
 		}
 		style->UpdateData();
+	} catch (...) {}
+}
+
+// ---------------------------------------------------------------------------
+// dialog_style_editor.cpp StyleRenamer：脚本内样式引用改名
+// ---------------------------------------------------------------------------
+
+struct StyleRenamer {
+	std::string const& source_name;
+	std::string const& new_name;
+
+	/// 源码 StyleRenamer::ProcessTag：标签名为 \r、参数为 TEXT 且等于原样式名
+	static void ProcessTag(std::string const& tag, AssOverrideParameter* param, void* userData) {
+		auto* self = static_cast<StyleRenamer*>(userData);
+		if (tag == "\\r" && param->GetType() == VariableDataType::TEXT &&
+		    param->Get<std::string>() == self->source_name)
+			param->Set(self->new_name);
+	}
+
+	/// 源码 StyleRenamer::Replace（Walk(true)）：逐行改 Style 字段与 \r 标签后回写文本
+	void Replace(AssFile& file) {
+		for (auto& diag : file.Events) {
+			if (diag.Style.get() == source_name)
+				diag.Style = boost::flyweight<std::string>(new_name);
+			auto blocks = diag.ParseTags();
+			for (auto block : blocks | agi::of_type<AssDialogueBlockOverride>())
+				block->ProcessParameters(&StyleRenamer::ProcessTag, this);
+			diag.UpdateText(blocks);
+		}
+	}
+};
+
+void apply_rename_style_references(AegisubDocument& doc, json::UnknownElement const& cmd) {
+	std::string const from = obj_get(cmd, "from");
+	std::string const to = obj_get(cmd, "to");
+	if (from.empty() || from == to) return;
+	try {
+		StyleRenamer renamer{from, to};
+		renamer.Replace(*doc.file);
 	} catch (...) {}
 }
 
@@ -672,6 +756,7 @@ void apply_commands(AegisubDocument& doc, json::Array const& commands) {
 		else if (type == "duplicateCues") apply_duplicate_cues(doc, cmd);
 		else if (type == "moveCues") apply_move_cues(doc, cmd);
 		else if (type == "updateStyle") apply_update_style(doc, cmd);
+		else if (type == "renameStyleReferences") apply_rename_style_references(doc, cmd);
 		else if (type == "addStyle") apply_add_style(doc, cmd);
 		else if (type == "deleteStyle") apply_delete_style(doc, cmd);
 		else if (type == "reorderStyles") apply_reorder_styles(doc, cmd);

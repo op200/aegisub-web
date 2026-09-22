@@ -149,6 +149,9 @@ const EditTopRow = memo(
     effects,
     handlers,
   }: EditTopRowProps) {
+    // subs_edit_box.cpp：style_box->Select(style_box->FindString(line->Style))，
+    // FindString 未命中返回 -1 → 只读 combo 显示空（悬空引用，如样式改名时选了"否"）
+    const styleExists = styles.some((item) => item.name === style)
     return (
       <>
         <label className="comment-toggle">
@@ -165,24 +168,25 @@ const EditTopRow = memo(
         </label>
         <label className="edit-style">
           <select
-            value={style}
+            value={styleExists ? style : ''}
             onChange={(event) => {
               const value = event.target.value
               handlers.current.patchDraft({ style: value })
               handlers.current.commit('style', value, 'style change')
             }}
           >
+            {/* 未命中时补一个空项承载 value=''，避免浏览器回退选中首项 */}
+            {!styleExists && <option value="" />}
             {styles.map((item) => (
               <option key={item.id}>{item.name}</option>
             ))}
           </select>
         </label>
-        {/* 源码 Edit 按钮直接打开当前行样式的编辑对话框（subs_edit_box.cpp，样式缺失时禁用） */}
+        {/* 源码 Edit 按钮直接打开当前行样式的编辑对话框（subs_edit_box.cpp，样式缺失时禁用；无 SetToolTip） */}
         <button
           className="edit-edit-btn"
           onClick={() => handlers.current.onEditStyle()}
-          disabled={!styles.some((item) => item.name === style)}
-          title={tPlain('Edit style')}
+          disabled={!styleExists}
         >
           {tPlain('Edit')}
         </button>

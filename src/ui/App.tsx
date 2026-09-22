@@ -14,6 +14,7 @@ import {
   setOption,
   useOptionsVersion,
 } from '../config/options'
+import { hasStyleOverride } from '../core/assTags'
 import { CoreClient } from '../core/client'
 import { createDocument } from '../core/defaults'
 import { exportSubtitle } from '../core/format'
@@ -88,8 +89,9 @@ import { LogPanel } from './components/LogPanel'
 import { MenuBar } from './components/MenuBar'
 import { PreferencesDialog } from './components/PreferencesDialog'
 import { PreviewPane, type VideoPlaybackMode } from './components/PreviewPane'
+import { StyleEditorDialog } from './components/StyleEditorDialog'
 import { StyleManagerDialog } from './components/StyleManagerDialog'
-import { SubtitleGrid } from './components/SubtitleGrid'
+import { gridRowHeight, SubtitleGrid } from './components/SubtitleGrid'
 import { Toolbar } from './components/Toolbar'
 import { initLocale, tPlain, useLocaleVersion } from './i18n'
 import { calculateAttachedVideoLayout } from './layout/videoLayout'
@@ -349,8 +351,12 @@ export function App() {
   const [busy, setBusy] = useState(false)
   const [toolbarVisible, setToolbarVisible] = useState(() => getOptionBool('App/Show Toolbar'))
   const [showStyleManager, setShowStyleManager] = useState(false)
-  // 编辑框 Edit 按钮直达样式编辑（源码 DialogStyleEditor），菜单入口仍是样式管理器
-  const [styleManagerAutoEdit, setStyleManagerAutoEdit] = useState(false)
+  // 编辑框 Edit 按钮直达样式编辑（源码 subs_edit_box.cpp ShowModal DialogStyleEditor）
+  // 句柄：源码持 AssStyle* 指针，改名不影响身份；WASM 核心的样式 id 即样式名（改名后
+  // 随之变化），故同时记录打开时的 id 与最近应用的名字，解析时先按 id 再按名字回退
+  const [editingStyleHandle, setEditingStyleHandle] = useState<{ id: string; name: string } | null>(
+    null,
+  )
   const [findMode, setFindMode] = useState<'find' | 'replace' | null>(null)
   // 查找/替换弹窗 ESC 关闭（不响应点击外部关闭）
   useEscapeClose(() => setFindMode(null), findMode !== null)
@@ -462,14 +468,11 @@ export function App() {
     coreRef.current = client
     let cancelled = false
     void (async () => {
-      let initial = await client.state()
-      try {
-        const saved = await loadLatestAutosave()
-        if (saved?.document && Date.now() - saved.savedAt < 30 * 24 * 60 * 60 * 1000)
-          initial = await client.restore(saved.document)
-      } catch {
-        // IndexedDB is optional in private browsing and embedded WebViews.
-      }
+      // 启动不采纳自动保存（源码 frame_main 同样不恢复）：自动保存的恢复只能由
+      // File → Open Autosaved Subtitles... 显式触发。启动静默载入历史自动保存会
+      // 把 UI 拖进异常状态——旧核心遗留的空文档经 TS 回退运行时 restore 直接
+      // structuredClone，网格变 0 行、编辑栏「未选中行」、插入行无操作
+      const initial = await client.state()
       const recents = await loadRecentLists()
       if (cancelled) return
       setRecentLists(recents)
@@ -547,6 +550,8 @@ export function App() {
     // Subtitle/Grid/Font Size：wxWidgets pt → CSS px（9pt → 12px）
     const gridSize = getOptionInt('Subtitle/Grid/Font Size')
     setVar('--grid-font-size', `${Math.round((gridSize * 4) / 3)}px`)
+    // 行高 = 字符高 + 4（base_grid.cpp UpdateStyle），随字号实测
+    setVar('--row-height', `${gridRowHeight()}px`)
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- optionsVersion 仅为触发重读配置
   }, [theme, optionsVersion])
 
@@ -562,6 +567,21 @@ export function App() {
     [activeId, core],
   )
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds])
+  // subs_edit_box.cpp：active_style = c->ass->GetStyle(line->Style)（样式缺失时 Edit 按钮禁用）
+  const activeStyle = core?.document.styles.find((item) => item.name === selectedCue?.style) ?? null
+  // Edit 按钮打开的样式（对话框随文档更新取最新值；改名后 id 失配时按名字回退）
+  const editingStyle =
+    core?.document.styles.find((item) => item.id === editingStyleHandle?.id) ??
+    core?.document.styles.find((item) => item.name === editingStyleHandle?.name) ??
+    null
+  // 改名落地后把句柄切到新 id（否则连续改名时既失去 id 也失去旧名字的回退依据）
+  if (editingStyle && editingStyle.id !== editingStyleHandle?.id) {
+    setEditingStyleHandle({ id: editingStyle.id, name: editingStyle.name })
+  }
+  /** dialog_style_editor.cpp StyleRenamer::NeedsReplace：脚本内是否存在该样式引用 */
+  const styleHasReferences = (name: string) =>
+    core?.document.cues.some((cue) => cue.style === name || hasStyleOverride(cue.text, name)) ??
+    false
   // subs_edit_box.cpp PopulateList：全文档 Actor/Effect 去重排序，供编辑框 datalist
   const actorValues = useMemo(() => {
     if (!core) return []
@@ -1003,7 +1023,9 @@ export function App() {
     setCore(state)
     setDirty(false)
     lastAutosaveRevisionRef.current = state.document.revision
-    selectOnly(state.document.cues[0].id)
+    const id = state.document.cues[0]?.id ?? null
+    setActiveId(id)
+    setSelectedIds(id ? new Set([id]) : new Set())
     setStatus(tPlain('New subtitles'))
   }
 
@@ -1790,10 +1812,11 @@ export function App() {
             ? {
                 // video_box.cpp 挂靠 TopSizer proportion 0：视频栏高度=精确最小高（display+56），
                 // 多余空间全给 Grid（proportion 1）；窗口放不下时整体被窗口裁剪（wx 布局子项
-                // 永不小于 min size）。无视频的占位面板与移动端仍按视口钳制以保持紧凑
+                // 永不小于 min size）。上界 min-content = 侧栏（视觉工具栏 + 子工具栏）自然高：
+                // 视频缩放过小时 wx 取 max(视频框, 侧栏) 撑高视频框，保证侧栏子选项不被挤掉
                 gridTemplateRows:
                   videoMedia && !isNarrowViewport
-                    ? `${videoLayout.panelHeight}px minmax(120px, 1fr)`
+                    ? `minmax(${videoLayout.panelHeight}px, min-content) minmax(120px, 1fr)`
                     : `min(${videoLayout.panelHeight}px, calc(100dvh - 194px)) minmax(120px, 1fr)`,
               }
             : undefined
@@ -1963,10 +1986,11 @@ export function App() {
               }}
               onCommand={executeCommand}
               isCommandEnabled={isCommandEnabled}
-              onEditStyle={() => {
-                setStyleManagerAutoEdit(true)
-                setShowStyleManager(true)
-              }}
+              onEditStyle={() =>
+                setEditingStyleHandle(
+                  activeStyle ? { id: activeStyle.id, name: activeStyle.name } : null,
+                )
+              }
             />
           </div>
         </div>
@@ -2027,14 +2051,14 @@ export function App() {
         <StyleManagerDialog
           styles={core.document.styles}
           activeStyleName={selectedCue?.style ?? core.document.styles[0]?.name ?? ''}
-          autoEdit={styleManagerAutoEdit}
-          onClose={() => {
-            setShowStyleManager(false)
-            setStyleManagerAutoEdit(false)
+          onClose={() => setShowStyleManager(false)}
+          hasReferences={styleHasReferences}
+          onUpdate={(id, patch, label, rename) => {
+            const commands: CoreCommand[] = [{ type: 'updateStyle', id, patch }]
+            // 改名询问选“是”：同一事务内改写脚本引用（源码单次 Commit 一步撤销）
+            if (rename) commands.push({ type: 'renameStyleReferences', ...rename })
+            void apply(commands, tPlain(label ?? 'style change'))
           }}
-          onUpdate={(id, patch, label) =>
-            void apply([{ type: 'updateStyle', id, patch }], tPlain(label ?? 'style change'))
-          }
           onAdd={(style, label) =>
             void apply([{ type: 'addStyle', style }], tPlain(label ?? 'style change'))
           }
@@ -2042,6 +2066,28 @@ export function App() {
             ids.forEach((id) => void apply([{ type: 'deleteStyle', id }], tPlain('style delete')))
           }
           onReorder={(ids) => void apply([{ type: 'reorderStyles', ids }], tPlain('style move'))}
+        />
+      )}
+
+      {/* 编辑框 Edit 按钮：源码 DialogStyleEditor(this, active_style, c, nullptr, "", font_list) */}
+      {editingStyle && (
+        <StyleEditorDialog
+          style={editingStyle}
+          existing={core.document.styles}
+          originalId={editingStyle.id}
+          hasReferences={styleHasReferences}
+          onApply={(style, rename) => {
+            const commands: CoreCommand[] = [
+              { type: 'updateStyle', id: editingStyle.id, patch: style },
+            ]
+            if (rename) commands.push({ type: 'renameStyleReferences', ...rename })
+            void apply(commands, tPlain('style change'))
+            // 新名字即刻作为回退句柄（id 待文档落地后由解析处的同步逻辑切换）
+            setEditingStyleHandle((current) =>
+              current ? { ...current, name: style.name } : current,
+            )
+          }}
+          onClose={() => setEditingStyleHandle(null)}
         />
       )}
 

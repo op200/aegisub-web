@@ -61,8 +61,15 @@ const GRID_COLUMNS: GridColumnDef[] = [
     canHide: true,
   },
   { key: 'layer', label: 'L', description: 'Layer', centered: true, width: 0, canHide: true },
-  { key: 'start', label: 'Start', description: 'Start Time', width: 0, canHide: true },
-  { key: 'end', label: 'End', description: 'End Time', width: 0, canHide: true },
+  {
+    key: 'start',
+    label: 'Start',
+    description: 'Start Time',
+    centered: true,
+    width: 0,
+    canHide: true,
+  },
+  { key: 'end', label: 'End', description: 'End Time', centered: true, width: 0, canHide: true },
   {
     key: 'cps',
     label: 'CPS',
@@ -101,14 +108,21 @@ const GRID_COLUMNS: GridColumnDef[] = [
   { key: 'text', label: 'Text', description: 'Text', width: 160, fill: true, canHide: false },
 ]
 
-const ROW_HEIGHT = 19
 const OVERSCAN = 8
+/** 网格竖向滚动条宽度（源码用系统滚动条宽度，Win32 约 17px；web 取 15px） */
+const SCROLLBAR_WIDTH = 15
+/** 滚动条两端箭头按钮高度（Win32 滚动条箭头为正方形，与滚动条同宽） */
+const SCROLLBAR_ARROW = SCROLLBAR_WIDTH
+
+/** 网格字号（px）：Subtitle/Grid/Font Size 由 pt 转 px（9pt → 12px） */
+function gridFontSize(): number {
+  return Math.round((getOptionInt('Subtitle/Grid/Font Size') * 4) / 3)
+}
 
 /** 网格字体（Subtitle/Grid/Font Face + Font Size；9pt → 12px） */
 function gridFont(): string {
   const face = getOptionString('Subtitle/Grid/Font Face')
-  const size = Math.round((getOptionInt('Subtitle/Grid/Font Size') * 4) / 3)
-  return `${size}px ${face ? `"${face}", ` : ''}'Segoe UI', 'Microsoft YaHei UI', sans-serif`
+  return `${gridFontSize()}px ${face ? `"${face}", ` : ''}'Segoe UI', 'Microsoft YaHei UI', sans-serif`
 }
 
 /** 表头字体（.subtitle-grid-header：12px/600，继承全局字体栈，不随 Font Size 选项） */
@@ -145,9 +159,29 @@ function textWidth(text: string, font: string): number {
   textWidthCacheSize += 1
   return width
 }
+
+/**
+ * 网格字符高度（源码 base_grid.cpp UpdateStyle：dc.GetCharHeight()）。
+ * Chromium 的 line-height:normal 行盒高 == fontBoundingBoxAscent + fontBoundingBoxDescent
+ * （12px Segoe UI 实测 13 + 3 = 16，与 wxMSW GetCharHeight 一致）；度量不可用时退回字号。
+ */
+function gridCharHeight(): number {
+  if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d')
+  if (!measureCtx) return gridFontSize()
+  measureCtx.font = gridFont()
+  const metrics = measureCtx.measureText('Hg')
+  const height = metrics.fontBoundingBoxAscent + metrics.fontBoundingBoxDescent
+  return Number.isFinite(height) && height > 0 ? height : gridFontSize()
+}
+
+/** 网格行高 / 表头行高（base_grid.cpp UpdateStyle：lineHeight = dc.GetCharHeight() + 4） */
+export function gridRowHeight(): number {
+  return gridCharHeight() + 4
+}
 /**
  * Aegisub GridColumn::UpdateWidth：width = 10 + max(内容宽, 表头宽)。
- * web 移植按真实渲染占用取值：单元格 6+6（居中列 2+2）内边距 + 1px 右边框，
+ * web 移植按真实渲染占用取值：单元格 4 左 + 5 右内边距 + 1px 右边框（共 10，对齐
+ * grid_column.cpp Paint 的 x + 4 与 UpdateWidth 的 10）；
  * 表头按 12px/600 实测（翻译后 CJK 列名更宽，须保证不换行）；
  * 内容为空（Layer/边距全 0）时列宽为 0 → 列折叠隐藏。
  * 帧模式下 Start/End 列宽按最大帧号计算（grid_column.cpp）。
@@ -209,8 +243,9 @@ function computeGridWidths(
     if (column.fill) return column.width
     const content = maxByKey[column.key] ?? 0
     if (!content) return 0
-    const headerNeed = textWidth(tPlain(column.label), headerFont()) + 13
-    const contentNeed = content + (column.centered ? 5 : 13)
+    // grid_column.cpp UpdateWidth：width = 10 + max(内容宽, 表头宽)（10 为固定内边距）
+    const headerNeed = textWidth(tPlain(column.label), headerFont()) + 10
+    const contentNeed = content + 10
     return Math.ceil(Math.max(headerNeed, contentNeed))
   })
   const fixedWidth = widths.filter((_, i) => !GRID_COLUMNS[i].fill).reduce((sum, w) => sum + w, 0)
@@ -287,6 +322,8 @@ function sameWidths(a: number[], b: number[]): boolean {
 interface GridRowProps {
   cue: SubtitleCue
   index: number
+  /** 行高（base_grid.cpp UpdateStyle 的 lineHeight，随网格字号变化） */
+  rowHeight: number
   active: boolean
   selected: boolean
   activeAtTime: boolean
@@ -310,6 +347,7 @@ const GridRow = memo(
   function GridRow({
     cue,
     index,
+    rowHeight,
     active,
     selected,
     activeAtTime,
@@ -331,7 +369,7 @@ const GridRow = memo(
     return (
       <div
         className={`subtitle-row grid-columns${selected ? ' selected' : ''}${active ? ' active' : ''}${activeAtTime ? ' at-time' : ''}${cue.comment ? ' comment' : ''}`}
-        style={{ transform: `translateY(${index * ROW_HEIGHT}px)` }}
+        style={{ transform: `translateY(${index * rowHeight}px)` }}
         role="row"
         aria-rowindex={index + 1}
         onContextMenu={(event) => {
@@ -341,7 +379,8 @@ const GridRow = memo(
           onOpenContextMenu(event.clientX, event.clientY)
         }}
       >
-        <span className="row-number" style={{ width: widths[0] }}>
+        {/* 行号列即 columns[0]（GridColumnLineNumber::Centered()=true），与数据行同公式居中 */}
+        <span className="row-number grid-cell-centered" style={{ width: widths[0] }}>
           {index + 1}
         </span>
         {GRID_COLUMNS.slice(1).map((column, colOffset) => {
@@ -368,7 +407,6 @@ const GridRow = memo(
                 className={`cue-text ${cls}`}
                 style={cellStyle(column, colIndex)}
                 key={column.key}
-                title={cue.text}
               >
                 {shown || '\u00a0'}
               </span>
@@ -389,6 +427,7 @@ const GridRow = memo(
   },
   (prev, next) =>
     prev.index === next.index &&
+    prev.rowHeight === next.rowHeight &&
     prev.active === next.active &&
     prev.selected === next.selected &&
     prev.activeAtTime === next.activeAtTime &&
@@ -443,6 +482,8 @@ export function SubtitleGrid({
   // 拖动块选（base_grid.cpp holding 状态：锚点行 + 上次停留行）
   const dragRef = useRef<{ anchorIndex: number; anchorId: string } | null>(null)
   const dragLastRowRef = useRef(-1)
+  // 滚动条滑块拖动（源码由 wxScrollBar 自身处理 thumb track 拖动）
+  const thumbDragRef = useRef<{ startY: number; startTop: number } | null>(null)
 
   useEffect(() => {
     const observer = new ResizeObserver(([entry]) => setHeight(entry.contentRect.height))
@@ -472,11 +513,97 @@ export function SubtitleGrid({
     }
   }, [])
 
+  // 行高随 Subtitle/Grid/Font Size 变化（源码 UpdateStyle 时重算 lineHeight）
+  const rowHeight = gridRowHeight()
+
   const range = useMemo(() => {
-    const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
-    const end = Math.min(cues.length, Math.ceil((scrollTop + height) / ROW_HEIGHT) + OVERSCAN)
+    const start = Math.max(0, Math.floor(scrollTop / rowHeight) - OVERSCAN)
+    const end = Math.min(cues.length, Math.ceil((scrollTop + height) / rowHeight) + OVERSCAN)
     return { start, end }
-  }, [cues.length, height, scrollTop])
+  }, [cues.length, height, scrollTop, rowHeight])
+
+  /**
+   * 自绘竖向滚动条几何（base_grid.cpp AdjustScrollbar）：
+   * drawPerScreen = clientHeight / lineHeight（clientHeight 含表头行，故用 height + rowHeight）；
+   * SetScrollbar(yPos, drawPerScreen, rows + drawPerScreen - 1, drawPerScreen - 2) →
+   * 滑块最大位置 = range - thumbSize = rows - 1（因此网格可滚过末行，末行停在表头下方）。
+   */
+  const scrollGeom = useMemo(() => {
+    const rows = cues.length
+    const gridHeight = height + rowHeight
+    const drawPerScreen = Math.max(1, Math.floor(gridHeight / rowHeight))
+    const scrollRange = Math.max(1, rows + drawPerScreen - 1)
+    const maxPos = Math.max(0, rows - 1)
+    const trackHeight = Math.max(0, gridHeight - SCROLLBAR_ARROW * 2)
+    const thumbHeight = Math.min(
+      trackHeight,
+      Math.max(rowHeight, Math.round((trackHeight * drawPerScreen) / scrollRange)),
+    )
+    const pos = Math.max(0, Math.min(Math.round(scrollTop / rowHeight), maxPos))
+    const thumbTop = maxPos > 0 ? Math.round(((trackHeight - thumbHeight) * pos) / maxPos) : 0
+    return {
+      maxPos,
+      trackHeight,
+      thumbHeight,
+      thumbTop,
+      // 源码 GetRows() <= 1 时 Enable(false)（滚动条仍常驻但置灰）
+      enabled: rows > 1,
+      pageStep: Math.max(1, drawPerScreen - 2),
+    }
+  }, [cues.length, height, scrollTop, rowHeight])
+
+  /** 滚动到指定行位置（源码 ScrollTo：mid(0, y, GetRows()-1)） */
+  const scrollToPos = (pos: number) => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const clamped = Math.max(0, Math.min(scrollGeom.maxPos, pos))
+    viewport.scrollTop = clamped * rowHeight
+  }
+
+  const onThumbPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!scrollGeom.enabled) return
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    thumbDragRef.current = { startY: event.clientY, startTop: scrollGeom.thumbTop }
+  }
+
+  const onThumbPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = thumbDragRef.current
+    if (!drag) return
+    const travel = scrollGeom.trackHeight - scrollGeom.thumbHeight
+    if (travel <= 0 || scrollGeom.maxPos <= 0) return
+    const pos = Math.round(
+      ((drag.startTop + event.clientY - drag.startY) / travel) * scrollGeom.maxPos,
+    )
+    scrollToPos(pos)
+  }
+
+  const onThumbPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!thumbDragRef.current) return
+    thumbDragRef.current = null
+    event.currentTarget.releasePointerCapture(event.pointerId)
+  }
+
+  // 轨道点击翻页（pageSize = drawPerScreen - 2，同 SetScrollbar 的 pageSize）
+  const onTrackPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!scrollGeom.enabled) return
+    if ((event.target as HTMLElement).closest('.grid-scrollbar-thumb')) return
+    const rect = event.currentTarget.getBoundingClientRect()
+    const up = event.clientY - rect.top < scrollGeom.thumbTop
+    scrollToPos(
+      Math.round((viewportRef.current?.scrollTop ?? 0) / rowHeight) +
+        (up ? -1 : 1) * scrollGeom.pageStep,
+    )
+  }
+
+  // 滚轮在表头/滚动条上时同样滚动网格（源码整窗处理 EVT_MOUSEWHEEL；数据区由原生滚动处理）
+  const onGridWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    if ((event.target as HTMLElement).closest('.subtitle-grid-viewport')) return
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const delta = event.deltaMode === 1 ? event.deltaY * rowHeight : event.deltaY
+    viewport.scrollTop += delta
+  }
 
   const toggleColumn = (key: string) => {
     setHiddenColumns((current) => {
@@ -521,15 +648,15 @@ export function SubtitleGrid({
     const viewport = viewportRef.current
     if (!viewport) return -1
     const rect = viewport.getBoundingClientRect()
-    return Math.floor((clientY - rect.top + viewport.scrollTop) / ROW_HEIGHT)
+    return Math.floor((clientY - rect.top + viewport.scrollTop) / rowHeight)
   }
 
   // MakeRowVisible：行不可见时滚动（row-1 / 可见行数-3 边距语义）
   const makeRowVisible = (row: number) => {
     const viewport = viewportRef.current
     if (!viewport) return
-    const visibleRows = Math.max(1, Math.floor(viewport.clientHeight / ROW_HEIGHT))
-    const first = Math.floor(viewport.scrollTop / ROW_HEIGHT)
+    const visibleRows = Math.max(1, Math.floor(viewport.clientHeight / rowHeight))
+    const first = Math.floor(viewport.scrollTop / rowHeight)
     if (row < first + 1) scrollToRow(row - 1)
     else if (row > first + visibleRows - 3) scrollToRow(row - visibleRows + 3)
   }
@@ -538,7 +665,7 @@ export function SubtitleGrid({
     const viewport = viewportRef.current
     if (!viewport) return
     const clamped = Math.max(0, Math.min(row, Math.max(0, cues.length - 1)))
-    viewport.scrollTop = clamped * ROW_HEIGHT
+    viewport.scrollTop = clamped * rowHeight
   }
 
   const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -605,8 +732,8 @@ export function SubtitleGrid({
       const viewport = viewportRef.current
       if (viewport) {
         // 边缘自动滚动（源码 ScrollTo(yPos ± 3)）
-        const yPos = Math.floor(viewport.scrollTop / ROW_HEIGHT)
-        const visibleRows = Math.max(1, Math.floor(viewport.clientHeight / ROW_HEIGHT))
+        const yPos = Math.floor(viewport.scrollTop / rowHeight)
+        const visibleRows = Math.max(1, Math.floor(viewport.clientHeight / rowHeight))
         if (row <= yPos) scrollToRow(yPos - 3)
         else if (row > yPos + visibleRows - (row > drag.anchorIndex ? 3 : 1)) scrollToRow(yPos + 3)
       }
@@ -626,7 +753,7 @@ export function SubtitleGrid({
       0,
       cues.findIndex((cue) => cue.id === activeId),
     )
-    const pageSize = Math.max(1, Math.floor(height / ROW_HEIGHT) - 2)
+    const pageSize = Math.max(1, Math.floor(height / rowHeight) - 2)
     let direction = 0
     let step = 1
     if (event.key === 'ArrowUp') direction = -1
@@ -664,7 +791,7 @@ export function SubtitleGrid({
 
   return (
     <section className="grid-panel" aria-label={tPlain('Subtitle lines')}>
-      <div className="subtitle-grid-scroll">
+      <div className="subtitle-grid-scroll" onWheel={onGridWheel}>
         <div className="subtitle-grid-minwidth" style={{ minWidth: fixedWidth }}>
           <div
             className="subtitle-grid-header grid-columns"
@@ -673,11 +800,10 @@ export function SubtitleGrid({
           >
             {GRID_COLUMNS.map((column, index) => (
               <span
-                className={`grid-header-cell${column.fill ? ' grid-fill' : ''}${isHidden(column, index) ? ' grid-hidden' : ''}`}
+                className={`grid-header-cell${column.centered ? ' grid-cell-centered' : ''}${column.fill ? ' grid-fill' : ''}${isHidden(column, index) ? ' grid-hidden' : ''}`}
                 style={cellStyle(column, index)}
                 role="columnheader"
                 key={column.key}
-                title={tPlain(column.description)}
                 onContextMenu={(event) => {
                   event.preventDefault()
                   setHeaderMenu({ x: event.clientX, y: event.clientY })
@@ -707,7 +833,13 @@ export function SubtitleGrid({
             aria-rowcount={cues.length}
             onContextMenu={(event) => event.preventDefault()}
           >
-            <div style={{ height: cues.length * ROW_HEIGHT, position: 'relative' }}>
+            <div
+              style={{
+                // 末尾补足可滚动空间：源码 yPos 上限为 rows - 1（末行可停在表头下方）
+                height: cues.length * rowHeight + Math.max(0, height - rowHeight),
+                position: 'relative',
+              }}
+            >
               {(() => {
                 // 当前视频帧号（IsDisplayed 按帧号比较，与行无关，提出循环）
                 const frameNow =
@@ -727,6 +859,7 @@ export function SubtitleGrid({
                       key={cue.id}
                       cue={cue}
                       index={index}
+                      rowHeight={rowHeight}
                       active={cue.id === activeId}
                       selected={selectedIds.has(cue.id)}
                       activeAtTime={activeAtTime}
@@ -744,6 +877,34 @@ export function SubtitleGrid({
               })()}
             </div>
           </div>
+        </div>
+        {/* 常驻竖向滚动条（base_grid.cpp 的 wxScrollBar：全高、rows<=1 时置灰） */}
+        <div
+          className={`grid-scrollbar${scrollGeom.enabled ? '' : ' disabled'}`}
+          aria-hidden="true"
+        >
+          <div
+            className="grid-scrollbar-btn up"
+            onPointerDown={() =>
+              scrollToPos(Math.round((viewportRef.current?.scrollTop ?? 0) / rowHeight) - 1)
+            }
+          />
+          <div className="grid-scrollbar-track" onPointerDown={onTrackPointerDown}>
+            <div
+              className="grid-scrollbar-thumb"
+              style={{ top: scrollGeom.thumbTop, height: scrollGeom.thumbHeight }}
+              onPointerDown={onThumbPointerDown}
+              onPointerMove={onThumbPointerMove}
+              onPointerUp={onThumbPointerUp}
+              onPointerCancel={onThumbPointerUp}
+            />
+          </div>
+          <div
+            className="grid-scrollbar-btn down"
+            onPointerDown={() =>
+              scrollToPos(Math.round((viewportRef.current?.scrollTop ?? 0) / rowHeight) + 1)
+            }
+          />
         </div>
       </div>
 

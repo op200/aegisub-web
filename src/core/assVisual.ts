@@ -43,11 +43,19 @@ export interface AssVisualOverrides {
   /** \fax/\fay 剪切（visual_tool_rotatexy.cpp 变换网格） */
   fax: number
   fay: number
+  /** GetLineOutline：\bord / \xbord / \ybord（缺省取样式 outline_w） */
+  outlineX: number
+  outlineY: number
+  /** GetLineShadow：\shad / \xshad / \yshad（缺省取样式 shadow_w） */
+  shadowX: number
+  shadowY: number
+  /** GetLineAlignment：\an（缺省取样式 alignment，无样式为 0） */
+  alignment: number
   clip?: { inverse: boolean; x1: number; y1: number; x2: number; y2: number }
 }
 
 /** visual_tool.cpp find_tag：按块序扫描覆写块，返回首个同名标签 */
-function findTagInBlocks(blocks: AssBlock[], name: string): AssTag | null {
+export function findTagInBlocks(blocks: AssBlock[], name: string): AssTag | null {
   for (const block of blocks) {
     if (block.type !== 'override') continue
     for (const tag of block.tags) if (tag.name === name) return tag
@@ -70,7 +78,14 @@ function tagXY(tag: AssTag | null): { x: number; y: number } | undefined {
 
 export function readVisualOverrides(
   text: string,
-  style?: { scaleX: number; scaleY: number; angle: number },
+  style?: {
+    scaleX: number
+    scaleY: number
+    angle: number
+    outline?: number
+    shadow?: number
+    alignment?: number
+  },
 ): AssVisualOverrides {
   const blocks = parseBlocks(text)
   const first = (name: string) => findTagInBlocks(blocks, name)
@@ -107,6 +122,14 @@ export function readVisualOverrides(
     rotationY: tagNum(first('\\fry'), 0),
     fax: tagNum(first('\\fax'), 0),
     fay: tagNum(first('\\fay'), 0),
+    // GetLineOutline：\bord 先设 x/y，\xbord/\ybord 分别覆盖
+    outlineX: tagNum(first('\\xbord'), tagNum(first('\\bord'), style?.outline ?? 0)),
+    outlineY: tagNum(first('\\ybord'), tagNum(first('\\bord'), style?.outline ?? 0)),
+    // GetLineShadow：\shad 先设 x/y，\xshad/\yshad 分别覆盖
+    shadowX: tagNum(first('\\xshad'), tagNum(first('\\shad'), style?.shadow ?? 0)),
+    shadowY: tagNum(first('\\yshad'), tagNum(first('\\shad'), style?.shadow ?? 0)),
+    // GetLineAlignment：\an 覆盖样式 alignment（无样式为 0）
+    alignment: tagNum(first('\\an'), style?.alignment ?? 0),
     clip: (() => {
       // GetLineClip：\iclip 优先于 \clip；仅矩形形式（4 参数），矢量形式由调用方回退全屏矩形
       const tag = findTagInBlocks(blocks, '\\iclip') ?? findTagInBlocks(blocks, '\\clip')
@@ -189,14 +212,20 @@ export function defaultLinePosition(
   return { x, y }
 }
 
-/** visual_tool.cpp SetOverride 的同名/互删标签表 */
-const REMOVE_TAG: Record<string, string> = {
-  '\\1c': '\\c',
-  '\\frz': '\\fr',
-  '\\pos': '\\move',
-  '\\move': '\\pos',
-  '\\clip': '\\iclip',
-  '\\iclip': '\\clip',
+/** visual_tool.cpp SetOverride 的同名/互删标签表（值为需一并删除的标签名） */
+const REMOVE_TAG: Record<string, string[]> = {
+  '\\1c': ['\\c'],
+  '\\frz': ['\\fr'],
+  '\\pos': ['\\move'],
+  '\\move': ['\\pos'],
+  '\\clip': ['\\iclip'],
+  '\\iclip': ['\\clip'],
+  '\\xbord': ['\\bord'],
+  '\\ybord': ['\\bord'],
+  '\\xshad': ['\\shad'],
+  '\\yshad': ['\\shad'],
+  '\\bord': ['\\xbord', '\\ybord'],
+  '\\shad': ['\\xshad', '\\yshad'],
 }
 
 /**
@@ -205,17 +234,34 @@ const REMOVE_TAG: Record<string, string> = {
  */
 export function setOverride(text: string, tag: string, value: string): string {
   const name = `\\${tag}`
-  const removeTag = REMOVE_TAG[name]
+  const removeTags = REMOVE_TAG[name] ?? []
   const blocks = parseBlocks(text)
   const first = blocks[0]
   if (first && first.type === 'override') {
     first.tags = first.tags.filter(
-      (existing) => existing.name !== name && existing.name !== removeTag,
+      (existing) => existing.name !== name && !removeTags.includes(existing.name),
     )
     first.tags.push({ name, params: value })
     return blocks.map(blockText).join('')
   }
   return `{${name}${value}}${text}`
+}
+
+/**
+ * visual_tool.cpp RemoveOverride：删除所有同名标签（不限首块），无命中则原文返回。
+ * perspective 工具 InnerToText 在值为默认值时用 RemoveOverride 清掉覆写标签。
+ */
+export function removeOverride(text: string, tag: string): string {
+  const name = `\\${tag}`
+  let changed = false
+  const blocks = parseBlocks(text).map((block) => {
+    if (block.type !== 'override') return block
+    const tags = block.tags.filter((existing) => existing.name !== name)
+    if (tags.length === block.tags.length) return block
+    changed = true
+    return { ...block, tags }
+  })
+  return changed ? blocks.map(blockText).join('') : text
 }
 
 /** drag 工具写 \pos（visual_tool_drag.cpp UpdateDrag：ToScriptCoords(pos).PStr()，两位小数去尾零） */

@@ -152,6 +152,21 @@ function parseOverrideTags(work: string): AssTag[] {
   return tags
 }
 
+/**
+ * dialog_style_editor.cpp StyleRenamer::ProcessTag 的存在性检查：
+ * 覆写块内 \r 标签的参数文本（源码 AssOverrideParameter 已去空白）等于样式名。
+ */
+export function hasStyleOverride(text: string, name: string): boolean {
+  if (!text.includes('\\r')) return false
+  for (const block of parseBlocks(text)) {
+    if (block.type !== 'override') continue
+    for (const tag of block.tags) {
+      if (tag.name === '\\r' && tag.params.trim() === name) return true
+    }
+  }
+  return false
+}
+
 /** 块序列化（AssDialogueBlockOverride::GetText：{Name+Params...}；其余原样） */
 export function blockText(block: AssBlock): string {
   if (block.type === 'override') return `{${block.tags.map((t) => t.name + t.params).join('')}}`

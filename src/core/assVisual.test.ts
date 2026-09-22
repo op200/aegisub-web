@@ -19,6 +19,12 @@ describe('ASS visual overrides', () => {
       rotationY: 20,
       fax: 0,
       fay: 0,
+      // GetLineOutline/GetLineShadow/GetLineAlignment：无样式时回退 0
+      outlineX: 0,
+      outlineY: 0,
+      shadowX: 0,
+      shadowY: 0,
+      alignment: 0,
       clip: { inverse: false, x1: 1, y1: 2, x2: 3, y2: 4 },
     })
   })

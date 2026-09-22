@@ -68,6 +68,8 @@ export type CoreCommand =
   | { type: 'duplicateCues'; ids: string[] }
   | { type: 'moveCues'; ids: string[]; direction: -1 | 1 }
   | { type: 'updateStyle'; id: string; patch: Partial<Omit<SubtitleStyle, 'id'>> }
+  /** StyleRenamer::Replace：脚本内该样式的引用改名（diag.Style 与 \r 标签） */
+  | { type: 'renameStyleReferences'; from: string; to: string }
   | { type: 'addStyle'; style?: Partial<Omit<SubtitleStyle, 'id'>> }
   | { type: 'deleteStyle'; id: string }
   | { type: 'reorderStyles'; ids: string[] }

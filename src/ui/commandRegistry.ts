@@ -835,6 +835,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   'video/tool/drag': { run: (_, api) => api.sendVideoAction('video/tool/drag') },
   'video/tool/rotate/z': { run: (_, api) => api.sendVideoAction('video/tool/rotate/z') },
   'video/tool/rotate/xy': { run: (_, api) => api.sendVideoAction('video/tool/rotate/xy') },
+  'video/tool/perspective': { run: (_, api) => api.sendVideoAction('video/tool/perspective') },
   'video/tool/scale': { run: (_, api) => api.sendVideoAction('video/tool/scale') },
   'video/tool/clip': { run: (_, api) => api.sendVideoAction('video/tool/clip') },
   'video/tool/vector_clip': { run: (_, api) => api.sendVideoAction('video/tool/vector_clip') },
