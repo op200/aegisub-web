@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <regex>
@@ -45,12 +46,24 @@ namespace {
 // 文档状态
 // ---------------------------------------------------------------------------
 
+/// 单条撤销条目（对齐 subs_controller.cpp:UndoInfo：文档快照 + 描述 + 选中/活动行 + 文本选区）。
+/// 行 id 用 AssDialogue::Id（快照拷贝保留 id，可跨版本定位等价行——ass_dialogue.h 注释语义）
+struct UndoEntry {
+	std::unique_ptr<AssFile> file;
+	std::string label;
+	std::vector<int> selected;  // 选中行 id
+	int active = -1;            // 活动行 id，-1 表示无
+	// 编辑框文本选区（UndoInfo pos/sel_start/sel_end）：由 UI 实时上报修订，
+	// Undo/Redo 后由 UI 按恢复值 setSelectionRange（源码 Apply 的 SetInsertionPoint/SetSelection）
+	int text_pos = 0;
+	int text_sel_start = 0;
+	int text_sel_end = 0;
+};
+
 struct AegisubDocument {
 	std::unique_ptr<AssFile> file;
-	std::vector<std::unique_ptr<AssFile>> undo_stack;
-	std::vector<std::unique_ptr<AssFile>> redo_stack;
-	std::vector<std::string> undo_labels;
-	std::vector<std::string> redo_labels;
+	std::vector<UndoEntry> undo_stack;
+	std::vector<UndoEntry> redo_stack;
 	int revision = 0;
 	std::string format = "ass";
 	std::string source_name = "untitled.ass";
@@ -171,6 +184,23 @@ int obj_int(json::UnknownElement const& el, char const* key) {
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<AssFile> clone_file(AssFile const& src) { return std::make_unique<AssFile>(src); }
+
+/// 以当前文档 + 栈顶条目的选中/活动行/文本选区建立新撤销条目
+/// （源码 OnCommit 用提交时的当前选中集与文本选区初始化 UndoInfo，此后持续修订栈顶）
+UndoEntry make_entry(AegisubDocument const& doc, std::string const& label) {
+	UndoEntry entry;
+	entry.file = clone_file(*doc.file);
+	entry.label = label;
+	if (!doc.undo_stack.empty()) {
+		const UndoEntry& top = doc.undo_stack.back();
+		entry.selected = top.selected;
+		entry.active = top.active;
+		entry.text_pos = top.text_pos;
+		entry.text_sel_start = top.text_sel_start;
+		entry.text_sel_end = top.text_sel_end;
+	}
+	return entry;
+}
 
 void create_default_document(AssFile& file) {
 	// 与 AssFile::LoadDefault 等效但避开 OPT_GET（options 依赖）
@@ -378,8 +408,24 @@ json::Object document_to_json(AegisubDocument const& doc) {
 	// 栈底为初始状态：只有存在可撤销提交（>1 条目）时才可撤销
 	state["canUndo"] = doc.undo_stack.size() > 1;
 	state["canRedo"] = !doc.redo_stack.empty();
-	state["undoLabel"] = doc.undo_labels.empty() ? "" : doc.undo_labels.back();
-	state["redoLabel"] = doc.redo_labels.empty() ? "" : doc.redo_labels.back();
+	state["undoLabel"] = doc.undo_stack.empty() ? "" : doc.undo_stack.back().label;
+	state["redoLabel"] = doc.redo_stack.empty() ? "" : doc.redo_stack.back().label;
+	// 选中/活动行随撤销恢复（subs_controller.cpp:Apply → SetSelectionAndActive）
+	json::Array selected;
+	if (!doc.undo_stack.empty()) {
+		for (int id : doc.undo_stack.back().selected) selected.push_back(std::to_string(id));
+		if (doc.undo_stack.back().active >= 0)
+			state["activeId"] = std::to_string(doc.undo_stack.back().active);
+	}
+	state["selected"] = std::move(selected);
+	if (state.find("activeId") == state.end()) state["activeId"] = json::Null();
+	// 编辑框文本选区随撤销恢复（subs_controller.cpp:Apply → SetInsertionPoint/SetSelection），
+	// UI 在 undo/redo 后按此恢复 textarea 选区与光标
+	json::Object text_selection;
+	text_selection["pos"] = static_cast<int64_t>(doc.undo_stack.empty() ? 0 : doc.undo_stack.back().text_pos);
+	text_selection["start"] = static_cast<int64_t>(doc.undo_stack.empty() ? 0 : doc.undo_stack.back().text_sel_start);
+	text_selection["end"] = static_cast<int64_t>(doc.undo_stack.empty() ? 0 : doc.undo_stack.back().text_sel_end);
+	state["textSelection"] = std::move(text_selection);
 	state["runtime"] = "wasm";
 	return state;
 }
@@ -970,13 +1016,16 @@ std::string export_srt(AegisubDocument const& doc) {
 
 extern "C" {
 
-uint32_t aegisub_core_abi_version(void) { return 2; }
+uint32_t aegisub_core_abi_version(void) { return 4; }
 
 aegisub_document_t aegisub_document_create(void) {
 	try {
 		auto* doc = new AegisubDocument;
 		doc->file = std::make_unique<AssFile>();
 		create_default_document(*doc->file);
+		// 栈底压入初始撤销点（源码 Load/Close 路径 Commit("", COMMIT_NEW)）：
+		// 缺失会让首次提交成为伪栈底，canUndo 恒 false、首条编辑不可撤销
+		doc->undo_stack.push_back(make_entry(*doc, ""));
 		return reinterpret_cast<aegisub_document_t>(doc);
 	} catch (std::exception const& e) {
 		set_error(e.what());
@@ -1011,11 +1060,8 @@ int32_t aegisub_document_open(aegisub_document_t document, const uint8_t* data, 
 		if (doc->file->Events.empty()) doc->file->Events.push_back(*new AssDialogue);
 		doc->undo_stack.clear();
 		doc->redo_stack.clear();
-		doc->undo_labels.clear();
-		doc->redo_labels.clear();
 		// 栈底压入初始状态（源码加载路径 Commit("", COMMIT_NEW) 建立首个撤销点）
-		doc->undo_stack.push_back(clone_file(*doc->file));
-		doc->undo_labels.push_back("");
+		doc->undo_stack.push_back(make_entry(*doc, ""));
 		doc->coalescable = false;
 		doc->amend_label.clear();
 		doc->amend_target.clear();
@@ -1071,24 +1117,17 @@ int32_t aegisub_document_apply_json(aegisub_document_t document, const char* com
 		std::string target = commands.size() == 1 ? obj_get(commands.front(), "id") : std::string();
 		bool coalesce = doc->coalescable && doc->redo_stack.empty() && !doc->undo_stack.empty() &&
 		                label_str == doc->amend_label && target == doc->amend_target;
-		if (coalesce) {
-			doc->undo_stack.pop_back();
-			if (!doc->undo_labels.empty()) doc->undo_labels.pop_back();
-		}
+		if (coalesce) doc->undo_stack.pop_back();
 
 		apply_commands(*doc, commands);
 		++doc->revision;
 		// 提交后快照入栈：栈顶始终是当前状态
-		doc->undo_stack.push_back(clone_file(*doc->file));
-		doc->undo_labels.push_back(label_str);
+		doc->undo_stack.push_back(make_entry(*doc, label_str));
 		doc->amend_label = label_str;
 		doc->amend_target = target;
 		doc->coalescable = true;
 		int depth = std::max(doc->undo_depth, 2);
-		while (static_cast<int>(doc->undo_stack.size()) > depth) {
-			doc->undo_stack.erase(doc->undo_stack.begin());
-			doc->undo_labels.erase(doc->undo_labels.begin());
-		}
+		while (static_cast<int>(doc->undo_stack.size()) > depth) doc->undo_stack.erase(doc->undo_stack.begin());
 		return 0;
 	} catch (std::exception const& e) {
 		set_error(e.what());
@@ -1103,9 +1142,7 @@ int32_t aegisub_document_undo(aegisub_document_t document) {
 	// 栈顶（当前状态）移入 redo 栈，然后应用新的栈顶（上一个状态）
 	doc->redo_stack.push_back(std::move(doc->undo_stack.back()));
 	doc->undo_stack.pop_back();
-	doc->redo_labels.push_back(doc->undo_labels.back());
-	doc->undo_labels.pop_back();
-	doc->file = clone_file(*doc->undo_stack.back());
+	doc->file = clone_file(*doc->undo_stack.back().file);
 	doc->coalescable = false;
 	return 0;
 }
@@ -1115,10 +1152,62 @@ int32_t aegisub_document_redo(aegisub_document_t document) {
 	if (!doc || doc->redo_stack.empty()) return -1;
 	doc->undo_stack.push_back(std::move(doc->redo_stack.back()));
 	doc->redo_stack.pop_back();
-	doc->undo_labels.push_back(doc->redo_labels.back());
-	doc->redo_labels.pop_back();
-	doc->file = clone_file(*doc->undo_stack.back());
+	doc->file = clone_file(*doc->undo_stack.back().file);
 	doc->coalescable = false;
+	return 0;
+}
+
+int32_t aegisub_document_notify_selection(aegisub_document_t document, const char* selected_json, const char* active_id) {
+	try {
+		auto* doc = reinterpret_cast<AegisubDocument*>(document);
+		if (!doc) {
+			set_error("null document");
+			return -1;
+		}
+		if (doc->undo_stack.empty()) return 0;
+		// 选中/活动行变化实时修订栈顶条目
+		// （subs_controller.cpp:OnSelectionChanged/OnActiveLineChanged）
+		UndoEntry& top = doc->undo_stack.back();
+		top.selected.clear();
+		top.active = -1;
+		if (selected_json && *selected_json) {
+			std::istringstream ss(selected_json);
+			auto parsed = agi::json_util::parse(ss);
+			json::Array const& ids = static_cast<json::Array const&>(parsed);
+			for (auto const& id : ids) {
+				// 行 id 是十进制字符串（AssDialogue::Id 自 1 起递增）
+				std::string const text = json_str(id);
+				char* end = nullptr;
+				long value = std::strtol(text.c_str(), &end, 10);
+				if (end != text.c_str() && *end == '\0' && value >= 1)
+					top.selected.push_back(static_cast<int>(value));
+			}
+		}
+		if (active_id && *active_id) {
+			char* end = nullptr;
+			long value = std::strtol(active_id, &end, 10);
+			if (end != active_id && *end == '\0' && value >= 1) top.active = static_cast<int>(value);
+		}
+		return 0;
+	} catch (std::exception const& e) {
+		set_error(e.what());
+		return -1;
+	}
+}
+
+int32_t aegisub_document_notify_text_selection(aegisub_document_t document, int32_t pos, int32_t sel_start, int32_t sel_end) {
+	auto* doc = reinterpret_cast<AegisubDocument*>(document);
+	if (!doc) {
+		set_error("null document");
+		return -1;
+	}
+	if (doc->undo_stack.empty()) return 0;
+	// 编辑框文本选区变化实时修订栈顶条目
+	// （subs_controller.cpp:OnTextSelectionChanged → UndoInfo::UpdateTextSelection）
+	UndoEntry& top = doc->undo_stack.back();
+	top.text_pos = pos;
+	top.text_sel_start = sel_start;
+	top.text_sel_end = sel_end;
 	return 0;
 }
 
@@ -1223,19 +1312,14 @@ int32_t aegisub_document_replace_all(aegisub_document_t document, const char* se
 		}
 		if (replaced > 0) {
 			// 替换成功才算一次提交（search_replace_engine.cpp:Commit(_("replace"))）
-			doc->undo_stack.push_back(clone_file(*doc->file));
-			doc->undo_labels.push_back("replace");
+			doc->undo_stack.push_back(make_entry(*doc, "replace"));
 			doc->amend_label = "replace";
 			doc->amend_target.clear();
 			doc->coalescable = true;
 			doc->redo_stack.clear();
-			doc->redo_labels.clear();
 			++doc->revision;
 			int depth = std::max(doc->undo_depth, 2);
-			while (static_cast<int>(doc->undo_stack.size()) > depth) {
-				doc->undo_stack.erase(doc->undo_stack.begin());
-				doc->undo_labels.erase(doc->undo_labels.begin());
-			}
+			while (static_cast<int>(doc->undo_stack.size()) > depth) doc->undo_stack.erase(doc->undo_stack.begin());
 		}
 		return replaced;
 	} catch (std::exception const& e) {

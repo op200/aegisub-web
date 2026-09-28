@@ -14,6 +14,11 @@ import type {
 interface HistoryEntry {
   label: string
   document: SubtitleDocument
+  /** 选中/活动行快照（UndoInfo 语义；cue id 跨快照稳定，可跨版本定位等价行） */
+  selected: string[]
+  activeId: string | null
+  /** 编辑框文本选区快照（UndoInfo pos/sel_start/sel_end）：UI 实时上报修订，Undo/Redo 后恢复 */
+  textSelection: { pos: number; start: number; end: number }
 }
 
 export class TypeScriptCoreRuntime {
@@ -36,7 +41,15 @@ export class TypeScriptCoreRuntime {
 
   /** 栈底压入初始状态（源码加载路径 Commit("", COMMIT_NEW)） */
   private resetHistory(): void {
-    this.undoStack = [{ label: '', document: structuredClone(this.document) }]
+    this.undoStack = [
+      {
+        label: '',
+        document: structuredClone(this.document),
+        selected: [],
+        activeId: null,
+        textSelection: { pos: 0, start: 0, end: 0 },
+      },
+    ]
     this.redoStack = []
     this.coalescable = false
     this.amendLabel = ''
@@ -76,8 +89,16 @@ export class TypeScriptCoreRuntime {
 
     for (const command of commands) this.applyCommand(command)
     this.document.revision += 1
-    // 提交后快照入栈：栈顶始终是当前状态
-    this.undoStack.push({ label, document: structuredClone(this.document) })
+    // 提交后快照入栈：栈顶始终是当前状态；新条目携带提交时的选中/活动行与文本选区
+    // （源码 OnCommit 用当前选中集/文本选区初始化 UndoInfo，此后 notify* 持续修订栈顶）
+    const previous = this.undoStack.at(-1)
+    this.undoStack.push({
+      label,
+      document: structuredClone(this.document),
+      selected: previous ? [...previous.selected] : [],
+      activeId: previous?.activeId ?? null,
+      textSelection: previous ? { ...previous.textSelection } : { pos: 0, start: 0, end: 0 },
+    })
     this.amendLabel = label
     this.amendTarget = target
     this.coalescable = true
@@ -95,6 +116,21 @@ export class TypeScriptCoreRuntime {
   /** 保存后下一次提交不再与保存前合并（subs_controller.cpp saved_commit_id 语义） */
   markSaved(): void {
     this.coalescable = false
+  }
+
+  /** 选中/活动行变化实时修订栈顶条目（subs_controller.cpp:OnSelectionChanged/OnActiveLineChanged） */
+  notifySelection(ids: string[], activeId: string | null): void {
+    const top = this.undoStack.at(-1)
+    if (!top) return
+    top.selected = [...ids]
+    top.activeId = activeId
+  }
+
+  /** 编辑框文本选区变化实时修订栈顶条目（subs_controller.cpp:OnTextSelectionChanged） */
+  notifyTextSelection(pos: number, start: number, end: number): void {
+    const top = this.undoStack.at(-1)
+    if (!top) return
+    top.textSelection = { pos, start, end }
   }
 
   undo(): CoreState {
@@ -174,7 +210,14 @@ export class TypeScriptCoreRuntime {
         cue[field] = value.slice(0, match.start) + replacement + value.slice(match.end)
     }
     // 提交后快照入栈（search_replace_engine.cpp:Commit(_("replace"))）
-    this.undoStack.push({ label: 'replace', document: structuredClone(this.document) })
+    const previous = this.undoStack.at(-1)
+    this.undoStack.push({
+      label: 'replace',
+      document: structuredClone(this.document),
+      selected: previous ? [...previous.selected] : [],
+      activeId: previous?.activeId ?? null,
+      textSelection: previous ? { ...previous.textSelection } : { pos: 0, start: 0, end: 0 },
+    })
     this.amendLabel = 'replace'
     this.amendTarget = ''
     this.coalescable = true
@@ -192,6 +235,9 @@ export class TypeScriptCoreRuntime {
       canRedo: this.redoStack.length > 0,
       undoLabel: this.undoStack.at(-1)?.label ?? '',
       redoLabel: this.redoStack.at(-1)?.label ?? '',
+      selected: [...(this.undoStack.at(-1)?.selected ?? [])],
+      activeId: this.undoStack.at(-1)?.activeId ?? null,
+      textSelection: { ...(this.undoStack.at(-1)?.textSelection ?? { pos: 0, start: 0, end: 0 }) },
       runtime: 'typescript',
     }
   }

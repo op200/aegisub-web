@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { RecentLists } from '../../storage/recentStore'
 import { commandIcon } from '../aegisubIcons'
 import { getAegisubMenus, groupMacroMenuItems } from '../aegisubMenus'
+import { COMMAND_REGISTRY } from '../commandRegistry'
 import { COMMANDS, primaryShortcut, type MenuItemDefinition } from '../commands'
 import { t, tFmt, tPlain, useLocaleVersion } from '../i18n'
 
@@ -71,10 +72,19 @@ export function MenuBar({
     setOpenSubmenu(null)
   }
 
-  // 菜单项图标（menu.cpp SetBitmap(co->Icon())：命令带 16px 位图图标；无图标处空占位保持对齐）
-  const renderIcon = (command?: string) => {
-    const icon = command ? commandIcon(command) : undefined
-    return icon ? <img className="menu-icon" src={icon} alt="" /> : <span className="menu-icon" />
+  // 菜单左侧共用槽位（menu.cpp：仅 wxITEM_NORMAL 项 SetBitmap(co->Icon())）：
+  // 选中→勾选标记（toggle/radio 在源码只有勾选标记）；可勾选但未选中→留空；
+  // 其余→命令图标。图标与勾选标记占同一列，图标左侧没有额外的勾选列宽
+  const renderGutter = (command?: string, checked = false) => {
+    if (checked)
+      return (
+        <span className="menu-gutter">
+          <Check size={13} />
+        </span>
+      )
+    const checkable = Boolean(command && COMMAND_REGISTRY[command]?.checked)
+    const icon = command && !checkable ? commandIcon(command) : undefined
+    return <span className="menu-gutter">{icon ? <img src={icon} alt="" /> : null}</span>
   }
 
   const renderItem = (item: MenuItemDefinition, key: string) => {
@@ -100,8 +110,7 @@ export function MenuBar({
           key={key}
           onPointerEnter={() => setOpenSubmenu(submenuId)}
         >
-          <span className="menu-check" />
-          {renderIcon()}
+          {renderGutter()}
           <span className="menu-label">{item.label ?? 'Recent'}</span>
           <span />
           <ChevronRight size={13} />
@@ -129,8 +138,7 @@ export function MenuBar({
           key={key}
           onPointerEnter={() => setOpenSubmenu(item.submenu!.id)}
         >
-          <span className="menu-check" />
-          {renderIcon()}
+          {renderGutter()}
           <span className="menu-label">{item.submenu.label}</span>
           <span />
           <ChevronRight size={13} />
@@ -148,8 +156,7 @@ export function MenuBar({
     if (!item.command)
       return (
         <button className="menu-item" role="menuitem" disabled key={key}>
-          <span className="menu-check" />
-          {renderIcon()}
+          {renderGutter()}
           <span className="menu-label">{item.label}</span>
         </button>
       )
@@ -181,8 +188,7 @@ export function MenuBar({
           onCommand(item.command!)
         }}
       >
-        <span className="menu-check">{checked ? <Check size={13} /> : null}</span>
-        {renderIcon(item.command)}
+        {renderGutter(item.command, checked)}
         <span className="menu-label">{label}</span>
         <span className="menu-shortcut">{primaryShortcut(item.command)}</span>
         <span />

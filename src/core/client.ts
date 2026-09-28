@@ -100,6 +100,19 @@ export class CoreClient {
   redo(): Promise<CoreState> {
     return this.request<CoreState>({ method: 'redo' })
   }
+  /** 选中/活动行实时同步核心：修订撤销栈顶条目（fire-and-forget，无响应） */
+  notifySelection(ids: string[], activeId: string | null): void {
+    this.worker.postMessage({ method: 'notifySelection', ids, activeId } satisfies CoreRequest)
+  }
+  /** 编辑框文本选区实时同步核心：修订撤销栈顶条目（fire-and-forget，无响应） */
+  notifyTextSelection(pos: number, selStart: number, selEnd: number): void {
+    this.worker.postMessage({
+      method: 'notifyTextSelection',
+      pos,
+      selStart,
+      selEnd,
+    } satisfies CoreRequest)
+  }
   export(format?: SubtitleFormat): Promise<Uint8Array> {
     return this.request<Uint8Array>({ method: 'export', format })
   }

@@ -85,6 +85,18 @@ export interface CoreState {
   canRedo: boolean
   undoLabel: string
   redoLabel: string
+  /**
+   * 选中/活动行快照：随 undo/redo 恢复（subs_controller.cpp:Apply → SetSelectionAndActive）；
+   * apply/state 响应中仅为核心侧镜像（UI 仍是选中状态的属主），不用于驱动 UI
+   */
+  selected: string[]
+  activeId: string | null
+  /**
+   * 编辑框文本选区快照（subs_controller.cpp:UndoInfo pos/sel_start/sel_end）：
+   * 随 undo/redo 恢复（Apply → SetInsertionPoint + SetSelection），UI 据此设置
+   * textarea 选区/光标；pos 为插入点，start/end 为选区边界
+   */
+  textSelection: { pos: number; start: number; end: number }
   runtime: 'typescript' | 'wasm'
 }
 

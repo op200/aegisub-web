@@ -44,6 +44,10 @@ export function rafThrottle(): RafThrottled {
  * 在途完成后仅执行最后一个目标——与源码 async_video_provider.cpp 的
  * RequestFrame（`++version` 覆盖请求、worker 发现 req_version < version 即
  * return）同一语义。
+ *
+ * 前提：task 必须返回代表管线完成的 promise（如 apply 的返回值）。包装函数若
+ * 吞掉 promise 同步返回，通道会把每次调用都视为「立即完成」，中间目标不再被
+ * 丢弃，下游 FIFO 排队后松手回放。
  */
 export interface SerialLatest<A extends unknown[]> {
   /** 记录最新目标；管线空闲则立即执行，否则覆盖待发槽位（中间目标丢弃） */

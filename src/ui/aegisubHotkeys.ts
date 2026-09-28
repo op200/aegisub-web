@@ -121,6 +121,19 @@ export function aegisubPrimaryShortcut(
 }
 
 /**
+ * 源码 hotkey::get_hotkey_str_first → Hotkey::GetHotkey：
+ * 上下文精确命中优先，否则回退 Default，最后 Always（用于助手对话框的 Keys 栏）。
+ */
+export function aegisubHotkeyStrFirst(context: ShortcutContext, commandId: string): string {
+  return (
+    activeMap[context]?.[commandId]?.[0] ??
+    activeMap.Default?.[commandId]?.[0] ??
+    activeMap.Always?.[commandId]?.[0] ??
+    ''
+  )
+}
+
+/**
  * 焦点上下文的快捷键查找链（对齐源码 wx 按键事件沿窗口树向上传播）：
  *
  * - base_grid.cpp OnCharHook：先查 "Subtitle Grid"，非方向键再查 "Audio"

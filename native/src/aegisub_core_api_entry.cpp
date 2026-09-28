@@ -16,6 +16,8 @@ __attribute__((used)) static const void* const kAegisubAbiRefs[] = {
     reinterpret_cast<const void*>(&aegisub_document_export),
     reinterpret_cast<const void*>(&aegisub_document_mark_saved),
     reinterpret_cast<const void*>(&aegisub_document_configure),
+    reinterpret_cast<const void*>(&aegisub_document_notify_selection),
+    reinterpret_cast<const void*>(&aegisub_document_notify_text_selection),
     reinterpret_cast<const void*>(&aegisub_core_free),
     reinterpret_cast<const void*>(&aegisub_core_last_error),
 };

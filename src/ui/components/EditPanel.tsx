@@ -82,6 +82,20 @@ function stripPlainText(text: string) {
   return [...text.matchAll(/\{[^}]*\}/g)].map(([block]) => block).join('')
 }
 
+/** 编辑框选区变化：写入模块级光标状态并上报核心
+ *  （subs_controller.cpp:OnTextSelectionChanged → 修订撤销栈顶条目）；pos 为光标端 */
+function reportTextSelection(
+  element: HTMLTextAreaElement,
+  onTextSelection: (pos: number, start: number, end: number) => void,
+) {
+  editCursorState.selectionStart = element.selectionStart
+  editCursorState.selectionEnd = element.selectionEnd
+  const start = element.selectionStart
+  const end = element.selectionEnd
+  // 反向选区（backward）光标在 start，否则在 end
+  onTextSelection(element.selectionDirection === 'backward' ? start : end, start, end)
+}
+
 /** 静态子树（Comment/Style/Actor/Effect、时间/边距、格式工具栏）拖动期间不重建：
  *  subs_edit_box.cpp OnCommit 对 COMMIT_DIAG_TEXT 只执行 edit_ctrl->SetTextTo +
  *  UpdateCharacterCount，其余控件一律不刷新；这里用 memo 复现该语义。
@@ -620,6 +634,12 @@ interface EditPanelProps {
   isCommandEnabled: (id: string) => boolean
   /** Edit 按钮：直接打开当前行样式的编辑对话框（源码 DialogStyleEditor） */
   onEditStyle: () => void
+  /** 文本选区实时上报核心（subs_controller.cpp:OnTextSelectionChanged；修订撤销栈顶条目） */
+  onTextSelection: (pos: number, start: number, end: number) => void
+  /** 核心撤销栈顶条目的文本选区快照（UndoInfo pos/sel_start/sel_end） */
+  textSelection: { pos: number; start: number; end: number }
+  /** 撤销/重做跳转计数：变化时强制回写编辑框文本并按快照恢复选区/光标 */
+  historyNonce: number
 }
 
 export function EditPanel({
@@ -634,6 +654,9 @@ export function EditPanel({
   onCommand,
   isCommandEnabled,
   onEditStyle,
+  onTextSelection,
+  textSelection,
+  historyNonce,
 }: EditPanelProps) {
   const [draft, setDraft] = useState<SubtitleCue | null>(cue ? structuredClone(cue) : null)
   // Show Original 持久化（subs_edit_box.cpp OnSplit 写 OPT_SET "Subtitle/Show Original"）
@@ -673,6 +696,11 @@ export function EditPanel({
   }, [textMenu])
   // cue 变化时重置草稿（React 官方"props 变化调整 state"模式：渲染期更新）
   const [prevCue, setPrevCue] = useState<SubtitleCue | null>(cue)
+  // 撤销/重做跳转：此时以核心文本全量回写草稿（对齐 subs_edit_box.cpp UpdateFields 的
+  // edit_ctrl->SetTextTo(line->Text) 路径），焦点字段守卫不得吞掉跳转后的文本
+  const [prevHistoryNonce, setPrevHistoryNonce] = useState(historyNonce)
+  const historyJump = historyNonce !== prevHistoryNonce
+  if (historyJump) setPrevHistoryNonce(historyNonce)
   if (cue !== prevCue) {
     setPrevCue(cue)
     if (cue?.id !== prevCue?.id) {
@@ -684,8 +712,8 @@ export function EditPanel({
       if (!cue) return null
       if (!old || cue.id !== old.id) return structuredClone(cue)
       // apply 回写晚于下一次按键时，回写中间值会在渲染期覆盖本地草稿吞掉输入：
-      // 焦点字段以本地草稿为准（同行内）
-      if (!editingField) return structuredClone(cue)
+      // 焦点字段以本地草稿为准（同行内）；撤销/重做跳转例外（源码始终 SetTextTo）
+      if (!editingField || historyJump) return structuredClone(cue)
       const merged = structuredClone(cue)
       ;(merged as unknown as Record<string, unknown>)[editingField] = (
         old as unknown as Record<string, unknown>
@@ -733,6 +761,21 @@ export function EditPanel({
     }
   })
   /* oxlint-enable react/immutability, react-hooks/exhaustive-deps */
+  // 撤销/重做后恢复编辑框文本选区与光标（subs_controller.cpp:Apply → SetInsertionPoint(pos)
+  // + SetSelection(sel_start, sel_end)）；以 DOM 实际文本长度钳制，光标端决定选区方向
+  const historyNonceRef = useRef(historyNonce)
+  useLayoutEffect(() => {
+    if (historyNonceRef.current === historyNonce) return
+    historyNonceRef.current = historyNonce
+    const editor = editorRef.current
+    if (!editor) return
+    const clamp = (value: number) => Math.max(0, Math.min(value, editor.value.length))
+    const start = clamp(textSelection.start)
+    const end = clamp(textSelection.end)
+    const pos = clamp(textSelection.pos)
+    editor.setSelectionRange(start, end, pos === start && start !== end ? 'backward' : 'forward')
+    reportTextSelection(editor, onTextSelection)
+  }, [historyNonce, textSelection, onTextSelection])
   if (!cue || !draft)
     return <section className="edit-panel empty-edit">{tPlain('No line selected')}</section>
 
@@ -968,9 +1011,16 @@ export function EditPanel({
     commitText(text, 'set font')
     requestAnimationFrame(() => editor?.setSelectionRange(selStart + shift, selEnd + shift))
   }
-  const highlighted = tokenizeAss(draft.text)
+  // subs_edit_ctrl.cpp UpdateStyle：仅「Comment 且 Effect 以 template 开头」的行启用卡拉OK模板词法
+  // （源码 boost::istarts_with(Effect, "template")，模板行才对 !表达式! 与 $变量 上色）
+  const templateLine = !!(draft.comment && draft.effect.toLowerCase().startsWith('template'))
+  const highlighted = tokenizeAss(draft.text, templateLine)
   const syntaxColors = getSyntaxColors(darkTheme)
   const syntaxHighlight = getOptionBool('Subtitle/Highlight/Syntax')
+  // 关闭语法高亮时源码整段用 NORMAL 样式（SetStyling(line_text.size(), 0)）
+  const highlightSegments = syntaxHighlight
+    ? highlighted
+    : [{ text: draft.text, type: 'NORMAL' as const }]
   // 字符计数（Subtitle/Character Limit 选项；超限红底，UpdateCharacterCount 只显示数字）
   const characterCount = longestVisibleLine(
     draft.text,
@@ -987,10 +1037,8 @@ export function EditPanel({
   // 帧号模式（timeedit_ctrl SetByFrame）：Start=FrameAtTime(START)，End=FrameAtTime(END)，时长含首帧
   const frameTiming = frameMode && frameRate.isLoaded()
   const frameRateLoaded = frameRate.isLoaded()
-  const trackCursor = (element: HTMLTextAreaElement) => {
-    editCursorState.selectionStart = element.selectionStart
-    editCursorState.selectionEnd = element.selectionEnd
-  }
+  const trackCursor = (element: HTMLTextAreaElement) =>
+    reportTextSelection(element, onTextSelection)
   const pasteIntoEditor = async () => {
     const editor = editorRef.current
     if (!editor) return
@@ -1094,22 +1142,22 @@ export function EditPanel({
           aria-hidden="true"
           style={editorStyle}
         >
-          {(syntaxHighlight
-            ? highlighted
-            : highlighted.filter((segment) => segment.type === 'NORMAL')
-          ).map((segment, index) => {
+          {highlightSegments.map((segment, index) => {
             const style = syntaxColors[segment.type]
             return (
               <span
                 key={index}
-                style={
+                style={{
+                  color: style.color,
                   // Bold 对齐源码 Colour/Subtitle/Syntax/Bold/* 选项，但用 text-stroke
                   // 模拟加粗：fontWeight 会改变字形宽度，导致高亮层与 textarea 纯文本
                   // 换行位置/光标位置错位（源码 Scintilla 单控件无此问题）
-                  style.bold
-                    ? { color: style.color, WebkitTextStroke: '0.45px currentColor' }
-                    : { color: style.color }
-                }
+                  ...(style.bold ? { WebkitTextStroke: '0.45px currentColor' } : null),
+                  // 绘图端点坐标下划线（Underline/Drawing Endpoint，源码 StyleSetUnderline）
+                  ...(style.underline ? { textDecoration: 'underline' } : null),
+                  // Background/* 为颜色类型时的底纹（默认仅 Error 有淡红底）
+                  ...(style.background ? { backgroundColor: style.background } : null),
+                }}
               >
                 {segment.text}
               </span>

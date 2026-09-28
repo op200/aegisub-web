@@ -33,6 +33,16 @@ export type CoreRequest =
   | { id?: number; method: 'configure'; config: { undoLevels: number } }
   // 手动保存成功后通知核心：下一次提交不再与保存前合并（无响应，fire-and-forget）
   | { id?: number; method: 'markSaved' }
+  // 选中/活动行实时同步核心：修订撤销栈顶条目（OnSelectionChanged 语义，无响应，fire-and-forget）
+  | { id?: number; method: 'notifySelection'; ids: string[]; activeId: string | null }
+  // 编辑框文本选区实时同步核心：修订撤销栈顶条目（OnTextSelectionChanged 语义，无响应）
+  | {
+      id?: number
+      method: 'notifyTextSelection'
+      pos: number
+      selStart: number
+      selEnd: number
+    }
 
 export interface CoreResponse {
   id: number

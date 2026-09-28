@@ -1,5 +1,5 @@
 import { X } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import {
   getOptionBool,
@@ -8,14 +8,39 @@ import {
   getOptionString,
   setOption,
 } from '../../config/options'
-import { formatEditorTime, formatVideoTime } from '../../core/time'
+import {
+  commitDialogueBlock,
+  isBadBlock,
+  parseDialogueBlocks,
+  stepDialogueBlock,
+  type DialogueBlock,
+} from '../../core/dialogueBlocks'
+import {
+  MATRIX_OPTIONS,
+  RESAMPLE_AR_MANUAL,
+  RESAMPLE_AR_STRETCH,
+  getScriptInfo,
+  getScriptResolution,
+  matrixOptionFromHeader,
+  parseYcbcrHeader,
+  resampleCommands,
+  ycbcrHeaderToEffective,
+} from '../../core/resample'
+import { formatEditorTime, formatVideoTime, parseEditorTime } from '../../core/time'
 import { processTiming } from '../../core/timingProcessor'
-import type { CoreCommand, SubtitleCue, SubtitleStyle } from '../../core/types'
+import type { CoreCommand, SubtitleCue, SubtitleDocument, SubtitleStyle } from '../../core/types'
 import { Framerate } from '../../core/vfr'
 import type { DummyVideoOptions, MediaSource } from '../../platform/types'
+import {
+  clearShiftHistoryFile,
+  loadShiftHistoryFile,
+  saveShiftHistoryFile,
+} from '../../storage/configStore'
 import { listFontFaces } from '../../storage/fontStore'
+import { aegisubHotkeyStrFirst } from '../aegisubHotkeys'
 import { aegisubIconUrl } from '../aegisubIcons'
 import { cssColorToHex, hexToCssColor } from '../color'
+import { commandForShortcut, shortcutFromKeyboardEvent } from '../commands'
 import {
   availableLocales,
   detectDefaultLocale,
@@ -26,6 +51,7 @@ import {
   t,
   tFmt,
   tPlain,
+  tPlural,
 } from '../i18n'
 
 interface DialogProps {
@@ -98,67 +124,211 @@ export function Dialog({ title, onClose, children, footer }: DialogProps) {
 // ---------------------------------------------------------------------------
 // Shift Times
 // ---------------------------------------------------------------------------
-export interface ShiftTimesOptions {
-  byMs: boolean
-  amount: number
-  backward: boolean
-  selectedOnly: boolean
+
+/** ?user/shift_history.json 条目（dialog_shift_times.cpp SaveHistory 的 JSON 键名） */
+interface ShiftHistoryEntry {
+  filename: string
+  'is by time': boolean
+  'is backward': boolean
+  amount: string
+  fields: number
+  mode: number
+  selection: { start: number; end: number }[]
+}
+
+/** get_history_string：文件, 幅度 方向, 字段, 行范围 */
+function shiftHistoryLabel(entry: ShiftHistoryEntry) {
+  const filename = entry.filename || tPlain('unsaved')
+  // 帧模式幅度显示为 "N frames"（fmt_plural：n==1 取单数条目）
+  let amount = entry.amount
+  if (!entry['is by time']) {
+    const count = Number.parseInt(entry.amount, 10) || 0
+    const plural = tPlural('1 frame', '%s frames', count)
+    amount = plural.includes('%s') ? plural.replace('%s', entry.amount) : plural
+  }
+  const direction = entry['is backward'] ? tPlain('backward') : tPlain('forward')
+  const fields = entry.fields === 0 ? tPlain('s+e') : entry.fields === 1 ? tPlain('s') : tPlain('e')
+  const selection = entry.selection ?? []
+  let lines = ''
+  if (entry.mode === 0) lines = tPlain('all')
+  else if (entry.mode === 2) {
+    if (selection.length) lines = tFmt('from %d onward', selection[0].start)
+  } else {
+    lines =
+      tPlain('sel ') +
+      selection
+        .map((range) =>
+          range.start === range.end ? `${range.start}` : `${range.start}-${range.end}`,
+        )
+        .join(';')
+  }
+  return `${filename}, ${amount} ${direction}, ${fields}, ${lines}`
+}
+
+/** wxTextCtrl 的 ToLong 语义：整串可解析才取整，否则为 0（Process 不校验输入） */
+function parseShiftFrames(text: string) {
+  return /^-?\d+$/.test(text.trim()) ? Number.parseInt(text.trim(), 10) : 0
+}
+
+/** Process 的 Shift()：按时间直接相加；按帧经帧率映射（START/END 取整规则不同） */
+function shiftCueTime(
+  initialMs: number,
+  shift: number,
+  byTime: boolean,
+  kind: 'start' | 'end',
+  frameRate: Framerate,
+) {
+  if (byTime) return initialMs + shift
+  return frameRate.timeAtFrame(shift + frameRate.frameAtTime(initialMs, kind), kind)
 }
 
 interface ShiftTimesDialogProps {
   cues: SubtitleCue[]
   selectedIds: string[]
+  /** 字幕文件名（SaveHistory 记录；subs_controller.cpp:Filename().filename()） */
+  fileName: string
+  /** 项目帧率（project->Timecodes()）：未加载时帧模式禁用（OnTimecodesLoaded） */
+  frameRate: Framerate
   onClose: () => void
   onApply: (commands: CoreCommand[], label: string) => void
 }
 
-export function ShiftTimesDialog({ cues, selectedIds, onClose, onApply }: ShiftTimesDialogProps) {
-  // 初值来自 Options（dialog_shift_times.cpp 构造时 OPT_GET；Affect 1=Selected rows，2=onward 归入 selected）
-  const [byMs, setByMs] = useState(() => getOptionBool('Tool/Shift Times/ByTime'))
-  const [amount, setAmount] = useState(() => getOptionInt('Tool/Shift Times/Time'))
-  const [frames, setFrames] = useState(() => getOptionInt('Tool/Shift Times/Frames'))
-  const [backward, setBackward] = useState(() => !getOptionBool('Tool/Shift Times/Direction'))
-  const [selectedOnly, setSelectedOnly] = useState(
-    () => getOptionInt('Tool/Shift Times/Affect') > 0,
+export function ShiftTimesDialog({
+  cues,
+  selectedIds,
+  fileName,
+  frameRate,
+  onClose,
+  onApply,
+}: ShiftTimesDialogProps) {
+  const framesEnabled = frameRate.isLoaded()
+  const hasSelection = selectedIds.length > 0
+  // 初值来自 Options（dialog_shift_times.cpp 构造 OPT_GET；帧率未加载时保持在时间模式）
+  const [byTime, setByTime] = useState(
+    () => getOptionBool('Tool/Shift Times/ByTime') || !frameRate.isLoaded(),
   )
+  const [amountText, setAmountText] = useState(() =>
+    formatEditorTime(getOptionInt('Tool/Shift Times/Time')),
+  )
+  const [framesText, setFramesText] = useState(() =>
+    String(getOptionInt('Tool/Shift Times/Frames')),
+  )
+  const [type, setType] = useState(() => getOptionInt('Tool/Shift Times/Type'))
+  const [mode, setMode] = useState(() => getOptionInt('Tool/Shift Times/Affect'))
+  const [backward, setBackward] = useState(() => getOptionBool('Tool/Shift Times/Direction'))
+  const [history, setHistory] = useState<ShiftHistoryEntry[]>([])
+
+  // 帧率未加载时强制时间模式（OnTimecodesLoaded：shift_by_time->SetValue(true)），
+  // 无选中行时强制 All rows（OnSelectedSetChanged）：由状态派生，避免 effect 内 setState
+  const activeByTime = framesEnabled ? byTime : true
+  const activeMode = hasSelection ? mode : 0
+  // LoadHistory：读取 ?user/shift_history.json
+  useEffect(() => {
+    void (async () => {
+      const stored = await loadShiftHistoryFile()
+      if (Array.isArray(stored)) setHistory(stored as ShiftHistoryEntry[])
+    })()
+  }, [])
 
   // 关闭时写回 Options（dialog_shift_times.cpp 析构 OPT_SET：无论 OK/Cancel 都保存）
   const latestRef = useRef({
-    byMs: true,
-    amount: 0,
-    frames: 0,
-    backward: false,
-    selectedOnly: false,
+    byTime: activeByTime,
+    amountText,
+    framesText,
+    type,
+    mode: activeMode,
+    backward,
   })
   useEffect(() => {
-    latestRef.current = { byMs, amount, frames, backward, selectedOnly }
+    latestRef.current = {
+      byTime: activeByTime,
+      amountText,
+      framesText,
+      type,
+      mode: activeMode,
+      backward,
+    }
   })
   useEffect(
     () => () => {
       const value = latestRef.current
-      setOption('Tool/Shift Times/Time', Math.round(value.amount) || 0)
-      setOption('Tool/Shift Times/Frames', Math.round(value.frames) || 0)
-      setOption('Tool/Shift Times/ByTime', value.byMs)
-      setOption('Tool/Shift Times/Direction', !value.backward)
-      setOption('Tool/Shift Times/Affect', value.selectedOnly ? 1 : 0)
+      setOption('Tool/Shift Times/Time', parseEditorTime(value.amountText) ?? 0)
+      setOption('Tool/Shift Times/Frames', parseShiftFrames(value.framesText))
+      setOption('Tool/Shift Times/ByTime', value.byTime)
+      setOption('Tool/Shift Times/Type', value.type)
+      setOption('Tool/Shift Times/Affect', value.mode)
+      setOption('Tool/Shift Times/Direction', value.backward)
     },
     [],
   )
 
+  /** 双击历史条目：回填幅度/方向/字段/范围（OnHistoryClick；帧率未加载时不切帧模式） */
+  const loadHistoryEntry = (entry: ShiftHistoryEntry) => {
+    if (entry['is by time']) {
+      setAmountText(formatEditorTime(parseEditorTime(entry.amount) ?? 0))
+      setByTime(true)
+    } else {
+      setFramesText(entry.amount)
+      if (framesEnabled) setByTime(false)
+    }
+    setBackward(entry['is backward'])
+    setType(entry.fields)
+    setMode(entry.mode)
+  }
+
+  const clearHistory = () => {
+    setHistory([])
+    void clearShiftHistoryFile()
+  }
+
   const apply = () => {
-    const shift = byMs ? amount : frames * 10 // 近似 10ms/帧（Aegisub 默认帧率处理）
-    const signed = backward ? -shift : shift
-    if (!signed) return
+    const start = type !== 2
+    const end = type !== 1
+    const magnitude = activeByTime
+      ? (parseEditorTime(amountText) ?? 0)
+      : parseShiftFrames(framesText)
+    // Process：时间模式零位移不提交直接关闭；帧模式 0 帧也提交（源码 Commit 无条件建立撤销点）
+    if (activeByTime && magnitude === 0) {
+      onClose()
+      return
+    }
+    const shift = backward ? -magnitude : magnitude
     const selSet = new Set(selectedIds)
-    const targets = cues.filter((cue) => !selectedOnly || selSet.has(cue.id))
-    const commands: CoreCommand[] = targets.map((cue) => ({
-      type: 'updateCue',
-      id: cue.id,
-      patch: {
-        startMs: Math.max(0, cue.startMs + signed),
-        endMs: Math.max(0, cue.endMs + signed),
-      },
-    }))
+    const commands: CoreCommand[] = []
+    // 记录被平移的行块（历史条目用；0 基下标 +1 与源码 Row 语义一致）
+    const blocks: { start: number; end: number }[] = []
+    let blockStart = 0
+    cues.forEach((cue, index) => {
+      if (!selSet.has(cue.id)) {
+        if (blockStart) {
+          blocks.push({ start: blockStart, end: index })
+          blockStart = 0
+        }
+        if (activeMode === 1) return
+        if (activeMode === 2 && blocks.length === 0) return
+      } else if (!blockStart) blockStart = index + 1
+
+      const patch: Partial<Omit<SubtitleCue, 'id'>> = {}
+      if (start) patch.startMs = shiftCueTime(cue.startMs, shift, activeByTime, 'start', frameRate)
+      if (end) patch.endMs = shiftCueTime(cue.endMs, shift, activeByTime, 'end', frameRate)
+      commands.push({ type: 'updateCue', id: cue.id, patch })
+    })
+    if (blockStart) blocks.push({ start: blockStart, end: cues.length })
+
+    // SaveHistory：新条目插入最前，上限 50
+    const entry: ShiftHistoryEntry = {
+      filename: fileName,
+      'is by time': activeByTime,
+      'is backward': backward,
+      amount: activeByTime ? formatEditorTime(magnitude) : framesText,
+      fields: type,
+      mode: activeMode,
+      selection: blocks,
+    }
+    const nextHistory = [entry, ...history].slice(0, 50)
+    setHistory(nextHistory)
+    void saveShiftHistoryFile(nextHistory)
+
     onApply(commands, 'shifting')
     onClose()
   }
@@ -174,58 +344,160 @@ export function ShiftTimesDialog({ cues, selectedIds, onClose, onApply }: ShiftT
         </>
       }
     >
-      <div className="dialog-fields">
-        <label>
-          {tPlain('Preset')}
-          <select
-            value={byMs ? 'ms' : 'frames'}
-            onChange={(event) => setByMs(event.target.value === 'ms')}
-          >
-            <option value="ms">{tPlain('Custom (milliseconds)')}</option>
-            <option value="frames">{tPlain('Custom (frames)')}</option>
-          </select>
-        </label>
-        {byMs ? (
-          <label>
-            {tPlain('Shift by (ms)')}
-            <input
-              type="number"
-              value={amount}
-              onChange={(event) => setAmount(Number(event.target.value))}
-              autoFocus
-            />
-          </label>
-        ) : (
-          <label>
-            {tPlain('Shift by (frames)')}
-            <input
-              type="number"
-              value={frames}
-              onChange={(event) => setFrames(Number(event.target.value))}
-              autoFocus
-            />
-          </label>
-        )}
-        <label>
-          {tPlain('Direction')}
-          <select
-            value={backward ? 'back' : 'forward'}
-            onChange={(event) => setBackward(event.target.value === 'back')}
-          >
-            <option value="forward">{tPlain('Forward')}</option>
-            <option value="back">{tPlain('Backward')}</option>
-          </select>
-        </label>
-        <label>
-          {tPlain('Apply to')}
-          <select
-            value={selectedOnly ? 'selected' : 'all'}
-            onChange={(event) => setSelectedOnly(event.target.value === 'selected')}
-          >
-            <option value="all">{tPlain('All lines')}</option>
-            <option value="selected">{tPlain('Selected lines only')}</option>
-          </select>
-        </label>
+      <div className="shift-times-body">
+        <div className="shift-times-left">
+          <fieldset className="dialog-fieldset">
+            <legend>{tPlain('Shift by')}</legend>
+            <div className="dialog-row">
+              <label className="dialog-check" title={tPlain('Shift by time')}>
+                <input
+                  type="radio"
+                  name="shift-by"
+                  checked={activeByTime}
+                  onChange={() => setByTime(true)}
+                />{' '}
+                {tPlain('Time: ')}
+              </label>
+              <input
+                className="shift-times-input"
+                value={amountText}
+                disabled={!activeByTime}
+                title={tPlain('Enter time in h:mm:ss.cs notation')}
+                onChange={(event) => setAmountText(event.target.value)}
+                onBlur={() => {
+                  const ms = parseEditorTime(amountText)
+                  if (ms !== null) setAmountText(formatEditorTime(ms))
+                }}
+                onKeyDown={(event) => {
+                  // shift_time->Bind(wxEVT_TEXT_ENTER)：时间框回车即提交
+                  if (event.key === 'Enter') apply()
+                }}
+              />
+            </div>
+            <div className="dialog-row">
+              <label className="dialog-check" title={tPlain('Shift by frames')}>
+                <input
+                  type="radio"
+                  name="shift-by"
+                  checked={!activeByTime}
+                  disabled={!framesEnabled}
+                  onChange={() => setByTime(false)}
+                />{' '}
+                {tPlain('Frames: ')}
+              </label>
+              <input
+                className="shift-times-input"
+                value={framesText}
+                disabled={activeByTime || !framesEnabled}
+                title={tPlain('Enter number of frames to shift by')}
+                onChange={(event) => setFramesText(event.target.value)}
+              />
+            </div>
+            <div className="dialog-row">
+              <label
+                className="dialog-check"
+                title={tPlain(
+                  'Shifts subs forward, making them appear later. Use if they are appearing too soon.',
+                )}
+              >
+                <input
+                  type="radio"
+                  name="shift-direction"
+                  checked={!backward}
+                  onChange={() => setBackward(false)}
+                />{' '}
+                {tPlain('Forward')}
+              </label>
+              <label
+                className="dialog-check"
+                title={tPlain(
+                  'Shifts subs backward, making them appear earlier. Use if they are appearing too late.',
+                )}
+              >
+                <input
+                  type="radio"
+                  name="shift-direction"
+                  checked={backward}
+                  onChange={() => setBackward(true)}
+                />{' '}
+                {tPlain('Backward')}
+              </label>
+            </div>
+          </fieldset>
+          <fieldset className="dialog-fieldset">
+            <legend>{tPlain('Affect')}</legend>
+            <label className="dialog-check">
+              <input
+                type="radio"
+                name="shift-affect"
+                checked={activeMode === 0}
+                onChange={() => setMode(0)}
+              />{' '}
+              {tPlain('All rows')}
+            </label>
+            <label className="dialog-check">
+              <input
+                type="radio"
+                name="shift-affect"
+                checked={activeMode === 1}
+                disabled={!hasSelection}
+                onChange={() => setMode(1)}
+              />{' '}
+              {tPlain('Selected rows')}
+            </label>
+            <label className="dialog-check">
+              <input
+                type="radio"
+                name="shift-affect"
+                checked={activeMode === 2}
+                disabled={!hasSelection}
+                onChange={() => setMode(2)}
+              />{' '}
+              {tPlain('Selection onward')}
+            </label>
+          </fieldset>
+          <fieldset className="dialog-fieldset">
+            <legend>{tPlain('Times')}</legend>
+            <label className="dialog-check">
+              <input
+                type="radio"
+                name="shift-fields"
+                checked={type === 0}
+                onChange={() => setType(0)}
+              />{' '}
+              {tPlain('Start and End times')}
+            </label>
+            <label className="dialog-check">
+              <input
+                type="radio"
+                name="shift-fields"
+                checked={type === 1}
+                onChange={() => setType(1)}
+              />{' '}
+              {tPlain('Start times only')}
+            </label>
+            <label className="dialog-check">
+              <input
+                type="radio"
+                name="shift-fields"
+                checked={type === 2}
+                onChange={() => setType(2)}
+              />{' '}
+              {tPlain('End times only')}
+            </label>
+          </fieldset>
+        </div>
+        <fieldset className="dialog-fieldset shift-times-history">
+          <legend>{tPlain('Load from history')}</legend>
+          <ul>
+            {history.map((entry, index) => (
+              <li key={index} onDoubleClick={() => loadHistoryEntry(entry)}>
+                {shiftHistoryLabel(entry)}
+              </li>
+            ))}
+          </ul>
+          <button onClick={clearHistory}>{tPlain('Clear')}</button>
+        </fieldset>
       </div>
     </Dialog>
   )
@@ -421,28 +693,158 @@ export function ScriptPropertiesDialog({
 }
 
 // ---------------------------------------------------------------------------
-// Styling Assistant（对应 Aegisub dialog_styling_assistant.cpp 的核心工作流）
+// Styling Assistant（dialog_styling_assistant.cpp DialogStyling）
 // ---------------------------------------------------------------------------
+
+/** 「Keys」栏 6 行（源码 add_hotkey 顺序：命令 id + 描述 msgid），末行两字面串 */
+const STYLING_ASSISTANT_KEYS: ReadonlyArray<readonly [string, string]> = [
+  ['tool/styling_assistant/commit', 'Accept changes'],
+  ['tool/styling_assistant/preview', 'Preview changes'],
+  ['grid/line/prev', 'Previous line'],
+  ['grid/line/next', 'Next line'],
+  ['video/play/line', 'Play video'],
+  ['audio/play/selection', 'Play audio'],
+]
+
+/** 源码 edit_line_copy/cut/paste 内部检查焦点：聚焦文本控件时走控件自身剪贴板操作 */
+const STYLING_NATIVE_TEXT_COMMANDS = new Set(['edit/line/cut', 'edit/line/copy', 'edit/line/paste'])
+
 interface StylingAssistantDialogProps {
   cue: SubtitleCue
+  /** c->ass->GetStyles()：文件顺序的全部样式名 */
   styles: SubtitleStyle[]
+  hasAudio: boolean
+  hasVideo: boolean
   onClose: () => void
-  onApply: (style: string, next: boolean) => void
-  onPrevious: () => void
-  onPlay: () => void
+  /** Commit：label "styling assistant"，COMMIT_DIAG_META（值按输入原样赋值） */
+  onApply: (id: string, style: string) => void
+  /** OnActiveLineChanged / OnActivate 的 JumpToTime(active_line->Start)（勾选 Seek 时） */
+  onSeekVideo: (timeMs: number) => void
+  /** hotkey::check 命中的其他上下文命令（导航/播放/撤销等，命中即消费） */
+  onCommand: (id: string) => void
 }
 
 export function StylingAssistantDialog({
   cue,
   styles,
+  hasAudio,
+  hasVideo,
   onClose,
   onApply,
-  onPrevious,
-  onPlay,
+  onSeekVideo,
+  onCommand,
 }: StylingAssistantDialogProps) {
-  const [style, setStyle] = useState(cue.style)
-  const commit = (next: boolean) => {
-    if (styles.some((item) => item.name === style)) onApply(style, next)
+  const [input, setInput] = useState({ value: cue.style, invalid: false })
+  const [listSelected, setListSelected] = useState(cue.style)
+  const [autoSeek, setAutoSeek] = useState(true)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const lastIdRef = useRef(cue.id)
+  /** 补全后待应用的选区（wx SetSelection(prefix.size(), style.size())） */
+  const pendingSelectionRef = useRef<[number, number] | null>(null)
+
+  // 每次编辑都写入新对象引用（React 同值时会跳过重渲染，导致选区不生效）
+  const applyEdit = (value: string, selection: [number, number] | null, invalid: boolean) => {
+    pendingSelectionRef.current = selection
+    setInput({ value, invalid })
+  }
+
+  // 源码 OnStyleBoxModified：前缀匹配列表顺序首个样式并补全（选中补全部分），无匹配标红
+  const applyAutocomplete = (value: string, cursor: number) => {
+    const prefix = value.slice(0, cursor).toLowerCase()
+    if (prefix === '') {
+      applyEdit(value, null, false)
+      return
+    }
+    const match = styles.find((item) => item.name.toLowerCase().startsWith(prefix))
+    if (match) applyEdit(match.name, [prefix.length, match.name.length], false)
+    else applyEdit(value, null, true)
+  }
+
+  /** 源码 OnActiveLineChanged：填充当前行样式名（全选）、列表选中、按需 Seek、回焦输入框 */
+  const loadLine = (line: SubtitleCue, seek: boolean) => {
+    applyEdit(line.style, [0, line.style.length], false)
+    // SetStringSelection：样式不在列表中时保持原选中（wx 行为）
+    if (styles.some((item) => item.name === line.style)) setListSelected(line.style)
+    if (seek && hasVideo) onSeekVideo(line.startMs)
+    inputRef.current?.focus()
+  }
+
+  /** 源码 Commit：GetStyle 大小写不敏感匹配，存在才提交；next 时执行 grid/line/next */
+  const commitValue = (value: string, next: boolean) => {
+    if (!styles.some((item) => item.name.toLowerCase() === value.toLowerCase())) return
+    onApply(cue.id, value)
+    if (next) onCommand('grid/line/next')
+  }
+
+  // 选区必须在 DOM 更新后设置（ChangeValue/SetSelection 的等价时序）
+  useLayoutEffect(() => {
+    const pending = pendingSelectionRef.current
+    if (!pending) return
+    pendingSelectionRef.current = null
+    inputRef.current?.setSelectionRange(pending[0], pending[1])
+  })
+
+  // 构造（OnActiveLineChanged(GetActiveLine())）+ 激活（OnActivate）净效果：勾选时 Seek 一次
+  useEffect(() => {
+    loadLine(cue, autoSeek)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅构造期执行一次
+  }, [])
+
+  // 活动行变化（selection controller ActiveLine 监听）
+  useEffect(() => {
+    if (lastIdRef.current === cue.id) return
+    lastIdRef.current = cue.id
+    loadLine(cue, autoSeek)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 依赖为活动行 id
+  }, [cue.id])
+
+  /** 源码 OnListClicked / OnListDoubleClicked：ChangeValue + Commit + SetFocus */
+  const pickFromList = (name: string, next: boolean) => {
+    setListSelected(name)
+    applyEdit(name, null, false)
+    commitValue(name, next)
+    inputRef.current?.focus()
+  }
+
+  const handleInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const target = event.target
+    applyAutocomplete(target.value, target.selectionStart ?? target.value.length)
+  }
+
+  const handleInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    // 源码 OnKeyDown：无修饰键的 Backspace 先把选区起点前移一位，
+    // 使 backspace 能删掉一个字符 + 补全部分（打破补全循环）
+    if (event.key !== 'Backspace' || event.ctrlKey || event.altKey || event.metaKey) return
+    const target = event.currentTarget
+    const start = target.selectionStart ?? 0
+    const end = target.selectionEnd ?? 0
+    if (start <= 0) return
+    event.preventDefault()
+    applyAutocomplete(target.value.slice(0, start - 1) + target.value.slice(end), start - 1)
+  }
+
+  // 对话框按键：wxEVT_CHAR_HOOK → hotkey::check("Styling Assistant")
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement
+    // 原生控件自行消费导航/激活键（wxCheckBox/wxButton 同理）
+    if (target.matches('input[type="checkbox"], button, select')) return
+    const command = commandForShortcut(
+      shortcutFromKeyboardEvent(event.nativeEvent),
+      'Styling Assistant',
+    )
+    if (!command || STYLING_NATIVE_TEXT_COMMANDS.has(command)) return
+    event.preventDefault()
+    event.stopPropagation()
+    switch (command) {
+      case 'tool/styling_assistant/commit':
+        commitValue(input.value, true)
+        return
+      case 'tool/styling_assistant/preview':
+        commitValue(input.value, false)
+        return
+      default:
+        onCommand(command)
+    }
   }
 
   return (
@@ -451,36 +853,118 @@ export function StylingAssistantDialog({
       onClose={onClose}
       footer={
         <>
-          <button onClick={onPrevious}>{tPlain('Previous')}</button>
-          <button onClick={onPlay}>{tPlain('Play')}</button>
-          <button onClick={() => commit(false)}>{tPlain('Apply')}</button>
-          <button onClick={() => commit(true)}>{tPlain('Apply and Next')}</button>
-          <button onClick={onClose}>{tPlain('Close')}</button>
+          <button onClick={onClose}>{tPlain('Cancel')}</button>
+          <button
+            onClick={() =>
+              window.open(
+                'https://aegisub.org/docs/latest/styling_assistant/',
+                '_blank',
+                'noopener',
+              )
+            }
+          >
+            {tPlain('Help')}
+          </button>
         </>
       }
     >
-      <div className="styling-assistant-body" data-shortcut-context="Styling Assistant">
-        <textarea readOnly value={cue.text} aria-label={tPlain('Subtitle text')} />
-        <label>
-          {tPlain('Style')}
-          <input
-            autoFocus
-            list="styling-assistant-styles"
-            value={style}
-            onChange={(event) => setStyle(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                event.preventDefault()
-                commit(true)
-              }
-            }}
-          />
-          <datalist id="styling-assistant-styles">
-            {styles.map((item) => (
-              <option key={item.id} value={item.name} />
-            ))}
-          </datalist>
-        </label>
+      <div
+        className="styling-assistant-body"
+        data-shortcut-context="Styling Assistant"
+        onKeyDown={handleKeyDown}
+      >
+        <fieldset className="dialog-fieldset styling-assistant-current-line">
+          <legend>{tPlain('Current line')}</legend>
+          <textarea className="styling-current-text" readOnly value={cue.text} />
+        </fieldset>
+        <div className="styling-assistant-row">
+          <fieldset className="dialog-fieldset styling-assistant-styles">
+            <legend>{tPlain('Styles available')}</legend>
+            {/* web 偏差：不还原键盘方向键导航——wx EVT_LISTBOX 会在每个方向键后
+                ChangeValue + Commit(false) + SetFocus（逐格应用样式并把焦点弹回输入框） */}
+            <div
+              className="styling-styles-list"
+              role="listbox"
+              aria-label={tPlain('Styles available')}
+            >
+              {styles.map((item) => (
+                <div
+                  key={item.id}
+                  role="option"
+                  tabIndex={-1}
+                  aria-selected={item.name === listSelected}
+                  className={
+                    item.name === listSelected
+                      ? 'styling-style-option selected'
+                      : 'styling-style-option'
+                  }
+                  // wx EVT_LISTBOX 仅在选中项变化时触发
+                  onClick={() => {
+                    if (item.name === listSelected) return
+                    pickFromList(item.name, false)
+                  }}
+                  onDoubleClick={() => pickFromList(item.name, true)}
+                >
+                  {item.name}
+                </div>
+              ))}
+            </div>
+          </fieldset>
+          <div className="styling-assistant-right">
+            <fieldset className="dialog-fieldset">
+              <legend>{tPlain('Set style')}</legend>
+              <input
+                ref={inputRef}
+                className={input.invalid ? 'styling-style-input invalid' : 'styling-style-input'}
+                value={input.value}
+                onChange={handleInputChange}
+                onKeyDown={handleInputKeyDown}
+              />
+            </fieldset>
+            <fieldset className="dialog-fieldset">
+              <legend>{tPlain('Keys')}</legend>
+              <div className="styling-keys-grid">
+                {STYLING_ASSISTANT_KEYS.flatMap(([command, label]) => [
+                  <span key={`${command}-label`}>{tPlain(label)}</span>,
+                  <span key={`${command}-key`} className="styling-key">
+                    {aegisubHotkeyStrFirst('Styling Assistant', command)}
+                  </span>,
+                ])}
+                <span key="click-on-list">{tPlain('Click on list')}</span>
+                <span key="select-style">{tPlain('Select style')}</span>
+              </div>
+              <label className="styling-seek-check">
+                <input
+                  type="checkbox"
+                  checked={autoSeek}
+                  onChange={(event) => setAutoSeek(event.target.checked)}
+                />
+                {tPlain('Seek video to line start time')}
+              </label>
+            </fieldset>
+            <fieldset className="dialog-fieldset styling-assistant-actions">
+              <legend>{tPlain('Actions')}</legend>
+              <button
+                disabled={!hasAudio}
+                onClick={() => {
+                  onCommand('audio/play/selection')
+                  inputRef.current?.focus()
+                }}
+              >
+                {tPlain('Play Audio')}
+              </button>
+              <button
+                disabled={!hasVideo}
+                onClick={() => {
+                  onCommand('video/play/line')
+                  inputRef.current?.focus()
+                }}
+              >
+                {tPlain('Play Video')}
+              </button>
+            </fieldset>
+          </div>
+        </div>
       </div>
     </Dialog>
   )
@@ -719,101 +1203,612 @@ export function FontCollectorDialog({
   )
 }
 
+// ---------------------------------------------------------------------------
+// Translation Assistant（dialog_translation.cpp DialogTranslation）
+// ---------------------------------------------------------------------------
+
+/** 「Keys」栏 8 行（源码 add_hotkey 顺序：命令 id + 描述 msgid） */
+const TRANSLATION_ASSISTANT_KEYS: ReadonlyArray<readonly [string, string]> = [
+  ['tool/translation_assistant/commit', 'Accept changes'],
+  ['tool/translation_assistant/preview', 'Preview changes'],
+  ['tool/translation_assistant/prev', 'Previous line'],
+  ['tool/translation_assistant/next', 'Next line'],
+  ['tool/translation_assistant/insert_original', 'Insert original'],
+  ['video/play/line', 'Play video'],
+  ['audio/play/selection', 'Play audio'],
+  ['edit/line/delete', 'Delete line'],
+]
+
+/** 源码 edit_line_copy/cut/paste 内部检查焦点：聚焦文本控件时走控件自身剪贴板操作 */
+const TRANSLATION_NATIVE_TEXT_COMMANDS = new Set([
+  'edit/line/cut',
+  'edit/line/copy',
+  'edit/line/paste',
+])
+
+interface TranslationDialogProps {
+  cue: SubtitleCue
+  /** 全部对白行（源码 c->ass->Events：行数显示与跨行导航） */
+  cues: SubtitleCue[]
+  hasAudio: boolean
+  hasVideo: boolean
+  onClose: () => void
+  /** selectionController->NextLine()/PrevLine() 语义（SetSelectionAndActive） */
+  onSelectCue: (id: string) => void
+  /** 提交译文（Commit：label "translation assistant"，COMMIT_DIAG_TEXT） */
+  onApply: (id: string, text: string) => void
+  /** UpdateDisplay 的 JumpToTime(active_line->Start)（Enable preview 勾选时） */
+  onSeekVideo: (timeMs: number) => void
+  /** hotkey::check 命中的其他上下文命令（删除行/撤销/播放等，命中即消费） */
+  onCommand: (id: string) => void
+  /** wxMessageBox 等价（状态栏） */
+  onMessage: (text: string) => void
+}
+
 export function TranslationDialog({
   cue,
-  onApply,
+  cues,
+  hasAudio,
+  hasVideo,
   onClose,
-}: {
-  cue: SubtitleCue
-  onApply: (text: string) => void
-  onClose: () => void
-}) {
-  const [text, setText] = useState(cue.text.replace(/\{[^}]*\}/g, ''))
-  const apply = () => {
-    onApply(text.replace(/\r?\n/g, '\\N'))
-    onClose()
+  onSelectCue,
+  onApply,
+  onSeekVideo,
+  onCommand,
+  onMessage,
+}: TranslationDialogProps) {
+  const skipWhitespace = getOptionBool('Tool/Translation Assistant/Skip Whitespace')
+  const [blocks, setBlocks] = useState<DialogueBlock[]>(() => parseDialogueBlocks(cue.text))
+  const [curBlock, setCurBlock] = useState(0)
+  const [translated, setTranslated] = useState('')
+  const [enablePreview, setEnablePreview] = useState(true)
+  const textAreaRef = useRef<HTMLTextAreaElement>(null)
+  const blocksRef = useRef(blocks)
+  const applyBlocks = (next: DialogueBlock[]) => {
+    blocksRef.current = next
+    setBlocks(next)
   }
+  /** 源码 switching_lines：自身导航引发的活动行变化不再重解析 */
+  const switchingRef = useRef(false)
+  /** 自身提交（file_change_connection.Block）：跳过 OnExternalCommit 的重解析 */
+  const selfCommitRef = useRef<{ id: string; text: string } | null>(null)
+  const lastRef = useRef({ id: cue.id, text: cue.text })
+  // 行号语义对齐源码：UpdateDisplay 用 0 基 Row（上游 27c152262 起的行为，
+  // 与 arch1t3cht fork 一致），OnExternalCommit 另用 Row + 1（见未完成计划备忘）
+  const lineIndex = cues.findIndex((item) => item.id === cue.id)
+  const lineCount = cues.length
+
+  /** 源码 UpdateDisplay：清空译文、聚焦，勾选 Enable preview 时 Seek 到行首 */
+  const updateDisplay = (line: SubtitleCue) => {
+    setTranslated('')
+    if (enablePreview && hasVideo) onSeekVideo(line.startMs)
+    textAreaRef.current?.focus()
+  }
+
+  /**
+   * 源码 NextBlock/PrevBlock：成功则同步活动行与显示；返回是否移动成功。
+   * `fromBlock` 供外部活动行变化后的重新查找使用（此时 cur_block 已重置为 0）。
+   */
+  const stepBlock = (direction: 1 | -1, fromBlock = curBlock): boolean => {
+    const position = stepDialogueBlock(
+      cues,
+      lineIndex,
+      blocksRef.current,
+      fromBlock,
+      direction,
+      skipWhitespace,
+    )
+    if (!position) return false
+    const targetCue = cues[position.lineIndex]
+    if (position.lineIndex !== lineIndex) {
+      applyBlocks(parseDialogueBlocks(targetCue.text))
+      switchingRef.current = true
+      onSelectCue(targetCue.id)
+    }
+    setCurBlock(position.blockIndex)
+    updateDisplay(targetCue)
+    return true
+  }
+
+  /** 源码 Commit：换行统一替换为 \N，替换当前块后提交；next 时前进，否则仅刷新显示 */
+  const commit = (next: boolean) => {
+    const newValue = translated.replace(/\r\n/g, '\\N').replace(/\r/g, '\\N').replace(/\n/g, '\\N')
+    const committed = commitDialogueBlock(blocksRef.current, curBlock, newValue)
+    applyBlocks(committed.blocks)
+    selfCommitRef.current = { id: cue.id, text: committed.text }
+    onApply(cue.id, committed.text)
+    if (next) {
+      if (!stepBlock(1)) {
+        onMessage(tPlain('No more lines to translate.'))
+        onClose()
+      }
+    } else {
+      updateDisplay(cue)
+    }
+  }
+
+  /** 源码 InsertOriginal：在当前光标处插入原文（Scintilla AddText，光标落在插入文本后） */
+  const insertOriginal = () => {
+    const text = blocksRef.current[curBlock]?.text ?? ''
+    const area = textAreaRef.current
+    if (!area) {
+      setTranslated((value) => value + text)
+      return
+    }
+    const start = area.selectionStart
+    const end = area.selectionEnd
+    setTranslated(translated.slice(0, start) + text + translated.slice(end))
+    requestAnimationFrame(() => area.setSelectionRange(start + text.length, start + text.length))
+  }
+
+  // 构造（源码构造函数）：解析活动行，首块不可翻译时向后查找（含跨行），
+  // 全部找不到等价 NothingToTranslate（命令层提示 "There is nothing to translate in the file."）
+  useEffect(() => {
+    if (isBadBlock(blocksRef.current[0], skipWhitespace)) {
+      if (!stepBlock(1, 0)) {
+        onMessage(tPlain('There is nothing to translate in the file.'))
+        onClose()
+      }
+    } else {
+      updateDisplay(cue)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅构造期执行一次
+  }, [])
+
+  // OnActiveLineChanged / OnExternalCommit(COMMIT_DIAG_TEXT)：外部行或文本变化时重解析
+  useEffect(() => {
+    const previous = lastRef.current
+    lastRef.current = { id: cue.id, text: cue.text }
+    if (previous.id === cue.id && previous.text === cue.text) return
+    if (previous.id !== cue.id) {
+      selfCommitRef.current = null
+      if (switchingRef.current) {
+        switchingRef.current = false
+        return
+      }
+    } else {
+      const committed = selfCommitRef.current
+      if (committed && committed.id === cue.id && committed.text === cue.text) {
+        selfCommitRef.current = null
+        return
+      }
+    }
+    applyBlocks(parseDialogueBlocks(cue.text))
+    setCurBlock(0)
+    if (isBadBlock(blocksRef.current[0], skipWhitespace)) {
+      // 源码 OnActiveLineChanged → NextBlock → 失败提示 "No more lines to translate."
+      if (!stepBlock(1, 0)) {
+        onMessage(tPlain('No more lines to translate.'))
+        onClose()
+      }
+      return
+    }
+    // 源码此分支不刷新显示（外部行变化时画面停留在旧行，属上游缺陷）；web 侧刷新
+    updateDisplay(cue)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 依赖为「活动行/文本」的原始值
+  }, [cue.id, cue.text])
+
+  // 对话框按键：wxEVT_KEY_DOWN + 译文控件 CHAR_HOOK → hotkey::check("Translation Assistant")
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement
+    // 原生控件自行消费导航/激活键（wxCheckBox/wxButton 同理）
+    if (target.matches('input[type="checkbox"], button, select')) return
+    const command = commandForShortcut(
+      shortcutFromKeyboardEvent(event.nativeEvent),
+      'Translation Assistant',
+    )
+    if (!command || TRANSLATION_NATIVE_TEXT_COMMANDS.has(command)) return
+    event.preventDefault()
+    event.stopPropagation()
+    switch (command) {
+      case 'tool/translation_assistant/commit':
+        commit(true)
+        return
+      case 'tool/translation_assistant/preview':
+        commit(false)
+        return
+      case 'tool/translation_assistant/next':
+        stepBlock(1)
+        return
+      case 'tool/translation_assistant/prev':
+        stepBlock(-1)
+        return
+      case 'tool/translation_assistant/insert_original':
+        insertOriginal()
+        return
+      default:
+        onCommand(command)
+    }
+  }
+
   return (
     <Dialog
       title={tPlain('Translation Assistant')}
       onClose={onClose}
       footer={
         <>
-          <button onClick={apply}>{tPlain('Apply')}</button>
           <button onClick={onClose}>{tPlain('Cancel')}</button>
+          <button
+            onClick={() =>
+              window.open(
+                'https://aegisub.org/docs/latest/translation_assistant/',
+                '_blank',
+                'noopener',
+              )
+            }
+          >
+            {tPlain('Help')}
+          </button>
         </>
       }
     >
-      <div className="translation-dialog-body">
-        <label>
-          {tPlain('Original')}
-          <textarea readOnly value={cue.text} />
-        </label>
-        <label>
-          {tPlain('Translation')}
-          <textarea autoFocus value={text} onChange={(event) => setText(event.target.value)} />
-        </label>
+      <div
+        className="translation-assistant-body"
+        data-shortcut-context="Translation Assistant"
+        onKeyDown={handleKeyDown}
+      >
+        <fieldset className="dialog-fieldset translation-assistant-box">
+          <legend>{tPlain('Original')}</legend>
+          <span className="translation-line-number">
+            {tFmt('Current line: %d/%d', lineIndex, lineCount)}
+          </span>
+          <div className="translation-original-text">
+            {blocks.map((block, index) =>
+              block.type === 'plain' && index === curBlock ? (
+                // 源码 SetStyling(1)：当前块前景色 rgb(10, 60, 200)
+                <span key={index} className="translation-original-active">
+                  {block.text}
+                </span>
+              ) : (
+                <span key={index}>{block.text}</span>
+              ),
+            )}
+          </div>
+        </fieldset>
+        <fieldset className="dialog-fieldset translation-assistant-box">
+          <legend>{tPlain('Translation')}</legend>
+          <textarea
+            ref={textAreaRef}
+            className="translation-text"
+            autoFocus
+            value={translated}
+            onChange={(event) => setTranslated(event.target.value)}
+          />
+        </fieldset>
+        <div className="translation-assistant-row">
+          <fieldset className="dialog-fieldset translation-assistant-keys">
+            <legend>{tPlain('Keys')}</legend>
+            <div className="translation-keys-grid">
+              {TRANSLATION_ASSISTANT_KEYS.flatMap(([command, label]) => [
+                <span key={`${command}-label`}>{tPlain(label)}</span>,
+                <span key={`${command}-key`} className="translation-key">
+                  {aegisubHotkeyStrFirst('Translation Assistant', command)}
+                </span>,
+              ])}
+            </div>
+            <label className="translation-preview-check">
+              <input
+                type="checkbox"
+                checked={enablePreview}
+                onChange={(event) => setEnablePreview(event.target.checked)}
+              />
+              {tPlain('Enable preview')}
+            </label>
+          </fieldset>
+          <fieldset className="dialog-fieldset translation-assistant-actions">
+            <legend>{tPlain('Actions')}</legend>
+            <button
+              disabled={!hasAudio}
+              onClick={() => {
+                onCommand('audio/play/selection')
+                textAreaRef.current?.focus()
+              }}
+            >
+              {tPlain('Play Audio')}
+            </button>
+            <button
+              disabled={!hasVideo}
+              onClick={() => {
+                onCommand('video/play/line')
+                textAreaRef.current?.focus()
+              }}
+            >
+              {tPlain('Play Video')}
+            </button>
+          </fieldset>
+        </div>
       </div>
     </Dialog>
   )
 }
 
+// ---------------------------------------------------------------------------
+// Resample Resolution（dialog_resample.cpp DialogResample）
+// ---------------------------------------------------------------------------
+
+/** Aspect Ratio Handling 选项（源码 ar_modes 顺序） */
+const RESAMPLE_AR_MODE_LABELS = ['Stretch', 'Add borders', 'Remove borders', 'Manual']
+
+/** wxSpinCtrl：文本无效时取下限，越界按范围钳位（整数） */
+function clampSpin(raw: string, min: number, max: number): number {
+  const value = Number(raw)
+  if (!Number.isFinite(value)) return min
+  return Math.max(min, Math.min(max, Math.trunc(value)))
+}
+
 export function ResampleDialog({
-  scriptInfo,
+  document,
+  hasVideo,
+  videoWidth,
+  videoHeight,
   onApply,
   onClose,
 }: {
-  scriptInfo: Record<string, string>
-  onApply: (patch: Record<string, string>) => void
+  document: SubtitleDocument
+  hasVideo: boolean
+  videoWidth: number
+  videoHeight: number
+  /** 一次 apply 覆盖整份文档（源码 resample + Commit 单步撤销，label "resolution resampling"） */
+  onApply: (commands: CoreCommand[]) => void
   onClose: () => void
 }) {
-  const [width, setWidth] = useState(Number(scriptInfo.PlayResX) || 1920)
-  const [height, setHeight] = useState(Number(scriptInfo.PlayResY) || 1080)
+  // 构造期快照：script_w/script_h（GetResolution）与 script_mat（YCbCr Matrix to_effective）
+  const script = getScriptResolution(document.scriptInfo)
+  const scriptMat = ycbcrHeaderToEffective(
+    parseYcbcrHeader(getScriptInfo(document.scriptInfo, 'YCbCr Matrix')),
+  )
+  // 视频矩阵：web 端无视频 YCbCr 元数据（等价源码默认构造的无效色彩空间），
+  // 因此不做矩阵建议（两栏都停在空选项），"From video" 也只回填分辨率
+  const [sourceX, setSourceX] = useState(script.width)
+  const [sourceY, setSourceY] = useState(script.height)
+  const [destX, setDestX] = useState(hasVideo ? videoWidth : script.width)
+  const [destY, setDestY] = useState(hasVideo ? videoHeight : script.height)
+  const [sourceMatrix, setSourceMatrix] = useState('')
+  const [destMatrix, setDestMatrix] = useState('')
+  const [symmetrical, setSymmetrical] = useState(true)
+  const [arMode, setArMode] = useState(RESAMPLE_AR_STRETCH)
+  // margin[LEFT, RIGHT, TOP, BOTTOM]（resolution_resampler.h 的 margin[4] 序）
+  const [margin, setMargin] = useState<[number, number, number, number]>([0, 0, 0, 0])
+
+  // UpdateButtons：|srcAR - dstAR| / dstAR > .01 才启用 AR 处理与 margin
+  const arChanged = Math.abs(sourceX / sourceY - destX / destY) / (destX / destY) > 0.01
+  const marginsEnabled = arChanged && arMode === RESAMPLE_AR_MANUAL
+  const independentMargins = marginsEnabled && !symmetrical
+  // OnMatrixChange：两端都解析出具体色彩空间才做转换
+  const sourceHeader = parseYcbcrHeader(sourceMatrix)
+  const destHeader = parseYcbcrHeader(destMatrix)
+  const matrixConversion =
+    sourceHeader.kind === 'colorspace' && destHeader.kind === 'colorspace'
+      ? { src: sourceHeader.colorspace, dst: destHeader.colorspace }
+      : null
+
+  const changeMarginLeft = (raw: string) => {
+    const value = clampSpin(raw, -9999, 9999)
+    // OnMarginChange(LEFT, RIGHT)：勾选 Symmetrical 时 RIGHT 跟随 LEFT
+    setMargin((current) => [value, symmetrical ? value : current[1], current[2], current[3]])
+  }
+  const changeMarginTop = (raw: string) => {
+    const value = clampSpin(raw, -9999, 9999)
+    setMargin((current) => [current[0], current[1], value, symmetrical ? value : current[3]])
+  }
+  const changeSymmetrical = (checked: boolean) => {
+    setSymmetrical(checked)
+    // OnSymmetrical：勾选时 RIGHT=LEFT、BOTTOM=TOP
+    if (checked) setMargin((current) => [current[0], current[0], current[2], current[2]])
+  }
+  const setFromScript = () => {
+    setSourceX(script.width)
+    setSourceY(script.height)
+    setSourceMatrix(MATRIX_OPTIONS[matrixOptionFromHeader(scriptMat)])
+  }
+  const setFromVideo = () => {
+    setDestX(videoWidth)
+    setDestY(videoHeight)
+    // MatrixOptionFromHeader(无效视频矩阵) 恒为 0（空选项）
+    setDestMatrix('')
+  }
+
+  const apply = () => {
+    const commands = resampleCommands(document, {
+      sourceX,
+      sourceY,
+      destX,
+      destY,
+      margin,
+      arMode,
+      matrixConversion,
+    })
+    if (commands.length) onApply(commands)
+    onClose()
+  }
+
   return (
     <Dialog
       title={tPlain('Resample Resolution')}
       onClose={onClose}
       footer={
         <>
-          <button
-            onClick={() => {
-              onApply({
-                PlayResX: String(Math.max(1, width)),
-                PlayResY: String(Math.max(1, height)),
-              })
-              onClose()
-            }}
-          >
-            {tPlain('OK')}
-          </button>
+          <button onClick={apply}>{tPlain('OK')}</button>
           <button onClick={onClose}>{tPlain('Cancel')}</button>
         </>
       }
     >
-      <div className="dialog-fields">
-        <label>
-          {tPlain('Width')}
-          <input
-            type="number"
-            min={1}
-            value={width}
-            onChange={(event) => setWidth(Number(event.target.value))}
-          />
-        </label>
-        <label>
-          {tPlain('Height')}
-          <input
-            type="number"
-            min={1}
-            value={height}
-            onChange={(event) => setHeight(Number(event.target.value))}
-          />
-        </label>
-        <p>
-          {tPlain(
-            'Script resolution metadata will be updated. Full override-tag coordinate resampling is not yet enabled.',
-          )}
-        </p>
+      <div className="resample-body">
+        <fieldset className="dialog-fieldset">
+          <legend>{tPlain('Source Resolution')}</legend>
+          <div className="resample-res-row">
+            <input
+              type="number"
+              className="resample-spin"
+              min={1}
+              max={999999}
+              value={sourceX}
+              aria-label={tPlain('Width')}
+              onChange={(event) => setSourceX(clampSpin(event.target.value, 1, 999999))}
+            />
+            <span className="resample-times">×</span>
+            <input
+              type="number"
+              className="resample-spin"
+              min={1}
+              max={999999}
+              value={sourceY}
+              aria-label={tPlain('Height')}
+              onChange={(event) => setSourceY(clampSpin(event.target.value, 1, 999999))}
+            />
+            <button
+              type="button"
+              disabled={sourceX === script.width && sourceY === script.height}
+              onClick={setFromScript}
+            >
+              {tPlain('From script')}
+            </button>
+          </div>
+          <div className="resample-matrix-row">
+            <span>{tPlain('YCbCr Matrix:')}</span>
+            <select
+              value={sourceMatrix}
+              onChange={(event) => setSourceMatrix(event.target.value)}
+              aria-label={tPlain('YCbCr Matrix:')}
+            >
+              {MATRIX_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </div>
+        </fieldset>
+        <fieldset className="dialog-fieldset">
+          <legend>{tPlain('Destination Resolution')}</legend>
+          <div className="resample-res-row">
+            <input
+              type="number"
+              className="resample-spin"
+              min={1}
+              max={999999}
+              value={destX}
+              aria-label={tPlain('Width')}
+              onChange={(event) => setDestX(clampSpin(event.target.value, 1, 999999))}
+            />
+            <span className="resample-times">×</span>
+            <input
+              type="number"
+              className="resample-spin"
+              min={1}
+              max={999999}
+              value={destY}
+              aria-label={tPlain('Height')}
+              onChange={(event) => setDestY(clampSpin(event.target.value, 1, 999999))}
+            />
+            <button
+              type="button"
+              disabled={!hasVideo || (destX === videoWidth && destY === videoHeight)}
+              onClick={setFromVideo}
+            >
+              {tPlain('From video')}
+            </button>
+          </div>
+          <div className="resample-matrix-row">
+            <span>{tPlain('YCbCr Matrix:')}</span>
+            <select
+              value={destMatrix}
+              onChange={(event) => setDestMatrix(event.target.value)}
+              aria-label={tPlain('YCbCr Matrix:')}
+            >
+              {MATRIX_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </div>
+        </fieldset>
+        <fieldset className="dialog-fieldset">
+          <legend>{tPlain('Aspect Ratio Handling')}</legend>
+          <div className="resample-ar-row">
+            {RESAMPLE_AR_MODE_LABELS.map((label, index) => (
+              <label key={label}>
+                <input
+                  type="radio"
+                  name="resample-ar-mode"
+                  checked={arMode === index}
+                  disabled={!arChanged}
+                  onChange={() => setArMode(index)}
+                />
+                {tPlain(label)}
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        <fieldset className="dialog-fieldset">
+          <legend>{tPlain('Margin offset')}</legend>
+          <div className="resample-margin-grid">
+            <span />
+            <input
+              type="number"
+              className="resample-spin"
+              min={-9999}
+              max={9999}
+              value={margin[2]}
+              disabled={!marginsEnabled}
+              onChange={(event) => changeMarginTop(event.target.value)}
+            />
+            <span />
+            <input
+              type="number"
+              className="resample-spin"
+              min={-9999}
+              max={9999}
+              value={margin[0]}
+              disabled={!marginsEnabled}
+              onChange={(event) => changeMarginLeft(event.target.value)}
+            />
+            <label className="resample-symmetrical">
+              <input
+                type="checkbox"
+                checked={symmetrical}
+                disabled={!marginsEnabled}
+                onChange={(event) => changeSymmetrical(event.target.checked)}
+              />
+              {tPlain('Symmetrical')}
+            </label>
+            <input
+              type="number"
+              className="resample-spin"
+              min={-9999}
+              max={9999}
+              value={margin[1]}
+              disabled={!independentMargins}
+              onChange={(event) =>
+                setMargin((current) => [
+                  current[0],
+                  clampSpin(event.target.value, -9999, 9999),
+                  current[2],
+                  current[3],
+                ])
+              }
+            />
+            <span />
+            <input
+              type="number"
+              className="resample-spin"
+              min={-9999}
+              max={9999}
+              value={margin[3]}
+              disabled={!independentMargins}
+              onChange={(event) =>
+                setMargin((current) => [
+                  current[0],
+                  current[1],
+                  current[2],
+                  clampSpin(event.target.value, -9999, 9999),
+                ])
+              }
+            />
+            <span />
+          </div>
+        </fieldset>
       </div>
     </Dialog>
   )

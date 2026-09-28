@@ -31,6 +31,17 @@ interface AegisubCoreModule {
   _aegisub_document_replace_all(document: number, settings: number): number
   _aegisub_document_mark_saved?(document: number): number
   _aegisub_document_configure?(document: number, undoLevels: number): number
+  _aegisub_document_notify_selection?(
+    document: number,
+    selectedJson: number,
+    activeId: number,
+  ): number
+  _aegisub_document_notify_text_selection?(
+    document: number,
+    pos: number,
+    selStart: number,
+    selEnd: number,
+  ): number
   _aegisub_core_free(memory: number): void
   _aegisub_core_last_error(): number
   _malloc(size: number): number
@@ -53,6 +64,8 @@ interface CoreRuntime {
   getState(): CoreState
   configure?(config: { undoLevels: number }): void
   markSaved?(): void
+  notifySelection?(ids: string[], activeId: string | null): void
+  notifyTextSelection?(pos: number, selStart: number, selEnd: number): void
 }
 
 /** 通过 C ABI 调用 WASM 里的 Aegisub 文档核心 */
@@ -170,6 +183,23 @@ class WasmCoreRuntime implements CoreRuntime {
     this.module._aegisub_document_mark_saved(this.document)
   }
 
+  // 选中/活动行实时修订撤销栈顶条目（WASM ABI v3；旧产物无此符号时忽略）
+  notifySelection(ids: string[], activeId: string | null): void {
+    if (!this.module._aegisub_document_notify_selection) return
+    const m = this.module
+    const selected = m.allocateUTF8(JSON.stringify(ids))
+    const active = m.allocateUTF8(activeId ?? '')
+    this.module._aegisub_document_notify_selection(this.document, selected, active)
+    m._free(selected)
+    m._free(active)
+  }
+
+  // 编辑框文本选区实时修订撤销栈顶条目（WASM ABI v4；旧产物无此符号时忽略）
+  notifyTextSelection(pos: number, selStart: number, selEnd: number): void {
+    if (!this.module._aegisub_document_notify_text_selection) return
+    this.module._aegisub_document_notify_text_selection(this.document, pos, selStart, selEnd)
+  }
+
   close(): void {
     this.module._aegisub_document_destroy(this.document)
   }
@@ -264,6 +294,18 @@ self.onmessage = (event: MessageEvent<CoreRequest>) => {
   // markSaved 同为 fire-and-forget（手动保存成功后打断合并链）
   if (request.method === 'markSaved') {
     void getActiveRuntime().then((active) => active.markSaved?.())
+    return
+  }
+  // notifySelection 同为 fire-and-forget（选中/活动行实时修订撤销栈顶条目）
+  if (request.method === 'notifySelection') {
+    const { ids, activeId } = request
+    void getActiveRuntime().then((active) => active.notifySelection?.(ids, activeId))
+    return
+  }
+  // notifyTextSelection 同为 fire-and-forget（编辑框文本选区实时修订撤销栈顶条目）
+  if (request.method === 'notifyTextSelection') {
+    const { pos, selStart, selEnd } = request
+    void getActiveRuntime().then((active) => active.notifyTextSelection?.(pos, selStart, selEnd))
     return
   }
   const response: CoreResponse = { id: request.id }

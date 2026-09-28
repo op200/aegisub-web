@@ -166,5 +166,31 @@ console.log('after replace text:', stateRep.document.cues[0].text)
 if (stateRep.document.cues[0].text !== 'hi {\\i1}world{\\i0}')
   throw new Error('replace text mismatch')
 
+// 10. 编辑框文本选区（subs_controller.cpp:UndoInfo pos/sel_start/sel_end）：
+// notify_text_selection 实时修订栈顶条目，undo 后恢复新栈顶的快照
+if (module_._aegisub_core_abi_version() < 4) throw new Error('abi version should be >= 4')
+module_._aegisub_document_notify_text_selection(doc, 7, 2, 7)
+const selPtr = module_._aegisub_document_state_json(doc)
+const selState = JSON.parse(module_.UTF8ToString(selPtr))
+module_._aegisub_core_free(selPtr)
+console.log('textSelection:', JSON.stringify(selState.textSelection))
+if (
+  selState.textSelection.pos !== 7 ||
+  selState.textSelection.start !== 2 ||
+  selState.textSelection.end !== 7
+)
+  throw new Error('textSelection mismatch')
+module_._aegisub_document_undo(doc)
+const selPtr2 = module_._aegisub_document_state_json(doc)
+const selState2 = JSON.parse(module_.UTF8ToString(selPtr2))
+module_._aegisub_core_free(selPtr2)
+console.log('undo textSelection:', JSON.stringify(selState2.textSelection))
+if (
+  selState2.textSelection.pos !== 0 ||
+  selState2.textSelection.start !== 0 ||
+  selState2.textSelection.end !== 0
+)
+  throw new Error('undo textSelection mismatch')
+
 module_._aegisub_document_destroy(doc)
 console.log('\nALL ABI TESTS PASSED')

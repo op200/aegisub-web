@@ -65,6 +65,12 @@ interface PreviewPaneProps {
   ) => Promise<unknown> | void
   /** 当前选中行（含活动行）：视觉工具 SetSelectedOverride 的目标集合 */
   selectedCues: SubtitleCue[]
+  /** 视觉工具点击特征：SetSelection（visual_tool.cpp OnMouseEvent；toggle=Ctrl 并集，否则单选） */
+  onVisualSelect: (id: string, toggle: boolean) => void
+  /** 视觉工具点击已选中特征：仅 SetActiveLine（选择不变） */
+  onVisualSetActive: (id: string) => void
+  /** 视觉工具 Ctrl+点击已选中特征且未拖动：RemoveSelection（不移除最后一行） */
+  onVisualDeselect: (id: string) => void
   onPatchStyle: (id: string, patch: Partial<Omit<SubtitleStyle, 'id'>>, label: string) => void
   isCommandEnabled: (id: string) => boolean
   isCommandChecked: (id: string) => boolean
@@ -1950,6 +1956,9 @@ export function PreviewPane({
   onPatchCue,
   onPatchCues,
   selectedCues,
+  onVisualSelect,
+  onVisualSetActive,
+  onVisualDeselect,
   isCommandEnabled,
   isCommandChecked,
   windowZoom,
@@ -2069,6 +2078,9 @@ export function PreviewPane({
   const mouseOnStageRef = useRef(false)
   // 视觉工具拖拽进行中 → 文档同步走 flushNow 即时渲染（源码每次鼠标事件 Commit+Render）
   const visualDragRef = useRef(false)
+  // 视觉工具点击（visual_tool.cpp OnMouseEvent）：记录本次按下命中的特征行与「按下时是否
+  // 改过选择」（sel_changed），抬起且未拖动时按源码做选择微调（Ctrl=RemoveSelection/否则收缩单行）
+  const visualClickRef = useRef<{ id: string; selChanged: boolean } | null>(null)
   // 拖拽刚结束的时间戳：pointerup 冲刷的最终提交在 effect 运行时拖拽态已复位，
   // 用短时间窗让最终提交仍走 flushNow（否则落入 250ms 防抖，最终帧有延迟感）
   const dragEndedAtRef = useRef(0)
@@ -3765,10 +3777,16 @@ export function PreviewPane({
     return active
   }
 
-  /** InnerToText 结果写回全部选中行（源码遍历 selectionController->GetSelectedSet） */
-  const perspCommitValues = (values: PerspValues, label = 'visual typesetting') => {
+  /** InnerToText 结果写回全部选中行（源码遍历 selectionController->GetSelectedSet）。
+   * 必须把 apply 的 promise 返回给调用方：拖拽提交经 serialLatest「最新目标」通道
+   * 弃帧，通道靠 promise 判定在途——包装函数吞掉返回值会退化成逐个排队，松手后
+   * 字幕行文本与视频渲染把中间位置回放数秒 */
+  const perspCommitValues = (
+    values: PerspValues,
+    label = 'visual typesetting',
+  ): Promise<unknown> | void => {
     if (!selectedCues.length) return
-    onPatchCues(
+    return onPatchCues(
       selectedCues.map((cue) => ({
         id: cue.id,
         patch: {
@@ -3845,6 +3863,7 @@ export function PreviewPane({
     // 与其他视觉工具同一「串行最新目标」通道：pointermove 可达数百 Hz，而一次提交要
     // 走全文档序列化 + apply + flushNow 即时渲染（见 dragCommitRef 注释）——逐个排队会
     // 在途任务堆积、鼠标停住后画面继续回放中间位置；中间目标一律丢弃，仅最新位置生效
+    // （perspCommitValues 必须返回 apply 的 promise，通道靠它判定在途）
     if (values) scheduleDragCommit(() => perspCommitValues(values))
     // 四角/网格随鼠标实时重绘（源码 UpdateDrag 尾部 Render）：只调度 rAF 合流的 overlay
     // 重绘，不在 pointermove 里 setState——renderOverlay 读的就是被就地改写的
@@ -4207,6 +4226,20 @@ export function PreviewPane({
       visualTool === 'video/tool/rotate/z' ||
       visualTool === 'video/tool/rotate/xy' ||
       visualTool === 'video/tool/clip'
+    // 点击特征的选择语义（visual_tool.cpp OnMouseEvent left_click 分支）：
+    // 未选中→SetSelection(feat, !ctrl)（Ctrl=并集/否则单选），已选中→仅 SetActiveLine；
+    // 两者都记 sel_changed 供抬起时微调。空白点击且可见特征 >1 时把选择收缩为活动行
+    visualClickRef.current = null
+    if (!holdTool) {
+      if (hit) {
+        const isSelected = selectedCues.some((item) => item.id === hit.cue.id)
+        visualClickRef.current = { id: hit.cue.id, selChanged: !isSelected }
+        if (isSelected) onVisualSetActive(hit.cue.id)
+        else onVisualSelect(hit.cue.id, event.ctrlKey)
+      } else if (!event.altKey && hitBoxesRef.current.length > 1 && activeCue) {
+        onVisualSelect(activeCue.id, false)
+      }
+    }
     const cue = holdTool ? activeCue : (hit?.cue ?? activeCue)
     if (!cue) return
     event.currentTarget.setPointerCapture(event.pointerId)
@@ -4453,7 +4486,7 @@ export function PreviewPane({
     onPatchCue(activeCue.id, { text }, tPlain('positioning'))
   }
 
-  const canvasPointerUp = () => {
+  const canvasPointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
     // 先同步冲刷最后一批拖拽提交（保持 flushNow 即时渲染路径），再退出拖拽态
     flushDragCommit()
     dragEndedAtRef.current = performance.now()
@@ -4465,6 +4498,23 @@ export function PreviewPane({
     if (perspRef.current) {
       perspPointerUp()
       return
+    }
+    // 点击（未拖动）的选择微调（visual_tool.cpp OnMouseEvent 拖动结束分支）：
+    // 特征未移动（HasMoved 为假 ⇔ 鼠标坐标回到按下处）且按下时未改过选择时，
+    // Ctrl=RemoveSelection / 非 Ctrl=SetSelection(clear)（收缩为单行）
+    const click = visualClickRef.current
+    const drag = dragRef.current
+    visualClickRef.current = null
+    if (
+      click &&
+      drag &&
+      drag.cue.id === click.id &&
+      !click.selChanged &&
+      drag.startX === event.clientX &&
+      drag.startY === event.clientY
+    ) {
+      if (event.ctrlKey) onVisualDeselect(click.id)
+      else onVisualSelect(click.id, false)
     }
     dragRef.current = null
   }

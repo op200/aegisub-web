@@ -4,6 +4,7 @@
  * config.json：agi::Options 在退出时 Flush 全量选项树；web 版每次 OPT_SET
  * 后写穿到 IndexedDB 'config' store（localStorage 保留为同步回退）。
  * hotkey.json：hotkey.cpp Flush 的整表 { "上下文": { "命令": ["按键"] } }。
+ * shift_history.json：平移时轴对话框历史（dialog_shift_times.cpp），同属于 ?user 文件。
  *
  * 启动时由 main.tsx 引导加载：IndexedDB 优先，旧版仅 localStorage 的数据
  * 自动迁移写入 IndexedDB。
@@ -13,6 +14,7 @@ import { openMainDatabase } from './db'
 const STORE = 'config'
 const CONFIG_KEY = 'config.json'
 const HOTKEY_KEY = 'hotkey.json'
+const SHIFT_HISTORY_KEY = 'shift_history.json'
 
 /** 旧版（localStorage-only）存储键，保留用于一次性迁移 */
 const LEGACY_CONFIG_KEY = 'aegisub-web:config'
@@ -43,6 +45,62 @@ function idbPut(database: IDBDatabase, key: string, value: unknown): Promise<voi
     transaction.oncomplete = () => resolve()
     transaction.onerror = () => reject(transaction.error)
   })
+}
+
+function idbDelete(database: IDBDatabase, key: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(STORE, 'readwrite')
+    transaction.objectStore(STORE).delete(key)
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error)
+  })
+}
+
+// --- ?user/shift_history.json（dialog_shift_times.cpp SaveHistory/LoadHistory/OnClear） ---
+
+/** 读取平移时轴历史；无文件或 IndexedDB 不可用时返回 null */
+export async function loadShiftHistoryFile(): Promise<unknown> {
+  try {
+    if (typeof indexedDB === 'undefined') return null
+    const database = await openMainDatabase()
+    try {
+      return (await idbGet<unknown>(database, SHIFT_HISTORY_KEY)) ?? null
+    } finally {
+      database.close()
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 写入平移时轴历史（内存态由调用方保留；持久化失败不阻断操作） */
+export async function saveShiftHistoryFile(history: unknown): Promise<void> {
+  try {
+    if (typeof indexedDB === 'undefined') return
+    const database = await openMainDatabase()
+    try {
+      await idbPut(database, SHIFT_HISTORY_KEY, history)
+    } finally {
+      database.close()
+    }
+  } catch {
+    // 私密模式下 IndexedDB 可能不可用，仅内存保留
+  }
+}
+
+/** 删除平移时轴历史（Clear 按钮：agi::fs::Remove(history_filename)） */
+export async function clearShiftHistoryFile(): Promise<void> {
+  try {
+    if (typeof indexedDB === 'undefined') return
+    const database = await openMainDatabase()
+    try {
+      await idbDelete(database, SHIFT_HISTORY_KEY)
+    } finally {
+      database.close()
+    }
+  } catch {
+    // 与源码一致：删除失败静默（Remove 仅记日志）
+  }
 }
 
 export interface PersistedConfig {

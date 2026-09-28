@@ -280,6 +280,9 @@ export function App() {
   const [core, setCore] = useState<CoreState | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [activeId, setActiveId] = useState<string | null>(null)
+  // 撤销/重做跳转计数：核心的文本选区快照需在跳转后强制回写编辑框（含光标），
+  // 由 EditPanel 按此 nonce 触发（subs_controller.cpp:Apply → SetTextTo + SetSelection）
+  const [historyNonce, setHistoryNonce] = useState(0)
   const [videoMedia, setVideoMedia] = useState<MediaSource | null>(null)
   const [audioMedia, setAudioMedia] = useState<MediaSource | null>(null)
   const [videoDurationMs, setVideoDurationMs] = useState(0)
@@ -843,10 +846,49 @@ export function App() {
     anchorRef.current = first
   }, [activeId, core])
 
+  // 选中/活动行变化实时同步核心：修订撤销栈顶条目
+  // （subs_controller.cpp:OnSelectionChanged/OnActiveLineChanged），撤销时按条目快照恢复
+  useEffect(() => {
+    coreRef.current?.notifySelection([...selectedIds], activeId)
+  }, [selectedIds, activeId])
+
   const selectOnly = (id: string) => {
     setActiveId(id)
     setSelectedIds(new Set([id]))
     anchorRef.current = id
+  }
+
+  // 视觉工具点击特征的选择语义（visual_tool.cpp OnMouseEvent）：
+  // SetSelection(feat, !ctrl)（Ctrl=并集/否则单选）+ SetActiveLine；BaseGrid::OnActiveLineChanged
+  // 会把 extendRow（锚点）同步为活动行
+  const visualSelectCue = (id: string, toggle: boolean) => {
+    setSelectedIds((current) => {
+      if (!toggle) return new Set([id])
+      if (current.has(id)) return current
+      const next = new Set(current)
+      next.add(id)
+      return next
+    })
+    setActiveId(id)
+    anchorRef.current = id
+  }
+
+  const visualSetActiveCue = (id: string) => {
+    setActiveId(id)
+    anchorRef.current = id
+  }
+
+  // RemoveSelection：不移除最后一行；被移除的行恰为活动行时活动行转移到任一成员
+  const visualDeselectCue = (id: string) => {
+    if (!selectedIds.has(id) || selectedIds.size <= 1) return
+    const next = new Set(selectedIds)
+    next.delete(id)
+    setSelectedIds(next)
+    if (activeId === id) {
+      const fallback = [...next][0] ?? null
+      setActiveId(fallback)
+      anchorRef.current = fallback
+    }
   }
 
   const moveSelection = (direction: number) => {
@@ -1560,11 +1602,24 @@ export function App() {
     apply,
     undo: async () => {
       const next = await coreRef.current?.undo()
-      if (next) setCore(next)
+      if (!next) return
+      setCore(next)
+      // 撤销恢复选中/活动行（subs_controller.cpp:Apply → SetSelectionAndActive）
+      setSelectedIds(new Set(next.selected))
+      setActiveId(next.activeId)
+      anchorRef.current = next.activeId
+      // 文本选区/光标随条目恢复，交由 EditPanel 按 nonce 应用
+      setHistoryNonce((value) => value + 1)
     },
     redo: async () => {
       const next = await coreRef.current?.redo()
-      if (next) setCore(next)
+      if (!next) return
+      setCore(next)
+      // 重做同样恢复选中/活动行（源码 Redo 与 Apply 走同一恢复路径）
+      setSelectedIds(new Set(next.selected))
+      setActiveId(next.activeId)
+      anchorRef.current = next.activeId
+      setHistoryNonce((value) => value + 1)
     },
     openSubtitles,
     newSubtitles,
@@ -1751,12 +1806,15 @@ export function App() {
         return
       const command = commandForShortcut(shortcut, context)
       const isSubtitleEditor = context === 'Subtitle Edit Box'
+      // 编辑框内交还浏览器原生处理的命令：cut/copy/paste 的原生行为在源码里由命令
+      // 内部检查焦点实现（command/edit.cpp edit_line_copy 等），Select All 同理；
+      // 而 undo/redo 无此特例——subs_edit_box.cpp OnKeyDown 的 CHAR_HOOK 把按键交给
+      // hotkey::check（命中即消费），Default 上下文的 Ctrl-Z/Ctrl-Y 触发全局撤销/重做，
+      // Scintilla 自身撤销不生效，故这两个命令必须走全局执行
       const nativeEditingCommands = new Set([
         'edit/line/cut',
         'edit/line/copy',
         'edit/line/paste',
-        'edit/undo',
-        'edit/redo',
         'subtitle/select/all',
       ])
       if (command && (!editing || (isSubtitleEditor && !nativeEditingCommands.has(command)))) {
@@ -1842,6 +1900,9 @@ export function App() {
                 )
               }
               selectedCues={selectedCues}
+              onVisualSelect={visualSelectCue}
+              onVisualSetActive={visualSetActiveCue}
+              onVisualDeselect={visualDeselectCue}
               onPatchStyle={(id, patch, label) =>
                 void apply([{ type: 'updateStyle', id, patch }], label)
               }
@@ -1991,6 +2052,11 @@ export function App() {
                   activeStyle ? { id: activeStyle.id, name: activeStyle.name } : null,
                 )
               }
+              onTextSelection={(pos, start, end) =>
+                coreRef.current?.notifyTextSelection(pos, start, end)
+              }
+              textSelection={core.textSelection}
+              historyNonce={historyNonce}
             />
           </div>
         </div>
@@ -2160,6 +2226,8 @@ export function App() {
         <ShiftTimesDialog
           cues={core.document.cues}
           selectedIds={selectedOrActive(core.document, selectedSet, activeId)}
+          fileName={core.document.sourceName}
+          frameRate={frameRate}
           onClose={() => setDialog(null)}
           onApply={(commands, label) => void apply(commands, label)}
         />
@@ -2201,19 +2269,14 @@ export function App() {
         <StylingAssistantDialog
           cue={selectedCue}
           styles={core.document.styles}
+          hasAudio={!!audioMedia}
+          hasVideo={!!videoMedia}
           onClose={() => setDialog(null)}
-          onApply={(style, next) => {
-            void apply(
-              [{ type: 'updateCue', id: selectedCue.id, patch: { style } }],
-              tPlain('styling assistant'),
-            )
-            if (next) moveSelection(1)
-          }}
-          onPrevious={() => moveSelection(-1)}
-          onPlay={() => {
-            setVideoTimeMs(selectedCue.startMs)
-            sendVideoAction('play')
-          }}
+          onApply={(id, style) =>
+            void apply([{ type: 'updateCue', id, patch: { style } }], 'styling assistant')
+          }
+          onSeekVideo={setVideoTimeMs}
+          onCommand={executeCommand}
         />
       )}
       {dialog === 'attachments' && <AttachmentDialog onClose={() => setDialog(null)} />}
@@ -2225,15 +2288,19 @@ export function App() {
           onClose={() => setDialog(null)}
         />
       )}
-      {dialog === 'translation' && selectedCue && (
+      {dialog === 'translation' && selectedCue && core && (
         <TranslationDialog
           cue={selectedCue}
-          onApply={(text) =>
-            void apply(
-              [{ type: 'updateCue', id: selectedCue.id, patch: { text } }],
-              tPlain('translation assistant'),
-            )
+          cues={core.document.cues}
+          hasAudio={!!audioMedia}
+          hasVideo={!!videoMedia}
+          onSelectCue={selectOnly}
+          onApply={(id, text) =>
+            void apply([{ type: 'updateCue', id, patch: { text } }], 'translation assistant')
           }
+          onSeekVideo={setVideoTimeMs}
+          onCommand={executeCommand}
+          onMessage={setStatus}
           onClose={() => setDialog(null)}
         />
       )}
@@ -2245,10 +2312,11 @@ export function App() {
       )}
       {dialog === 'resample' && core && (
         <ResampleDialog
-          scriptInfo={core.document.scriptInfo}
-          onApply={(patch) =>
-            void apply([{ type: 'updateScriptInfo', patch }], tPlain('resolution resampling'))
-          }
+          document={core.document}
+          hasVideo={!!videoMedia}
+          videoWidth={videoIntrinsicSize.width}
+          videoHeight={videoIntrinsicSize.height}
+          onApply={(commands) => void apply(commands, 'resolution resampling')}
           onClose={() => setDialog(null)}
         />
       )}

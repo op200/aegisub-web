@@ -25,6 +25,14 @@ const char *aegisub_document_search(aegisub_document_t document, const char *set
 int32_t aegisub_document_replace_all(aegisub_document_t document, const char *settings_json);
 /// 标记文档已保存：下一次提交不再与保存前合并（subs_controller.cpp saved_commit_id 语义）
 int32_t aegisub_document_mark_saved(aegisub_document_t document);
+/// 选中/活动行实时修订撤销栈顶条目（subs_controller.cpp:OnSelectionChanged/OnActiveLineChanged）。
+/// selected_json 为行 id 字符串数组的 JSON（如 ["3","7"]）；active_id 为行 id 字符串或空串。
+/// fire-and-forget，无响应
+int32_t aegisub_document_notify_selection(aegisub_document_t document, const char *selected_json, const char *active_id);
+/// 编辑框文本选区实时修订撤销栈顶条目（subs_controller.cpp:OnTextSelectionChanged）。
+/// pos 为插入点（光标），sel_start/sel_end 为选区边界；Undo/Redo 后 UI 按恢复值设置 textarea 选区。
+/// fire-and-forget，无响应
+int32_t aegisub_document_notify_text_selection(aegisub_document_t document, int32_t pos, int32_t sel_start, int32_t sel_end);
 /// 运行时配置（undo_levels = Limits/Undo Levels）
 int32_t aegisub_document_configure(aegisub_document_t document, int32_t undo_levels);
 void aegisub_core_free(const void *memory);
