@@ -90,8 +90,9 @@ export class CoreClient {
     return this.request<CoreState>({ method: 'restore', document })
   }
 
-  apply(commands: CoreCommand[], label: string): Promise<CoreState> {
-    return this.request<CoreState>({ method: 'apply', commands, label })
+  /** amend = 显式修订上一次提交（只有编辑框/视觉拖拽等提交点传 true，其余各自成撤销点） */
+  apply(commands: CoreCommand[], label: string, amend?: boolean): Promise<CoreState> {
+    return this.request<CoreState>({ method: 'apply', commands, label, amend })
   }
 
   undo(): Promise<CoreState> {

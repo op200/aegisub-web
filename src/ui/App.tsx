@@ -816,11 +816,14 @@ export function App() {
   }
 
   const apply = useCallback(
-    async (commands: CoreCommand[], label: string): Promise<CoreState | null> => {
+    // amend = 修订上一次提交（源码 AssFile::Commit 的 commitId / subs_controller.cpp:OnCommit
+    // 的 commit_id 邻接判据）：只有编辑框与视觉工具拖拽这类"同一次交互内的连续提交"才传 true，
+    // 命令类提交省略 → 各自成一个撤销点
+    async (commands: CoreCommand[], label: string, amend?: boolean): Promise<CoreState | null> => {
       if (!coreRef.current) return null
       setBusy(true)
       try {
-        const next = await coreRef.current.apply(commands, label)
+        const next = await coreRef.current.apply(commands, label, amend)
         setCore(next)
         setDirty(true)
         // label 为源码 msgid（小写），经 tPlain 命中 po 翻译显示
@@ -1869,9 +1872,8 @@ export function App() {
           displayMode === 'full' || displayMode === 'video_subs'
             ? {
                 // video_box.cpp 挂靠 TopSizer proportion 0：视频栏高度=精确最小高（display+56），
-                // 多余空间全给 Grid（proportion 1）；窗口放不下时整体被窗口裁剪（wx 布局子项
-                // 永不小于 min size）。上界 min-content = 侧栏（视觉工具栏 + 子工具栏）自然高：
-                // 视频缩放过小时 wx 取 max(视频框, 侧栏) 撑高视频框，保证侧栏子选项不被挤掉
+                // 多余空间全给 Grid（proportion 1）；窗口放不下时 wx 靠 frame 最小尺寸强制窗口变大
+                // （永不压缩视频栏），浏览器侧由 .workspace 的 overflow:auto 滚动到达（见 styles.css）
                 gridTemplateRows:
                   videoMedia && !isNarrowViewport
                     ? `minmax(${videoLayout.panelHeight}px, min-content) minmax(120px, 1fr)`
@@ -1892,11 +1894,14 @@ export function App() {
               onOpenMedia={() => void openVideo()}
               mediaAction={videoAction}
               onCommand={executeCommand}
-              onPatchCue={(id, patch, label) => apply([{ type: 'updateCue', id, patch }], label)}
-              onPatchCues={(patches, label) =>
+              onPatchCue={(id, patch, label, amend) =>
+                apply([{ type: 'updateCue', id, patch }], label, amend)
+              }
+              onPatchCues={(patches, label, amend) =>
                 apply(
                   patches.map(({ id, patch }) => ({ type: 'updateCue', id, patch })),
                   label,
+                  amend,
                 )
               }
               selectedCues={selectedCues}
@@ -2041,9 +2046,16 @@ export function App() {
               frameRate={frameRate}
               frameMode={frameMode && frameRate.isLoaded()}
               onFrameModeChange={setFrameMode}
-              onCommit={(patch, label) => {
-                if (selectedCue)
-                  void apply([{ type: 'updateCue', id: selectedCue.id, patch }], label)
+              onCommit={(patch, label, amend) => {
+                // subs_edit_box.cpp SetSelectedRows：编辑框任一字段都作用于选中集合的全部行
+                // （无选中时 selectedCues 回退活动行）；一次 apply 内多条命令 = 一个撤销点；
+                // amend 由 EditPanel 按源码判定（同描述/同时间字段）后下发
+                if (selectedCues.length === 0) return
+                void apply(
+                  selectedCues.map((cue) => ({ type: 'updateCue', id: cue.id, patch })),
+                  label,
+                  amend,
+                )
               }}
               onCommand={executeCommand}
               isCommandEnabled={isCommandEnabled}

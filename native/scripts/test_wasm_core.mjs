@@ -89,7 +89,9 @@ const applyCmds = JSON.stringify([
 ])
 const cmdsPtr = cstr(applyCmds)
 const labelPtr = cstr('Edit text')
-const applyResult = module_._aegisub_document_apply_json(doc, cmdsPtr, labelPtr)
+// 第 4 参 amend（ABI v6）：非 0 = 修订上一次提交（源码 AssFile::Commit 的 commitId 回传）；
+// 命令类提交传 0 → 各自成点
+const applyResult = module_._aegisub_document_apply_json(doc, cmdsPtr, labelPtr, 0)
 free(cmdsPtr)
 free(labelPtr)
 if (applyResult !== 0) throw new Error('apply failed')
@@ -168,7 +170,7 @@ if (stateRep.document.cues[0].text !== 'hi {\\i1}world{\\i0}')
 
 // 10. 编辑框文本选区（subs_controller.cpp:UndoInfo pos/sel_start/sel_end）：
 // notify_text_selection 实时修订栈顶条目，undo 后恢复新栈顶的快照
-if (module_._aegisub_core_abi_version() < 4) throw new Error('abi version should be >= 4')
+if (module_._aegisub_core_abi_version() < 5) throw new Error('abi version should be >= 5')
 module_._aegisub_document_notify_text_selection(doc, 7, 2, 7)
 const selPtr = module_._aegisub_document_state_json(doc)
 const selState = JSON.parse(module_.UTF8ToString(selPtr))
@@ -191,6 +193,40 @@ if (
   selState2.textSelection.end !== 0
 )
   throw new Error('undo textSelection mismatch')
+
+if (module_._aegisub_core_abi_version() < 6) throw new Error('abi version should be >= 6')
+
+// 11. 撤销合并判据（ABI v6 的显式 amend）：
+//   同标签 + amend=1 连续提交合并为一个撤销点；命令类（amend=0）各自成点
+const cueId = state.document.cues[0].id
+function cueText() {
+  const ptr = module_._aegisub_document_state_json(doc)
+  const value = JSON.parse(module_.UTF8ToString(ptr)).document.cues[0].text
+  module_._aegisub_core_free(ptr)
+  return value
+}
+function applyText(text, label, amend) {
+  const cmds = cstr(JSON.stringify([{ type: 'updateCue', id: cueId, patch: { text } }]))
+  const lbl = cstr(label)
+  if (module_._aegisub_document_apply_json(doc, cmds, lbl, amend) !== 0) throw new Error('applyText failed')
+  free(cmds)
+  free(lbl)
+}
+const baseText = cueText()
+applyText('amend-1', 'amend test', 1)
+applyText('amend-2', 'amend test', 1)
+if (cueText() !== 'amend-2') throw new Error('amend apply mismatch')
+module_._aegisub_document_undo(doc)
+console.log('coalesced amend undo ->', cueText())
+if (cueText() !== baseText) throw new Error('consecutive amended edits should coalesce into one undo point')
+
+applyText('cmd-1', 'amend test', 0)
+applyText('cmd-2', 'amend test', 0)
+module_._aegisub_document_undo(doc)
+console.log('non-amend undo 1 ->', cueText())
+if (cueText() !== 'cmd-1') throw new Error('non-amended commits must be separate undo points')
+module_._aegisub_document_undo(doc)
+if (cueText() !== baseText) throw new Error('second non-amended undo mismatch')
 
 module_._aegisub_document_destroy(doc)
 console.log('\nALL ABI TESTS PASSED')

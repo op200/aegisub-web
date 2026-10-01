@@ -14,7 +14,14 @@ aegisub_document_t aegisub_document_create(void);
 void aegisub_document_destroy(aegisub_document_t document);
 int32_t aegisub_document_open(aegisub_document_t document, const uint8_t *data, size_t size, const char *source_name);
 const char *aegisub_document_state_json(aegisub_document_t document);
-int32_t aegisub_document_apply_json(aegisub_document_t document, const char *commands_json, const char *label);
+/// 应用一批命令并（可选地）建立撤销点。
+/// amend 非 0 = "修订上一次提交"（源码 AssFile::Commit 的 commitId 回传，subs_controller.cpp:
+/// OnCommit 的 `commit_id == *c.commit_id+1` 判据）：仅当上一次提交由同一提交点发起、期间没有
+/// 其它提交、redo 栈为空且未越过保存点时才与上一个撤销点合并；调用方须自行按源码语义判断
+/// "同描述 / 同一次拖拽"（subs_edit_box.cpp:Commit 的 amend + last_commit_type、
+/// visual_tool.cpp:274-276 的鼠标抬起失效），核心只认这个显式信号。
+/// 命令类提交（复制行/删除/粘贴/排序等，源码未传 commitId）传 0 → 各自成点。
+int32_t aegisub_document_apply_json(aegisub_document_t document, const char *commands_json, const char *label, int32_t amend);
 int32_t aegisub_document_undo(aegisub_document_t document);
 int32_t aegisub_document_redo(aegisub_document_t document);
 const uint8_t *aegisub_document_export(aegisub_document_t document, const char *format, size_t *size);

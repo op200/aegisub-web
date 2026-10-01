@@ -350,7 +350,12 @@ button:disabled {
      100dvh - 74(菜单24+工具栏30+状态栏20) - 120(Grid 最小高) = 100dvh - 194，
      视频 intrinsic 高（1080p）不得把 Grid 挤出窗口 */
   grid-template-rows: minmax(320px, calc(100dvh - 194px)) minmax(120px, 1fr);
-  overflow: hidden;
+  /* 源码在窗口放不下时不压缩任何子项：VideoBox（video_box.cpp:93）/ Grid（frame_main.cpp:212）都按
+     sizer 自然尺寸排布，靠 frame 的最小尺寸强制窗口变大（VideoDisplay::FitClientSizeToVideo 的
+     SetMin/MaxClientSize）。浏览器无法改变窗口尺寸，等价做法 = 工作区可滚动：布局仍按自然尺寸铺开
+     （视频框 = 视频×窗口缩放、视觉工具列被撑高、底栏/滑条位于视频框之下），超出部分滚动到达，
+     而不是被裁掉后无法触达（视频放大时底栏、字幕网格、右侧音频/编辑面板都曾整个消失） */
+  overflow: auto;
 }
 /* Aegisub frame_main.cpp：Video(左) | [Audio(上) + EditBox(下)]（右），Grid 全宽在底部 */
 .top-workspace {
@@ -385,7 +390,11 @@ button:disabled {
   background: rgba(128, 128, 128, 0.28);
 }
 .preview-panel {
-  min-width: 0;
+  /* video_box.cpp：VideoBox 在 frame_main 的 TopSizer 里 proportion 0，宽度取 sizer 自然宽 =
+     max(topSizer 自然宽 = 侧栏 + 视频框, videoBottomSizer 自然宽 = 底栏各控件最小宽之和)。
+     故面板宽以 min-content 为下限：窗口缩放极小时视频框变小，但底栏时间框仍保住 110px
+     （VideoPosition/VideoSubsPos 的 wxSize(110,-1)），面板随之变宽、视频框仍贴左上 */
+  min-width: min-content;
   min-height: 0;
   /* 允许收缩：视频框 = intrinsic × zoom（原版停靠模式 SetMin/MaxClientSize），窗口放不下时裁剪而非挤压音频区 */
   flex: 0 1 auto;
@@ -393,45 +402,58 @@ button:disabled {
   /* 视频区行 min 取 min-content：video_box.cpp 的 topSizer 最小高 = max(视频框, 侧栏自然高)，
      窗口/缩放放不下时裁掉底部滑条与工具行，而不是压缩视频区（App 的 workspace 行同源） */
   grid-template-rows: minmax(min-content, 1fr) 2px 25px 29px;
-  background: #111;
+  /* 视频面板底色 = wxPanel 默认色：画布不足视频区时露出的余量颜色
+     （video_box.cpp 的 topSizer 不拉伸 VideoDisplay，余下空间即面板背景） */
+  background: var(--surface);
   border-right: 1px solid var(--border-dark);
 }
 .video-content {
+  position: relative;
   min-width: 0;
   min-height: 0;
   display: grid;
   /* 视觉工具列宽随图标尺寸伸缩（源码 wxToolBar 最佳尺寸撑开 sizer 列），30px 为
      16px 图标时的基准宽（.visual-toolbar min-width 维持默认外观） */
   grid-template-columns: auto minmax(0, 1fr);
-  /* video_box.cpp：visualToolBar proportion=1 拉伸填满列高，visualSubToolBar 自然高度（wxTB_BOTTOM）沉底；
-     主工具行 min 取 min-content（wx 子项永不小于 min size）：缩放过小时侧栏整体撑高视频框，
-     而不是把工具行压成 0（App 的 workspace 行随 min-content 一起长） */
-  grid-template-rows: minmax(min-content, 1fr) auto;
+  /* video_box.cpp:82-84：topSizer(横向) = toolbarSizer + VideoDisplay，两者并排同高。
+     toolbarSizer 内部纵向两件套（visualToolBar proportion 1 / visualSubToolBar proportion 0）
+     都在这一列里 → 子工具栏沉到列底、底边与视频框底边对齐，面板高恒为 视频高 + 56
+     （calculateAttachedVideoLayout 的 CHROME_HEIGHT），不因子工具栏额外增高 */
+  grid-template-rows: minmax(min-content, 1fr);
 }
-/* 矢量裁剪子工具栏：与主视觉工具栏同列，位于列底（visualSubToolBar 在 visualToolBar 下方）。
-   元素同时带 .visual-toolbar 类，双类选择器覆盖其 grid-row:1（同特异性按顺序后者会赢） */
-.visual-toolbar.visual-subtoolbar {
+/* video_box.cpp:78-80 的 toolbarSizer：主工具栏(proportion 1) + 子工具栏(proportion 0) 纵向同列 */
+.visual-toolbar-column {
   grid-column: 1;
-  grid-row: 2;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  /* wx 子项永不小于 min size：列最低高 = 两个工具条自然高之和 → 缩放过小时侧栏撑高视频区
+     （topSizer 最小高 = max(视频框, 侧栏)），画布下方露出的是面板底色 */
+  min-height: min-content;
+  /* 16px 图标时列宽基准 30px（wxMSW 视觉工具栏默认观感） */
+  min-width: 30px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+/* 矢量裁剪/透视子工具栏：同列内跟在主工具栏之后（visualSubToolBar 在 visualToolBar 下方） */
+.visual-toolbar.visual-subtoolbar {
+  flex: 0 0 auto;
   border-top: 1px solid var(--border-faint);
 }
 .video-content > .video-stage {
   grid-column: 2;
-  grid-row: 1 / span 2;
+  grid-row: 1;
 }
 .visual-toolbar {
-  grid-column: 1;
-  grid-row: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 1px;
   padding: 3px 0;
   background: var(--surface);
-  border-right: 1px solid var(--border);
-  /* 16px 图标时列宽基准 30px（wxMSW 视觉工具栏默认观感） */
-  min-width: 30px;
-  /* 矢量裁剪子工具栏出现时主工具栏行被压缩：可滚动而非被不透明背景盖住（"工具消失"） */
+  /* 主工具栏 proportion 1：拉伸吃掉列内余量（图标贴顶，下方余量即源码里被撑出的空白）；
+     列被外层压缩时内部滚动，而非被不透明背景盖住（"工具消失"） */
+  flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
 }
@@ -449,6 +471,14 @@ button:disabled {
   place-items: center;
   overflow: hidden;
   background: #111;
+  /* video_display.cpp 停靠模式：GL 画布被 SetMin/MaxClientSize 钉死为视口尺寸
+     （intrinsic × windowZoom，不含内容缩放），sizer 未给对齐标志 → 默认 left/top 贴角。
+     画布外的余量露 .preview-panel 底色，画布内多余部分才是 glClearColor 的黑。
+     --viewport-width/height 由 PreviewPane 按 hasVideo 内联给出；无视频时画布铺满视频区 */
+  width: var(--viewport-width, 100%);
+  height: var(--viewport-height, 100%);
+  justify-self: start;
+  align-self: start;
 }
 .video-stage video {
   width: 100%;
@@ -582,7 +612,9 @@ button:disabled {
   touch-action: none;
 }
 .video-bottom {
-  min-width: 0;
+  /* wx sizer 子项永不小于 min size：底栏自身也以 min-content 为下限，
+     于是面板的 min-content ≥ 底栏自然宽（= 按钮行 + 2×110 + 缩放框 + 间距） */
+  min-width: min-content;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -608,8 +640,14 @@ button:disabled {
 }
 .video-position,
 .video-subs-pos {
-  flex: 1;
-  min-width: 0;
+  /* video_box.cpp：VideoPosition/VideoSubsPos 是 wxSizerFlags(1)（可拉伸，min size 110px）。
+     web 侧不写死最小宽，改由**内容**决定：field-sizing: content 让输入框固有宽跟随 value
+     文本（"时间码 - 帧号" / "相对字幕起止的偏移串"），min-width: min-content 保证窗口缩到
+     极小时也不小于这段文本宽；值变长/变短时最小宽跟着变。
+     不支持 field-sizing 的浏览器退回输入框固有内容宽（Chromium 约 139px），仍不会被压扁 */
+  field-sizing: content;
+  flex: 1 1 auto;
+  min-width: min-content;
   height: 21px;
   padding: 0 4px;
   border: 1px solid var(--border);
@@ -2125,9 +2163,28 @@ button:disabled {
     /* 移动端为固定高度块：恢复可压缩行，侧栏超高时内部滚动（原行为），
        不让 min-content 把底部滑条/工具行顶出面板 */
     grid-template-rows: minmax(0, 1fr) 2px 25px 29px;
+    /* 移动端面板占满整行宽：底栏按可用宽度压缩，避免底栏自然宽（≈418px）撑出横向滚动 */
+    min-width: 0;
   }
   .video-content {
-    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr);
+  }
+  /* 移动端面板高度固定：侧栏不撑高（内部滚动），避免把滑条/底栏顶出面板 */
+  .visual-toolbar-column {
+    min-height: 0;
+  }
+  /* 移动端面板高度固定：画布恢复铺满视频区，避免视口尺寸大于固定行高时溢出到滑条行 */
+  .video-stage {
+    width: 100%;
+    height: 100%;
+    justify-self: stretch;
+  }
+  .video-position,
+  .video-subs-pos {
+    min-width: 0;
+  }
+  .video-bottom {
+    min-width: 0;
   }
   .audio-panel {
     height: 245px;
@@ -2419,16 +2476,25 @@ button:disabled {
   align-items: stretch;
 }
 .timing-styles {
-  width: 170px;
+  /* LeftSizer 宽度 = max(StyleList 最小宽 150, All/None 按钮行自然宽)：按钮文字不换行，
+     译文较长（如「全选(A)/全不选(N)」）时左栏随内容加宽，而非把按钮压成两行 */
+  min-width: 170px;
   flex-shrink: 0;
   /* LeftSizer 为 wxVERTICAL：清单在上、All/None 按钮行在下 */
   display: flex;
   flex-direction: column;
 }
+.timing-styles .dialog-row button {
+  /* wxButton 不折行；StyleButtonsSizer 里两按钮 proportion 1（按自然宽分配） */
+  flex: 1 1 auto;
+  white-space: nowrap;
+}
 .dialog-checklist {
   /* LeftSizer->Add(StyleList, wxSizerFlags(1))：样式清单吸收左栏剩余高度，
-     自适应填充到父容器（wxCheckListBox 最小尺寸 150×150） */
+     自适应填充到父容器（wxCheckListBox 最小尺寸 150×150）；
+     定宽 150 避免样式名把左栏自然宽撑大（左栏宽度只由按钮行决定） */
   flex: 1;
+  width: 150px;
   min-height: 150px;
   display: flex;
   flex-direction: column;

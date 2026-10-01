@@ -259,7 +259,9 @@ function cpsOf(cue: SubtitleCue): number | null {
   const text = cue.text.replace(/\{[^}]*\}/g, '').replace(/\\(N|n|h)/g, '')
   if (!text) return null
   if (text.length > duration) return null
-  return Math.round((text.length * 1000) / duration)
+  const cps = Math.round((text.length * 1000) / duration)
+  // grid_column.cpp Paint：cps < 0 或 cps > 100 时不绘制（过高的字/秒省略显示）
+  return cps > 100 ? null : cps
 }
 
 function cellValue(

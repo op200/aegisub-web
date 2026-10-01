@@ -27,6 +27,10 @@ import { MenuPopup } from './MenuPopup'
 
 const EDIT_ICON = (name: string) => aegisubIconUrl(`${name}_64`)
 
+/** 时间字段（subs_edit_box.cpp 的 TimeField：TIME_START / TIME_END / TIME_DURATION）：
+ *  连续修改同一字段才合并为一个撤销点（CommitTimes 的 last_time_commit_type 判据） */
+type TimeFieldKey = 'startMs' | 'endMs' | 'duration'
+
 /** edit/color/* 按钮 → 覆写标签 + 样式字段（command/edit.cpp show_color_picker） */
 const COLOR_TAGS = {
   c: { tag: '\\c', alt: '\\1c', field: 'primaryColor' },
@@ -109,8 +113,9 @@ interface EditRowHandlers {
     field: 'actor' | 'effect' | 'marginL' | 'marginR' | 'marginV',
     value: string | number,
     label: string,
+    amend: boolean,
   ) => void
-  commitTimes: (patch: { startMs?: number; endMs: number }) => void
+  commitTimes: (patch: { startMs?: number; endMs: number }, field: TimeFieldKey) => void
   commitTimeKeystroke: (field: 'startMs' | 'endMs', value: number) => void
   setTime: (
     field: 'startMs' | 'endMs',
@@ -213,11 +218,12 @@ const EditTopRow = memo(
             onChange={(event) => {
               const value = event.target.value
               handlers.current.patchDraft({ actor: value })
-              handlers.current.commitField('actor', value, 'actor change')
+              // 逐键输入合并为一个撤销点（subs_edit_box.cpp OnActorChange: amend = EVT_TEXT）
+              handlers.current.commitField('actor', value, 'actor change', true)
             }}
             onBlur={(event) => {
               handlers.current.setEditingField(null)
-              handlers.current.commitField('actor', event.target.value, 'actor change')
+              handlers.current.commitField('actor', event.target.value, 'actor change', false)
             }}
           />
           <datalist id={`edit-actor-values-${cueId}`}>
@@ -235,11 +241,11 @@ const EditTopRow = memo(
             onChange={(event) => {
               const value = event.target.value
               handlers.current.patchDraft({ effect: value })
-              handlers.current.commitField('effect', value, 'effect change')
+              handlers.current.commitField('effect', value, 'effect change', true)
             }}
             onBlur={(event) => {
               handlers.current.setEditingField(null)
-              handlers.current.commitField('effect', event.target.value, 'effect change')
+              handlers.current.commitField('effect', event.target.value, 'effect change', false)
             }}
           />
           <datalist id={`edit-effect-values-${cueId}`}>
@@ -373,7 +379,7 @@ const EditTimesRow = memo(
                 const session = handlers.current.timeSession()
                 session.endMs = nextEndMs
                 handlers.current.patchDraft({ endMs: nextEndMs })
-                handlers.current.commitTimes({ endMs: nextEndMs })
+                handlers.current.commitTimes({ endMs: nextEndMs }, 'duration')
               }
               return
             }
@@ -383,7 +389,7 @@ const EditTimesRow = memo(
               const session = handlers.current.timeSession()
               session.endMs = nextEndMs
               handlers.current.patchDraft({ endMs: nextEndMs })
-              handlers.current.commitTimes({ endMs: nextEndMs })
+              handlers.current.commitTimes({ endMs: nextEndMs }, 'duration')
             }
           }}
           onBlur={(event) => {
@@ -393,7 +399,7 @@ const EditTimesRow = memo(
             if (parsed !== null) {
               const nextEndMs = startMs + parsed
               handlers.current.patchDraft({ endMs: nextEndMs })
-              handlers.current.commitTimes({ endMs: nextEndMs })
+              handlers.current.commitTimes({ endMs: nextEndMs }, 'duration')
             }
             handlers.current.clearTimeSession()
           }}
@@ -408,7 +414,7 @@ const EditTimesRow = memo(
           onChange={(event) => {
             const value = Number(event.target.value)
             handlers.current.patchDraft({ marginL: value })
-            handlers.current.commitField('marginL', value, 'left margin change')
+            handlers.current.commitField('marginL', value, 'left margin change', false)
           }}
           onBlur={(event) => {
             handlers.current.setEditingField(null)
@@ -416,6 +422,7 @@ const EditTimesRow = memo(
               'marginL',
               Number(event.target.value),
               'left margin change',
+              false,
             )
           }}
         />
@@ -429,7 +436,7 @@ const EditTimesRow = memo(
           onChange={(event) => {
             const value = Number(event.target.value)
             handlers.current.patchDraft({ marginR: value })
-            handlers.current.commitField('marginR', value, 'right margin change')
+            handlers.current.commitField('marginR', value, 'right margin change', false)
           }}
           onBlur={(event) => {
             handlers.current.setEditingField(null)
@@ -437,6 +444,7 @@ const EditTimesRow = memo(
               'marginR',
               Number(event.target.value),
               'right margin change',
+              false,
             )
           }}
         />
@@ -450,7 +458,7 @@ const EditTimesRow = memo(
           onChange={(event) => {
             const value = Number(event.target.value)
             handlers.current.patchDraft({ marginV: value })
-            handlers.current.commitField('marginV', value, 'vertical margin change')
+            handlers.current.commitField('marginV', value, 'vertical margin change', false)
           }}
           onBlur={(event) => {
             handlers.current.setEditingField(null)
@@ -458,6 +466,7 @@ const EditTimesRow = memo(
               'marginV',
               Number(event.target.value),
               'vertical margin change',
+              false,
             )
           }}
         />
@@ -629,7 +638,9 @@ interface EditPanelProps {
   /** 帧号显示模式（timecodes 加载后可用；timeedit_ctrl SetByFrame） */
   frameMode: boolean
   onFrameModeChange: (value: boolean) => void
-  onCommit: (patch: Partial<Omit<SubtitleCue, 'id'>>, label: string) => void
+  /** amend = 修订上一次提交（subs_edit_box.cpp:Commit 的 commitId 回传；由 EditPanel 按
+   *  "同描述 / 同时间字段" 判定后下发） */
+  onCommit: (patch: Partial<Omit<SubtitleCue, 'id'>>, label: string, amend?: boolean) => void
   onCommand: (id: string) => void
   isCommandEnabled: (id: string) => boolean
   /** Edit 按钮：直接打开当前行样式的编辑对话框（源码 DialogStyleEditor） */
@@ -776,42 +787,58 @@ export function EditPanel({
     editor.setSelectionRange(start, end, pos === start && start !== end ? 'backward' : 'forward')
     reportTextSelection(editor, onTextSelection)
   }, [historyNonce, textSelection, onTextSelection])
+  /** 编辑框的提交合并槽（subs_edit_box.cpp 的 commit_id + last_commit_type / last_time_commit_type）：
+   *  只有描述未变（时间修改按字段细分）才回传上次提交（amend），否则开新撤销点；行 id 参与 key
+   *  以复现 OnActiveLineChanged 切行重置 commit_id 的行为 */
+  const amendKeyRef = useRef('')
   if (!cue || !draft)
     return <section className="edit-panel empty-edit">{tPlain('No line selected')}</section>
 
+  const commitAmend = (key: string, requested: boolean) => {
+    const amend = requested && key === amendKeyRef.current
+    amendKeyRef.current = key
+    return amend
+  }
   const commit = (
     field: keyof SubtitleCue,
     value: SubtitleCue[keyof SubtitleCue],
     label: string,
   ) => {
-    if (cue[field] !== value) onCommit({ [field]: value }, label)
+    // 源码 OnCommentChange/OnStyleChange/OnLayerEnter 不传 amend（每次各自成点）
+    if (cue[field] !== value)
+      onCommit({ [field]: value }, label, commitAmend(`${cue.id}:${label}`, false))
   }
   /** 合并写草稿（函数式更新：memo 静态子树的处理器经 ref 调用，不持有渲染期 draft） */
   const patchDraft = (patch: Partial<SubtitleCue>) => {
     setDraft((old) => (old ? { ...old, ...patch } : old))
   }
   /** 逐键提交（源码 EVT_TEXT）：以已发送值为准去重（cue prop 可能落后于在途事务，
-   *  用陈旧 cue 比较会漏发补丁）；键含行 id，跨行残留只会命中"core 已有该值"的 no-op；
-   *  runtime 按"同 label+同目标行"合并 undo */
+   *  用陈旧 cue 比较会漏发补丁）；键含行 id，跨行残留只会命中"core 已有该值"的 no-op */
   const commitField = (
     field: 'actor' | 'effect' | 'marginL' | 'marginR' | 'marginV',
     value: string | number,
     label: string,
+    amend: boolean,
   ) => {
     const key = `${cue.id}:${field}`
     if (sentFieldsRef.current[key] === value) return
     sentFieldsRef.current[key] = value
-    onCommit({ [field]: value } as Partial<Omit<SubtitleCue, 'id'>>, label)
+    // Actor/Effect 逐键（wxEVT_TEXT）才 amend，失焦不 amend；边距不 amend（源码同上）
+    onCommit(
+      { [field]: value } as Partial<Omit<SubtitleCue, 'id'>>,
+      label,
+      commitAmend(`${cue.id}:${label}`, amend),
+    )
   }
   /** 时间提交（subs_edit_box.cpp CommitTimes）：以已发送值为准去重后发送；
-   *  undo 标签 "modify times"（源码同） */
-  const commitTimes = (patch: { startMs?: number; endMs: number }) => {
+   *  undo 标签 "modify times"（源码同）；连续修改同一字段才 amend（last_time_commit_type） */
+  const commitTimes = (patch: { startMs?: number; endMs: number }, field: TimeFieldKey) => {
     const key = `${cue.id}:times`
     const sent = sentFieldsRef.current[key] as { startMs?: number; endMs: number } | undefined
     const startSent = patch.startMs === undefined || sent?.startMs === patch.startMs
     if (startSent && sent?.endMs === patch.endMs) return
     sentFieldsRef.current[key] = { ...sent, ...patch }
-    onCommit(patch, 'modify times')
+    onCommit(patch, 'modify times', commitAmend(`${cue.id}:times:${field}`, true))
   }
   /** 时间编辑会话（subs_edit_box.cpp initial_times）：按行缓存快照，跨行自动重建 */
   const timeSession = () => {
@@ -835,7 +862,7 @@ export function EditPanel({
       patch = { endMs: value, startMs: Math.min(value, session.startMs) }
     }
     setDraft((old) => (old ? { ...old, ...patch } : old))
-    commitTimes(patch)
+    commitTimes(patch, field)
   }
   /** 光标处的有效字体（command/edit.cpp font_for_line） */
   const effectiveFontAt = (text: string, normPos: number): EffectiveFont => {
@@ -882,7 +909,7 @@ export function EditPanel({
         ? { startMs: value, endMs: Math.max(value, initial.endMs) }
         : { endMs: value, startMs: Math.min(value, initial.startMs) }
     setDraft((old) => (old ? { ...old, ...patch } : old))
-    commitTimes(patch)
+    commitTimes(patch, field)
   }
   /** command/edit.cpp toggle_override_tag：光标处读取当前状态后真实切换；
    *  有选区时首尾各写一个标签（state?0:1 … state?1:0），无选区只写光标处一个 */
@@ -925,7 +952,8 @@ export function EditPanel({
   }
   const commitText = (text: string, label: string) => {
     setDraft((old) => (old ? { ...old, text } : old))
-    onCommit({ text }, label)
+    // subs_edit_box.cpp:CommitText 传 amend=true → 同描述的连续文本提交合并
+    onCommit({ text }, label, commitAmend(`${cue.id}:${label}`, true))
     requestAnimationFrame(() => editorRef.current?.focus())
   }
   // edit/color/*（command/edit.cpp show_color_picker）：初始色 = 样式色被光标处
@@ -1183,7 +1211,11 @@ export function EditPanel({
           onChange={(event) => {
             setDraft({ ...draft, text: event.target.value })
             trackCursor(event.currentTarget)
-            onCommit({ text: event.target.value }, 'modify text')
+            onCommit(
+              { text: event.target.value },
+              'modify text',
+              commitAmend(`${cue.id}:modify text`, true),
+            )
           }}
           onContextMenu={(event) => {
             event.preventDefault()
@@ -1207,12 +1239,20 @@ export function EditPanel({
               const nextText = `${draft.text.slice(0, editor.selectionStart)}${tag}${draft.text.slice(editor.selectionEnd)}`
               const nextPosition = editor.selectionStart + 2
               setDraft({ ...draft, text: nextText })
-              onCommit({ text: nextText }, 'modify text')
+              onCommit(
+                { text: nextText },
+                'modify text',
+                commitAmend(`${cue.id}:modify text`, true),
+              )
               requestAnimationFrame(() => editor.setSelectionRange(nextPosition, nextPosition))
             } else if (event.key === 'Enter' && !event.ctrlKey && !event.altKey && !event.metaKey) {
               event.preventDefault()
               event.stopPropagation()
-              onCommit({ text: draft.text }, 'modify text')
+              onCommit(
+                { text: draft.text },
+                'modify text',
+                commitAmend(`${cue.id}:modify text`, true),
+              )
               onCommand('grid/line/next/create')
             } else if (event.key === 'Tab') {
               event.preventDefault()

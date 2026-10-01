@@ -23,7 +23,12 @@ interface AegisubCoreModule {
   _aegisub_document_destroy(document: number): void
   _aegisub_document_open(document: number, data: number, size: number, sourceName: number): number
   _aegisub_document_state_json(document: number): number
-  _aegisub_document_apply_json(document: number, commandsJson: number, label: number): number
+  _aegisub_document_apply_json(
+    document: number,
+    commandsJson: number,
+    label: number,
+    amend: number,
+  ): number
   _aegisub_document_undo(document: number): number
   _aegisub_document_redo(document: number): number
   _aegisub_document_export(document: number, format: number, sizePtr: number): number
@@ -55,7 +60,7 @@ interface AegisubCoreModule {
 interface CoreRuntime {
   open(bytes: Uint8Array, sourceName: string): CoreState
   restore(document: SubtitleDocument): CoreState
-  apply(commands: CoreCommand[], label: string): CoreState
+  apply(commands: CoreCommand[], label: string, amend?: boolean): CoreState
   undo(): CoreState
   redo(): CoreState
   export(format?: SubtitleFormat): Uint8Array
@@ -108,12 +113,12 @@ class WasmCoreRuntime implements CoreRuntime {
     return this.open(text, document.sourceName || 'untitled.ass')
   }
 
-  apply(commands: CoreCommand[], label: string): CoreState {
+  apply(commands: CoreCommand[], label: string, amend = false): CoreState {
     if (!commands.length) return this.state()
     const m = this.module
     const cmds = m.allocateUTF8(JSON.stringify(commands))
     const labelPtr = m.allocateUTF8(label)
-    const result = m._aegisub_document_apply_json(this.document, cmds, labelPtr)
+    const result = m._aegisub_document_apply_json(this.document, cmds, labelPtr, amend ? 1 : 0)
     m._free(cmds)
     m._free(labelPtr)
     if (result !== 0) throw new Error(this.error)
@@ -323,7 +328,7 @@ self.onmessage = (event: MessageEvent<CoreRequest>) => {
           response.result = active.restore(request.document)
           break
         case 'apply': {
-          const state = active.apply(request.commands, request.label)
+          const state = active.apply(request.commands, request.label, request.amend ?? false)
           const delta = textOnlyDelta(request.commands, state)
           if (delta) response.delta = delta
           else response.result = state

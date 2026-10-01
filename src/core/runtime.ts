@@ -29,10 +29,8 @@ export class TypeScriptCoreRuntime {
   private redoStack: HistoryEntry[] = []
   /** Limits/Undo Levels（默认 50；configure 由 worker 按 Preferences 下发） */
   private maxUndoLevels = 50
-  /** 相邻提交合并资格（commit_id 邻接 + redo 空 + 保存后失效） */
+  /** 相邻提交合并资格（调用方 amend + redo 空 + 保存后失效） */
   private coalescable = false
-  private amendLabel = ''
-  private amendTarget = ''
 
   constructor(document: SubtitleDocument) {
     this.document = structuredClone(document)
@@ -52,8 +50,6 @@ export class TypeScriptCoreRuntime {
     ]
     this.redoStack = []
     this.coalescable = false
-    this.amendLabel = ''
-    this.amendTarget = ''
   }
 
   open(bytes: Uint8Array, sourceName: string): CoreState {
@@ -69,7 +65,7 @@ export class TypeScriptCoreRuntime {
     return this.getState()
   }
 
-  apply(commands: CoreCommand[], label: string): CoreState {
+  apply(commands: CoreCommand[], label: string, amend = false): CoreState {
     if (!commands.length) return this.getState()
     // 空描述提交：数据改变但不建立撤销点（subs_controller.cpp:OnCommit 空消息早退）
     if (!label && this.undoStack.length) {
@@ -77,18 +73,19 @@ export class TypeScriptCoreRuntime {
       this.document.revision += 1
       return this.getState()
     }
-    // 相邻提交合并：同描述 + 同目标行 + redo 空 + 保存后失效
-    // （subs_edit_box desc 相同才 amend、OnActiveLineChanged 切行打断；此处行 id 即目标）
-    const target = commands.length === 1 && commands[0].type === 'updateCue' ? commands[0].id : ''
+    // 相邻提交合并（subs_controller.cpp:OnCommit：commit_id 邻接 + redo 空 + 未越过保存点）：
+    // amend = 调用方显式声明"修订上一次提交"（源码由 SubsEditBox / VisualTool 回传自己的
+    // commit_id，命令类提交一律传默认 -1 → 各自成点）。另校验描述相同，避免 replaceAll 等
+    // 非 apply 通道产生的栈顶被误并
     const coalesce =
-      this.coalescable &&
-      !this.redoStack.length &&
-      label === this.amendLabel &&
-      target === this.amendTarget
+      this.coalescable && amend && !this.redoStack.length && this.undoStack.at(-1)?.label === label
     if (coalesce) this.undoStack.pop()
 
     for (const command of commands) this.applyCommand(command)
     this.document.revision += 1
+    // 新撤销点入栈即清空 redo（subs_controller.cpp:OnCommit 的 redo_stack.clear()）；
+    // 缺此步则 redo 栈长期非空，而合并前提恰要求 redo 空 → 撤销过一次后每次提交各成一点
+    this.redoStack = []
     // 提交后快照入栈：栈顶始终是当前状态；新条目携带提交时的选中/活动行与文本选区
     // （源码 OnCommit 用当前选中集/文本选区初始化 UndoInfo，此后 notify* 持续修订栈顶）
     const previous = this.undoStack.at(-1)
@@ -99,8 +96,6 @@ export class TypeScriptCoreRuntime {
       activeId: previous?.activeId ?? null,
       textSelection: previous ? { ...previous.textSelection } : { pos: 0, start: 0, end: 0 },
     })
-    this.amendLabel = label
-    this.amendTarget = target
     this.coalescable = true
     const depth = Math.max(this.maxUndoLevels, 2)
     if (this.undoStack.length > depth) this.undoStack.splice(0, this.undoStack.length - depth)
@@ -218,8 +213,6 @@ export class TypeScriptCoreRuntime {
       activeId: previous?.activeId ?? null,
       textSelection: previous ? { ...previous.textSelection } : { pos: 0, start: 0, end: 0 },
     })
-    this.amendLabel = 'replace'
-    this.amendTarget = ''
     this.coalescable = true
     this.redoStack = []
     const depth = Math.max(this.maxUndoLevels, 2)

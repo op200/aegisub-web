@@ -70,9 +70,7 @@ struct AegisubDocument {
 	// --- 撤销栈语义对齐 subs_controller.cpp ---
 	// 栈结构：栈底为初始状态、栈顶为当前状态（源码 OnCommit 在提交后快照入栈）；
 	// Undo 要求栈内 >1 个条目（subs_controller.cpp:undo_stack.size() <= 1 直接返回）。
-	bool coalescable = false;      // 相邻提交合并资格（commit_id 邻接 + redo 空 + 保存后失效）
-	std::string amend_label;       // 上一次入栈提交的描述（subs_edit_box：desc 相同才允许 amend）
-	std::string amend_target;      // 单条 updateCue 的行 id（编辑框切行 OnActiveLineChanged 重置 commit_id）
+	bool coalescable = false;      // 相邻提交合并资格（调用方 amend + redo 空 + 保存后失效）
 	int undo_depth = 50;           // Limits/Undo Levels（下限 2 在入栈时钳制）
 };
 
@@ -183,7 +181,23 @@ int obj_int(json::UnknownElement const& el, char const* key) {
 // 基础文档操作
 // ---------------------------------------------------------------------------
 
-std::unique_ptr<AssFile> clone_file(AssFile const& src) { return std::make_unique<AssFile>(src); }
+/// 深拷贝文档，并保持对白行的 Id 不变。
+///
+/// 陷阱：AssFile 的拷贝构造对每行执行 `new AssDialogue(e)`，而
+/// AssDialogue 的拷贝构造会分配**新的 Id**（ass_dialogue.cpp:57
+/// `Id = ++next_id`），这与 ass_dialogue.h 里「Undo/Redo 用的副本保留
+/// 唯一 Id，以便在不同版本中定位等价行」的约定相悖。
+/// 上游 UndoInfo 存的是 `std::vector<AssDialogueBase>`（Id 属于基类，
+/// 随切片一起复制），Apply 时再用 `AssDialogue(AssDialogueBase const&)`
+/// 重建——该构造函数不重发 Id。这里等价处理：拷贝后按位置把 Id 还原。
+std::unique_ptr<AssFile> clone_file(AssFile const& src) {
+	auto out = std::make_unique<AssFile>(src);
+	auto src_it = src.Events.begin();
+	auto dst_it = out->Events.begin();
+	for (; src_it != src.Events.end() && dst_it != out->Events.end(); ++src_it, ++dst_it)
+		dst_it->Id = src_it->Id;
+	return out;
+}
 
 /// 以当前文档 + 栈顶条目的选中/活动行/文本选区建立新撤销条目
 /// （源码 OnCommit 用提交时的当前选中集与文本选区初始化 UndoInfo，此后持续修订栈顶）
@@ -1016,7 +1030,7 @@ std::string export_srt(AegisubDocument const& doc) {
 
 extern "C" {
 
-uint32_t aegisub_core_abi_version(void) { return 4; }
+uint32_t aegisub_core_abi_version(void) { return 6; }
 
 aegisub_document_t aegisub_document_create(void) {
 	try {
@@ -1063,8 +1077,6 @@ int32_t aegisub_document_open(aegisub_document_t document, const uint8_t* data, 
 		// 栈底压入初始状态（源码加载路径 Commit("", COMMIT_NEW) 建立首个撤销点）
 		doc->undo_stack.push_back(make_entry(*doc, ""));
 		doc->coalescable = false;
-		doc->amend_label.clear();
-		doc->amend_target.clear();
 		doc->revision = 0;
 		return 0;
 	} catch (std::exception const& e) {
@@ -1092,7 +1104,7 @@ const char* aegisub_document_state_json(aegisub_document_t document) {
 	}
 }
 
-int32_t aegisub_document_apply_json(aegisub_document_t document, const char* commands_json, const char* label) {
+int32_t aegisub_document_apply_json(aegisub_document_t document, const char* commands_json, const char* label, int32_t amend) {
 	try {
 		auto* doc = reinterpret_cast<AegisubDocument*>(document);
 		if (!doc) {
@@ -1112,19 +1124,25 @@ int32_t aegisub_document_apply_json(aegisub_document_t document, const char* com
 			++doc->revision;
 			return 0;
 		}
-		// 相邻提交合并（subs_controller.cpp:OnCommit）：同描述 + 同目标行 + redo 空 + 保存后失效。
-		// 源码 single_line 原位更新/弹栈重推两种合并路径对外都表现为"一个撤销点"，此处统一弹栈重推。
-		std::string target = commands.size() == 1 ? obj_get(commands.front(), "id") : std::string();
-		bool coalesce = doc->coalescable && doc->redo_stack.empty() && !doc->undo_stack.empty() &&
-		                label_str == doc->amend_label && target == doc->amend_target;
+		// 相邻提交合并（subs_controller.cpp:OnCommit：`commit_id == *c.commit_id+1` + redo 空 +
+		// 未越过保存点）。判据里的"commit_id 邻接"等价于调用方显式声明修订上一次提交：
+		// 源码由各提交点（SubsEditBox / VisualTool）持有 commit_id，只有它们自己发起的上一次
+		// 提交才可能被修订（命令类提交一律传默认 -1 → 各自成点），故 ABI 直接收显式 amend 标志。
+		// 另校验描述相同：非 apply 通道（aegisub_document_replace_all）也会入栈，不能让它的栈顶
+		// 被随后的 amend 提交误并。源码 single_line 原位更新/弹栈重推两条合并路径对外都表现为
+		// "一个撤销点"，此处统一弹栈重推。
+		bool coalesce = doc->coalescable && amend != 0 && doc->redo_stack.empty() &&
+		                !doc->undo_stack.empty() && doc->undo_stack.back().label == label_str;
 		if (coalesce) doc->undo_stack.pop_back();
 
 		apply_commands(*doc, commands);
 		++doc->revision;
+		// 新撤销点入栈即清空 redo（subs_controller.cpp:OnCommit 的 redo_stack.clear()）。
+		// 缺此步则 redo 栈长期非空，而合并前提恰要求 redo 空 → 撤销过一次之后，拖拽的
+		// 每次 pointermove 都会各建一个撤销点（表现为"单次拖动 = 几十次历史事件"）
+		doc->redo_stack.clear();
 		// 提交后快照入栈：栈顶始终是当前状态
 		doc->undo_stack.push_back(make_entry(*doc, label_str));
-		doc->amend_label = label_str;
-		doc->amend_target = target;
 		doc->coalescable = true;
 		int depth = std::max(doc->undo_depth, 2);
 		while (static_cast<int>(doc->undo_stack.size()) > depth) doc->undo_stack.erase(doc->undo_stack.begin());
@@ -1313,8 +1331,6 @@ int32_t aegisub_document_replace_all(aegisub_document_t document, const char* se
 		if (replaced > 0) {
 			// 替换成功才算一次提交（search_replace_engine.cpp:Commit(_("replace"))）
 			doc->undo_stack.push_back(make_entry(*doc, "replace"));
-			doc->amend_label = "replace";
-			doc->amend_target.clear();
 			doc->coalescable = true;
 			doc->redo_stack.clear();
 			++doc->revision;

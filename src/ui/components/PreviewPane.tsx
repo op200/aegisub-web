@@ -53,15 +53,19 @@ interface PreviewPaneProps {
   onOpenMedia: () => void
   mediaAction: { sequence: number; type: string }
   onCommand: (id: string) => void
+  /** amend = 修订上一次提交（源码 VisualTool::commit_id）：同一次拖拽内的连续提交才合并为
+   *  一个撤销点（visual_tool.cpp OnMouseEvent 末尾左键抬起即 commit_id = -1） */
   onPatchCue: (
     id: string,
     patch: Partial<Omit<SubtitleCue, 'id'>>,
     label: string,
+    amend?: boolean,
   ) => Promise<unknown> | void
   /** 批量补丁（一次 apply = 一条 undo 记录）：SetSelectedOverride 多行同改语义 */
   onPatchCues: (
     patches: { id: string; patch: Partial<Omit<SubtitleCue, 'id'>> }[],
     label: string,
+    amend?: boolean,
   ) => Promise<unknown> | void
   /** 当前选中行（含活动行）：视觉工具 SetSelectedOverride 的目标集合 */
   selectedCues: SubtitleCue[]
@@ -2094,6 +2098,16 @@ export function PreviewPane({
     dragCommitRef.current = serialLatest((commit: () => unknown) => commit())
   const scheduleDragCommit = (commit: () => unknown) => dragCommitRef.current!(commit)
   const flushDragCommit = () => dragCommitRef.current!.flush()
+  // 视觉工具拖拽的 amend 状态（源码 VisualTool::commit_id）：按下时置 false（本次拖拽的首个
+  // 提交开新撤销点），此后同一次拖拽内的提交都传 true → 合并为一个撤销点
+  // （visual_tool.cpp:274-276 "Only coalesce the changes made in a single drag"，鼠标抬起即 -1）
+  const dragAmendRef = useRef(false)
+  /** 取当前拖拽的 amend 值并标记"已在同一拖拽内提交过" */
+  const dragAmend = () => {
+    const amend = dragAmendRef.current
+    dragAmendRef.current = true
+    return amend
+  }
   // <video> 元素同一时刻只保留一个在途 seek：拖动/跟随产生的目标远快于解复用 + 解码，
   // 逐个下发会让浏览器按顺序把中间位置解码呈现（"眼睁睁看着图像从 a 慢慢走到 b"）。
   // 在途期间新目标只覆盖待发槽位（中间位置丢弃），seeked 后补发最新目标——与源码
@@ -2264,6 +2278,18 @@ export function PreviewPane({
    *  zoom 100% 时 1 视频像素 : 1 物理屏幕像素（点对点），不在此取整以免破坏设备像素对齐 */
   const mediaCssSize = (intrinsic: number) =>
     Math.max(1, (intrinsic * windowZoom * contentZoom) / (displayDpr > 0 ? displayDpr : 1))
+
+  /** 视口（GL 画布）CSS 尺寸 = intrinsic × windowZoom / dpr，不含内容缩放。
+   *  video_display.cpp FitClientSizeToVideo：停靠模式把画布钉死为视口尺寸（SetMin/MaxClientSize），
+   *  画布本身不做 AR letterbox（PositionVideo 的 letterbox 仅在 freeSize 分支）；
+   *  媒体框 = 视口 × contentZoom 画在画布内，画布余量由 glClearColor(0,0,0,0) 清成黑。
+   *  停靠模式下画布贴视频区左上（wxSizer 未给对齐标志 → 默认 left/top），余量露面板底色 */
+  const viewportCssSize = (intrinsic: number) =>
+    Math.max(1, (intrinsic * windowZoom) / (displayDpr > 0 ? displayDpr : 1))
+
+  /** 视口尺寸的 intrinsic 来源：dummy 用 dummy 分辨率，真实视频用解码尺寸 */
+  const viewportIntrinsicHeight = media?.dummy ? media.dummy.height : intrinsicHeight
+  const viewportIntrinsicWidth = media?.dummy ? media.dummy.width : intrinsicWidth
 
   /** 媒体显示框（video / WebCodecs 包裹层 / dummy 框）相对舞台的矩形，含平移与缩放后的实际位置 */
   const mediaRect = () => {
@@ -3798,6 +3824,7 @@ export function PreviewPane({
         },
       })),
       tPlain(label),
+      dragAmend(),
     )
   }
 
@@ -3965,6 +3992,7 @@ export function PreviewPane({
         },
       })),
       tPlain(label),
+      dragAmend(),
     )
   }
 
@@ -4205,6 +4233,8 @@ export function PreviewPane({
   }
 
   const canvasPointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    // 任何一次按下都开新提交组（源码 VisualTool::OnMouseEvent 末尾"左键未按住即 commit_id = -1"）
+    dragAmendRef.current = false
     // 源码视觉工具只响应左键；中键留给拖动平移，右键留给上下文菜单
     if (event.button !== 0) return
     visualDragRef.current = true
@@ -4330,7 +4360,9 @@ export function PreviewPane({
             })`,
           )
         : setPosition(drag.cue.text, drag.baseX + dx, drag.baseY + dy)
-      scheduleDragCommit(() => onPatchCue(drag.cue.id, { text }, tPlain('visual typesetting')))
+      scheduleDragCommit(() =>
+        onPatchCue(drag.cue.id, { text }, tPlain('visual typesetting'), dragAmend()),
+      )
     } else if (visualTool === 'video/tool/scale') {
       let dx = ((event.clientX - drag.startX) / scale) * 1.25
       let dy = ((drag.startY - event.clientY) / scale) * 1.25
@@ -4359,6 +4391,7 @@ export function PreviewPane({
             patch: { text: setOverride(setOverride(cue.text, 'fscx', valueX), 'fscy', valueY) },
           })),
           tPlain('visual typesetting'),
+          dragAmend(),
         ),
       )
     } else if (visualTool === 'video/tool/rotate/z') {
@@ -4378,6 +4411,7 @@ export function PreviewPane({
             patch: { text: setOverride(cue.text, 'frz', value) },
           })),
           tPlain('visual typesetting'),
+          dragAmend(),
         ),
       )
     } else if (visualTool === 'video/tool/rotate/xy') {
@@ -4403,6 +4437,7 @@ export function PreviewPane({
             patch: { text: setOverride(setOverride(cue.text, 'frx', valueX), 'fry', valueY) },
           })),
           tPlain('visual typesetting'),
+          dragAmend(),
         ),
       )
     } else if (visualTool === 'video/tool/clip') {
@@ -4431,6 +4466,7 @@ export function PreviewPane({
             },
           })),
           tPlain('visual typesetting'),
+          dragAmend(),
         ),
       )
     }
@@ -4493,30 +4529,32 @@ export function PreviewPane({
     visualDragRef.current = false
     if (vclipRef.current) {
       vclipPointerUp()
-      return
-    }
-    if (perspRef.current) {
+    } else if (perspRef.current) {
       perspPointerUp()
-      return
+    } else {
+      // 点击（未拖动）的选择微调（visual_tool.cpp OnMouseEvent 拖动结束分支）：
+      // 特征未移动（HasMoved 为假 ⇔ 鼠标坐标回到按下处）且按下时未改过选择时，
+      // Ctrl=RemoveSelection / 非 Ctrl=SetSelection(clear)（收缩为单行）
+      const click = visualClickRef.current
+      const drag = dragRef.current
+      visualClickRef.current = null
+      if (
+        click &&
+        drag &&
+        drag.cue.id === click.id &&
+        !click.selChanged &&
+        drag.startX === event.clientX &&
+        drag.startY === event.clientY
+      ) {
+        if (event.ctrlKey) onVisualDeselect(click.id)
+        else onVisualSelect(click.id, false)
+      }
+      dragRef.current = null
     }
-    // 点击（未拖动）的选择微调（visual_tool.cpp OnMouseEvent 拖动结束分支）：
-    // 特征未移动（HasMoved 为假 ⇔ 鼠标坐标回到按下处）且按下时未改过选择时，
-    // Ctrl=RemoveSelection / 非 Ctrl=SetSelection(clear)（收缩为单行）
-    const click = visualClickRef.current
-    const drag = dragRef.current
-    visualClickRef.current = null
-    if (
-      click &&
-      drag &&
-      drag.cue.id === click.id &&
-      !click.selChanged &&
-      drag.startX === event.clientX &&
-      drag.startY === event.clientY
-    ) {
-      if (event.ctrlKey) onVisualDeselect(click.id)
-      else onVisualSelect(click.id, false)
-    }
-    dragRef.current = null
+    // 本次拖拽结束，后续提交开新撤销点（visual_tool.cpp:274-276 "Only coalesce the changes made
+    // in a single drag"：OnMouseEvent 末尾左键未按住即 commit_id = -1）。必须放在 vclip/透视的
+    // 拖拽收尾提交之后，否则松手时的最后一次提交会被误判为"新拖拽起点"而多出一个撤销点
+    dragAmendRef.current = false
   }
 
   // ---- video_context 命令（video_display.cpp 右键菜单）----
@@ -4668,100 +4706,141 @@ export function PreviewPane({
         onMouseEnter={() => setVideoHover(true)}
         onMouseLeave={() => setVideoHover(false)}
       >
-        {/* Tool/Visual/Autohide：仅鼠标位于视频上时显示视觉工具条 */}
-        {!(getOptionBool('Tool/Visual/Autohide') && !videoHover) && (
-          <div className="visual-toolbar" aria-label={tPlain('Visual tools')}>
-            {VISUAL_TOOLS.map(([id, icon]) =>
-              id === '' ? (
-                <div className="visual-sep" key="visual-sep" />
-              ) : (
-                <button
-                  className={`visual-tool${visualTool === id ? ' pressed' : ''}`}
-                  title={commandTooltip(id, 'Video')}
-                  aria-label={commandTooltip(id, 'Video')}
-                  key={id}
-                  disabled={!isCommandEnabled(id)}
-                  aria-pressed={
-                    id.startsWith('video/tool/')
-                      ? visualTool === id || isCommandChecked(id)
-                      : undefined
-                  }
-                  onClick={() => onCommand(id)}
-                >
-                  <img src={VICON(icon)} alt="" width={16} height={16} draggable={false} />
-                </button>
-              ),
-            )}
-          </div>
-        )}
-        {vclip && (
-          <div
-            className="visual-toolbar visual-subtoolbar"
-            aria-label={tPlain('Vector clip sub tools')}
-          >
-            {VCLIP_MODES.map((id, index) =>
-              id === '' ? (
-                <div className="visual-sep" key={`vsub-sep-${index}`} />
-              ) : (
-                <button
-                  className={`visual-tool${vclip.mode === id ? ' pressed' : ''}`}
-                  title={commandTooltip(id, 'Video')}
-                  aria-label={commandTooltip(id, 'Video')}
-                  aria-pressed={vclip.mode === id}
-                  key={id}
-                  onClick={() =>
-                    setVclip((current) =>
-                      current ? { ...current, mode: id, dragStart: null, boxStart: null } : current,
-                    )
-                  }
-                >
-                  {commandIcon(id) ? (
-                    <img src={commandIcon(id)} alt="" width={16} height={16} draggable={false} />
+        {/* video_box.cpp:78-84：topSizer(横向) = toolbarSizer + VideoDisplay，toolbarSizer 是纵向两件套
+            （visualToolBar proportion 1 + visualSubToolBar proportion 0），与视频框并排同高：
+            子工具栏在列内沉底、底边与视频框底边对齐，面板高恒为 视频高 + 56 */}
+        {(!(getOptionBool('Tool/Visual/Autohide') && !videoHover) ||
+          vclip ||
+          visualTool === 'video/tool/perspective') && (
+          <div className="visual-toolbar-column">
+            {/* Tool/Visual/Autohide：仅鼠标位于视频上时显示视觉工具条 */}
+            {!(getOptionBool('Tool/Visual/Autohide') && !videoHover) && (
+              <div className="visual-toolbar" aria-label={tPlain('Visual tools')}>
+                {VISUAL_TOOLS.map(([id, icon]) =>
+                  id === '' ? (
+                    <div className="visual-sep" key="visual-sep" />
                   ) : (
-                    <span className="tool-button-label">{COMMANDS[id]?.label?.[0]}</span>
-                  )}
+                    <button
+                      className={`visual-tool${visualTool === id ? ' pressed' : ''}`}
+                      title={commandTooltip(id, 'Video')}
+                      aria-label={commandTooltip(id, 'Video')}
+                      key={id}
+                      disabled={!isCommandEnabled(id)}
+                      aria-pressed={
+                        id.startsWith('video/tool/')
+                          ? visualTool === id || isCommandChecked(id)
+                          : undefined
+                      }
+                      onClick={() => onCommand(id)}
+                    >
+                      <img src={VICON(icon)} alt="" width={16} height={16} draggable={false} />
+                    </button>
+                  ),
+                )}
+              </div>
+            )}
+            {vclip && (
+              <div
+                className="visual-toolbar visual-subtoolbar"
+                aria-label={tPlain('Vector clip sub tools')}
+              >
+                {VCLIP_MODES.map((id, index) =>
+                  id === '' ? (
+                    <div className="visual-sep" key={`vsub-sep-${index}`} />
+                  ) : (
+                    <button
+                      className={`visual-tool${vclip.mode === id ? ' pressed' : ''}`}
+                      title={commandTooltip(id, 'Video')}
+                      aria-label={commandTooltip(id, 'Video')}
+                      aria-pressed={vclip.mode === id}
+                      key={id}
+                      onClick={() =>
+                        setVclip((current) =>
+                          current
+                            ? { ...current, mode: id, dragStart: null, boxStart: null }
+                            : current,
+                        )
+                      }
+                    >
+                      {commandIcon(id) ? (
+                        <img
+                          src={commandIcon(id)}
+                          alt=""
+                          width={16}
+                          height={16}
+                          draggable={false}
+                        />
+                      ) : (
+                        <span className="tool-button-label">{COMMANDS[id]?.label?.[0]}</span>
+                      )}
+                    </button>
+                  ),
+                )}
+              </div>
+            )}
+            {visualTool === 'video/tool/perspective' && (
+              <div
+                className="visual-toolbar visual-subtoolbar"
+                aria-label={tPlain('Perspective sub tools')}
+              >
+                <div className="visual-sep" />
+                {PERSP_SUBTOOLS.map(({ id, bit }) => (
+                  <button
+                    className={`visual-tool${(perspSettings & bit) !== 0 ? ' pressed' : ''}`}
+                    title={commandTooltip(id, 'Video')}
+                    aria-label={commandTooltip(id, 'Video')}
+                    key={id}
+                    // 源码 EnableTool(lock_outer, subtool & PERSP_OUTER)：未启用 plane 时禁用
+                    disabled={
+                      id === 'video/tool/perspective/lock_outer' &&
+                      !perspHasOuterBits(perspSettings)
+                    }
+                    aria-pressed={(perspSettings & bit) !== 0}
+                    onClick={() => perspSubToolClick(id)}
+                  >
+                    <img src={commandIcon(id)} alt="" width={16} height={16} draggable={false} />
+                  </button>
+                ))}
+                <button
+                  className="visual-tool"
+                  title={perspOrgTitle}
+                  aria-label={perspOrgTitle}
+                  // 源码 ToggleTool(orgmode, false)：org 模式按钮恒不按下
+                  aria-pressed={false}
+                  onClick={() => perspSubToolClick('video/tool/perspective/orgmode/center')}
+                >
+                  <img
+                    src={commandIcon(perspOrgCommand)}
+                    alt=""
+                    width={16}
+                    height={16}
+                    draggable={false}
+                  />
                 </button>
-              ),
+              </div>
             )}
           </div>
         )}
-        {visualTool === 'video/tool/perspective' && (
-          <div
-            className="visual-toolbar visual-subtoolbar"
-            aria-label={tPlain('Perspective sub tools')}
-          >
-            <div className="visual-sep" />
-            {PERSP_SUBTOOLS.map(({ id, bit }) => (
-              <button
-                className={`visual-tool${(perspSettings & bit) !== 0 ? ' pressed' : ''}`}
-                title={commandTooltip(id, 'Video')}
-                aria-label={commandTooltip(id, 'Video')}
-                key={id}
-                // 源码 EnableTool(lock_outer, subtool & PERSP_OUTER)：未启用 plane 时禁用
-                disabled={
-                  id === 'video/tool/perspective/lock_outer' && !perspHasOuterBits(perspSettings)
-                }
-                aria-pressed={(perspSettings & bit) !== 0}
-                onClick={() => perspSubToolClick(id)}
-              >
-                <img src={commandIcon(id)} alt="" width={16} height={16} draggable={false} />
+        {fontAccess === 'available' && hasVideo && (
+          <div className="system-fonts-hint" role="status">
+            <span>
+              {fontAccessError
+                ? `System fonts unavailable: ${fontAccessError}`
+                : tPlain(
+                    'Subtitles render with built-in fallback fonts. Authorize access to use the fonts installed on this system.',
+                  )}
+            </span>
+            {!fontAccessError && (
+              <button onClick={() => void enableSystemFonts()}>
+                {tPlain('Enable system fonts')}
               </button>
-            ))}
+            )}
             <button
-              className="visual-tool"
-              title={perspOrgTitle}
-              aria-label={perspOrgTitle}
-              // 源码 ToggleTool(orgmode, false)：org 模式按钮恒不按下
-              aria-pressed={false}
-              onClick={() => perspSubToolClick('video/tool/perspective/orgmode/center')}
+              className="system-fonts-hint-close"
+              aria-label={tPlain('Dismiss')}
+              onClick={() => setFontAccess('dismissed')}
             >
-              <img
-                src={commandIcon(perspOrgCommand)}
-                alt=""
-                width={16}
-                height={16}
-                draggable={false}
-              />
+              ×
             </button>
           </div>
         )}
@@ -4769,6 +4848,15 @@ export function PreviewPane({
           className="video-stage"
           ref={stageRef}
           tabIndex={0}
+          // 画布 = 视口尺寸（不含 contentZoom），贴视频区左上；余量露面板底色（源码 wxPanel 默认色）
+          style={
+            hasVideo
+              ? ({
+                  '--viewport-width': `${viewportCssSize(viewportIntrinsicWidth)}px`,
+                  '--viewport-height': `${viewportCssSize(viewportIntrinsicHeight)}px`,
+                } as CSSProperties)
+              : undefined
+          }
           onPointerDown={(event) => {
             // video_display.cpp OnMouseEvent：按住中键拖动平移视频画面（Pan(位置差)）
             if (event.button !== 1 || !hasVideo) return
@@ -4810,29 +4898,6 @@ export function PreviewPane({
             if (hasVideo) setContextMenu({ x: event.clientX, y: event.clientY })
           }}
         >
-          {fontAccess === 'available' && hasVideo && (
-            <div className="system-fonts-hint" role="status">
-              <span>
-                {fontAccessError
-                  ? `System fonts unavailable: ${fontAccessError}`
-                  : tPlain(
-                      'Subtitles render with built-in fallback fonts. Authorize access to use the fonts installed on this system.',
-                    )}
-              </span>
-              {!fontAccessError && (
-                <button onClick={() => void enableSystemFonts()}>
-                  {tPlain('Enable system fonts')}
-                </button>
-              )}
-              <button
-                className="system-fonts-hint-close"
-                aria-label={tPlain('Dismiss')}
-                onClick={() => setFontAccess('dismissed')}
-              >
-                ×
-              </button>
-            </div>
-          )}
           <div
             className="video-zoom-stage"
             ref={zoomStageRef}

@@ -59,30 +59,90 @@ describe('core runtime', () => {
   })
 
   // 撤销栈语义对齐 subs_controller.cpp
-  it('coalesces consecutive same-label edits into one undo point', () => {
+  it('coalesces consecutive amended edits of the same label into one undo point', () => {
     const runtime = new TypeScriptCoreRuntime(createDocument())
     const id = runtime.getState().document.cues[0].id
-    runtime.apply([{ type: 'updateCue', id, patch: { text: 'a' } }], 'Edit text')
-    runtime.apply([{ type: 'updateCue', id, patch: { text: 'ab' } }], 'Edit text')
-    runtime.apply([{ type: 'updateCue', id, patch: { text: 'abc' } }], 'Edit text')
-    // 连续同描述编辑合并为一个撤销点：一次撤销回到初始文本
+    runtime.apply([{ type: 'updateCue', id, patch: { text: 'a' } }], 'Edit text', true)
+    runtime.apply([{ type: 'updateCue', id, patch: { text: 'ab' } }], 'Edit text', true)
+    runtime.apply([{ type: 'updateCue', id, patch: { text: 'abc' } }], 'Edit text', true)
+    // 连续 amend 的同描述编辑合并为一个撤销点：一次撤销回到初始文本
     expect(runtime.undo().document.cues[0].text).toBe('Welcome to Aegisub Web')
   })
 
-  it('does not coalesce different labels or different target lines', () => {
+  // 命令类提交不传 amend（源码 AssFile::Commit 的 commitId 默认 -1 → 永不合并且各自成点）
+  it('does not coalesce commands that are not amended (duplicate twice = two undo points)', () => {
     const runtime = new TypeScriptCoreRuntime(createDocument())
     const first = runtime.getState().document.cues[0].id
-    const added = runtime.apply([{ type: 'addCue', afterId: first }], 'Add line')
-    const second = added.document.cues[1].id
-    runtime.apply([{ type: 'updateCue', id: first, patch: { text: 'a' } }], 'Edit text')
-    runtime.apply([{ type: 'updateCue', id: second, patch: { text: 'b' } }], 'Edit text')
-    // 切行打断合并（subs_edit_box OnActiveLineChanged 重置 commit_id）：'b' 是独立撤销点
-    expect(runtime.undo().document.cues[1].text).not.toBe('b')
-    runtime.apply([{ type: 'updateCue', id: first, patch: { text: 'c' } }], 'Edit text')
-    runtime.apply([{ type: 'updateCue', id: first, patch: { startMs: 1000 } }], 'Edit timing')
-    // 不同描述打断合并
+    const dup = (ids: string[]) =>
+      runtime.apply([{ type: 'duplicateCues', ids }], 'Duplicate Lines').document.cues
+    expect(dup([first])).toHaveLength(2)
+    expect(dup([first])).toHaveLength(3)
+    expect(runtime.undo().document.cues).toHaveLength(2)
+    expect(runtime.undo().document.cues).toHaveLength(1)
+  })
+
+  it('does not coalesce when the label changes', () => {
+    const runtime = new TypeScriptCoreRuntime(createDocument())
+    const id = runtime.getState().document.cues[0].id
+    runtime.apply([{ type: 'updateCue', id, patch: { text: 'a' } }], 'Edit text', true)
+    runtime.apply([{ type: 'updateCue', id, patch: { startMs: 1000 } }], 'Edit timing', true)
+    // 不同描述打断合并（subs_edit_box:Commit 的 desc == last_commit_type 前置条件）
     expect(runtime.undo().document.cues[0].startMs).not.toBe(1000)
-    expect(runtime.undo().document.cues[0].text).toBe('a')
+    expect(runtime.undo().document.cues[0].text).toBe('Welcome to Aegisub Web')
+  })
+
+  // 提交清空 redo 栈（subs_controller.cpp:OnCommit 的 redo_stack.clear()）：缺失时 redo 长期
+  // 非空，而合并前提恰要求 redo 空 → 撤销过一次后每次提交各成一个撤销点
+  it('clears the redo stack on a commit so a drag stays one undo point after an undo', () => {
+    const runtime = new TypeScriptCoreRuntime(createDocument())
+    const id = runtime.getState().document.cues[0].id
+    runtime.apply([{ type: 'updateCue', id, patch: { text: 'typed' } }], 'Edit text')
+    runtime.undo()
+    expect(runtime.getState().canRedo).toBe(true)
+
+    // 一次拖拽 = 拖拽期间的多次 amend 提交（首帧 amend 无栈顶可修订，之后逐帧合并）
+    runtime.apply(
+      [{ type: 'updateCue', id, patch: { text: '\\pos(1,2)x' } }],
+      'visual typesetting',
+      true,
+    )
+    runtime.apply(
+      [{ type: 'updateCue', id, patch: { text: '\\pos(3,4)x' } }],
+      'visual typesetting',
+      true,
+    )
+    runtime.apply(
+      [{ type: 'updateCue', id, patch: { text: '\\pos(5,6)x' } }],
+      'visual typesetting',
+      true,
+    )
+    expect(runtime.getState().canRedo).toBe(false)
+
+    // 一次撤销即回滚整次拖拽
+    expect(runtime.undo().document.cues[0].text).toBe('Welcome to Aegisub Web')
+  })
+
+  // 拖拽首帧不 amend（源码 VisualTool::commit_id 在鼠标抬起时置 -1）→ 两次拖拽各成一个撤销点
+  it('does not coalesce across two drags (amend resets on mouse up)', () => {
+    const runtime = new TypeScriptCoreRuntime(createDocument())
+    const id = runtime.getState().document.cues[0].id
+    runtime.apply(
+      [{ type: 'updateCue', id, patch: { text: '\\pos(1,2)x' } }],
+      'visual typesetting',
+      true,
+    )
+    runtime.apply(
+      [{ type: 'updateCue', id, patch: { text: '\\pos(3,4)x' } }],
+      'visual typesetting',
+      true,
+    )
+    // 第二次拖拽的首帧（按下鼠标）不携带 amend
+    runtime.apply(
+      [{ type: 'updateCue', id, patch: { text: '\\pos(5,6)x' } }],
+      'visual typesetting',
+      false,
+    )
+    expect(runtime.undo().document.cues[0].text).toBe('\\pos(3,4)x')
     expect(runtime.undo().document.cues[0].text).toBe('Welcome to Aegisub Web')
   })
 
@@ -92,10 +152,10 @@ describe('core runtime', () => {
     expect(runtime.undo().canUndo).toBe(false)
 
     const id = runtime.getState().document.cues[0].id
-    runtime.apply([{ type: 'updateCue', id, patch: { text: 'saved' } }], 'Edit text')
+    runtime.apply([{ type: 'updateCue', id, patch: { text: 'saved' } }], 'Edit text', true)
     runtime.markSaved()
-    runtime.apply([{ type: 'updateCue', id, patch: { text: 'after save' } }], 'Edit text')
-    // 保存后下一次同描述提交不与保存前合并
+    runtime.apply([{ type: 'updateCue', id, patch: { text: 'after save' } }], 'Edit text', true)
+    // 保存后下一次同描述 amend 提交不与保存前合并（saved_commit_id+1 != commit_id）
     expect(runtime.undo().document.cues[0].text).toBe('saved')
     expect(runtime.redo().document.cues[0].text).toBe('after save')
   })
