@@ -2,6 +2,15 @@ import { X } from 'lucide-react'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import {
+  WX_ID,
+  defaultDialogValues,
+  type DialogControl,
+  type DialogResponse,
+  type DialogSpec,
+  type DialogValue,
+} from '../../automation/luaDialog'
+import type { AutomationFilterDisplayInfo } from '../../automation/luaEngine'
+import {
   getOptionBool,
   getOptionDouble,
   getOptionInt,
@@ -118,6 +127,192 @@ export function Dialog({ title, onClose, children, footer }: DialogProps) {
         {footer && <footer>{footer}</footer>}
       </section>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Lua Automation：配置对话框 / 进度对话框
+// （auto4_lua_dialog.cpp 的 LuaDialog、auto4_lua_progresssink.cpp 的进度报告）
+// ---------------------------------------------------------------------------
+
+/** #RRGGBB[AA] → <input type="color"> 的 #RRGGBB */
+function toColorInput(value: DialogValue): string {
+  const hex = typeof value === 'string' ? value : ''
+  return /^#[0-9a-fA-F]{6}/.test(hex) ? hex.slice(0, 7) : '#000000'
+}
+
+/** <input type="color"> 的 #RRGGBB → 回读值（coloralpha 保留原 alpha 分量） */
+function fromColorInput(next: string, previous: DialogValue, alpha: boolean): string {
+  if (!alpha) return next
+  const match =
+    typeof previous === 'string' ? previous.match(/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})$/) : null
+  return `${next}${match ? match[1] : 'FF'}`
+}
+
+function DialogControlField({
+  control,
+  value,
+  onChange,
+}: {
+  control: DialogControl
+  value: DialogValue
+  onChange: (value: DialogValue) => void
+}) {
+  switch (control.kind) {
+    case 'label':
+      return <span className="lua-config-label">{control.label}</span>
+    case 'edit':
+      return (
+        <input
+          type="text"
+          value={typeof value === 'string' ? value : ''}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      )
+    case 'textbox':
+      return (
+        <textarea
+          rows={4}
+          value={typeof value === 'string' ? value : ''}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      )
+    case 'intedit':
+      return (
+        <input
+          type="number"
+          value={Number(value ?? 0)}
+          min={control.min}
+          max={control.max}
+          step={1}
+          onChange={(event) => onChange(Math.trunc(Number(event.target.value)))}
+        />
+      )
+    case 'floatedit':
+      return (
+        <input
+          type="number"
+          value={Number(value ?? 0)}
+          min={control.min}
+          max={control.max}
+          step={control.step || 'any'}
+          onChange={(event) => onChange(Number(event.target.value))}
+        />
+      )
+    case 'dropdown':
+      return (
+        <select
+          value={typeof value === 'string' ? value : ''}
+          onChange={(e) => onChange(e.target.value)}
+        >
+          {control.items.map((item, index) => (
+            <option key={index} value={item}>
+              {item}
+            </option>
+          ))}
+        </select>
+      )
+    case 'checkbox':
+      return (
+        <label className="lua-config-check">
+          <input
+            type="checkbox"
+            checked={value === true}
+            onChange={(e) => onChange(e.target.checked)}
+          />
+          {control.label}
+        </label>
+      )
+    case 'color':
+    case 'coloralpha':
+      return (
+        <input
+          type="color"
+          value={toColorInput(value)}
+          onChange={(event) => onChange(fromColorInput(event.target.value, value, control.alpha))}
+        />
+      )
+  }
+}
+
+/** aegisub.dialog.display 的宿主实现：渲染控件、回传按钮下标与原始值 */
+export function LuaConfigDialog({
+  spec,
+  initialValues,
+  onSubmit,
+}: {
+  spec: DialogSpec
+  /** 已有配置值（导出过滤器的 Configure 重开时回填）；缺省用控件默认值 */
+  initialValues?: DialogValue[]
+  onSubmit: (response: DialogResponse) => void
+}) {
+  const [values, setValues] = useState<DialogValue[]>(
+    () => initialValues ?? defaultDialogValues(spec),
+  )
+  const setValue = (index: number, value: DialogValue) =>
+    setValues((current) => current.map((item, i) => (i === index ? value : item)))
+
+  const buttonLabel = (id: number, label: string) => {
+    if (label) return label
+    if (id === WX_ID.ok) return tPlain('OK')
+    if (id === WX_ID.cancel) return tPlain('Cancel')
+    if (id === WX_ID.yes) return tPlain('Yes')
+    if (id === WX_ID.no) return tPlain('No')
+    return ''
+  }
+
+  return (
+    <Dialog
+      title={tPlain('Script Configuration')}
+      onClose={() => onSubmit({ button: -1, values })}
+      footer={spec.buttons.map((button, index) => (
+        <button key={index} className="button" onClick={() => onSubmit({ button: index, values })}>
+          {buttonLabel(button.id, button.label)}
+        </button>
+      ))}
+    >
+      <div className="lua-config-body">
+        {spec.controls.map((control, index) => (
+          <div key={index} className="lua-config-control">
+            <DialogControlField
+              control={control}
+              value={values[index]}
+              onChange={(value) => setValue(index, value)}
+            />
+          </div>
+        ))}
+      </div>
+    </Dialog>
+  )
+}
+
+/** 宏运行期的进度/取消对话框（BackgroundScriptRunner 的 Web 版） */
+export function LuaProgressDialog({
+  title,
+  task,
+  value,
+  onCancel,
+}: {
+  title: string
+  task: string
+  value: number
+  onCancel: () => void
+}) {
+  return (
+    <Dialog
+      title={title || tPlain('Progress')}
+      onClose={onCancel}
+      footer={
+        <button className="button" onClick={onCancel}>
+          {tPlain('Cancel')}
+        </button>
+      }
+    >
+      <div className="lua-progress">
+        <progress max={100} value={Math.max(0, Math.min(100, value))} />
+        <span>{task}</span>
+      </div>
+    </Dialog>
   )
 }
 
@@ -2105,7 +2300,11 @@ export interface AutomationScriptInfo {
   name: string
   description: string
   filename: string
-  macros: string[]
+  macros: { id: string; name: string }[]
+  filters: string[]
+  author: string
+  version: string
+  warnings: string[]
   error?: string
 }
 
@@ -2117,6 +2316,46 @@ interface AutomationManagerDialogProps {
   onClose: () => void
 }
 
+/** Show Info 文本（dialog_automation.cpp OnInfo；web 单一脚本管理器，全局脚本恒 0） */
+function automationInfoText(
+  scripts: AutomationScriptInfo[],
+  script: AutomationScriptInfo | null,
+): string {
+  const info: string[] = []
+  info.push(
+    tFmt(
+      'Total scripts loaded: %d\nGlobal scripts loaded: %d\nLocal scripts loaded: %d\n',
+      scripts.length,
+      0,
+      scripts.length,
+    ),
+  )
+  info.push(tPlain('Scripting engines installed:'))
+  info.push('- Lua (*.lua)')
+  if (script) {
+    info.push(
+      tFmt(
+        '\nScript info:\nName: %s\nDescription: %s\nAuthor: %s\nVersion: %s\nFull path: %s\nState: %s\n',
+        script.name,
+        script.description,
+        script.author,
+        script.version,
+        script.filename,
+        script.error
+          ? tPlain('Failed to load')
+          : script.warnings.length
+            ? tPlain('Loaded with warnings')
+            : tPlain('Correctly loaded'),
+      ),
+    )
+    for (const warning of script.warnings) info.push(tFmt('Warning: %s\n', warning))
+    info.push(tPlain('Features provided by script:\n'))
+    for (const macro of script.macros) info.push(tFmt('    Macro: %s (%s)', macro.name, macro.id))
+    for (const filter of script.filters) info.push(tFmt('    Export filter: %s', filter))
+  }
+  return info.join('\n')
+}
+
 export function AutomationManagerDialog({
   scripts,
   onAdd,
@@ -2124,14 +2363,27 @@ export function AutomationManagerDialog({
   onReload,
   onClose,
 }: AutomationManagerDialogProps) {
+  // wxLC_SINGLE_SEL：单选，工具栏按钮按选中态启用（dialog_automation.cpp UpdateDisplay：
+  // Remove 仅对有选中项可用——web 全部为本地脚本；Reload 有选中项即可）
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const selected = scripts.find((script) => script.id === selectedId) ?? null
+  // Show Info 点击时捕获当前选中（web 偏差：用内嵌面板替代桌面的 wxMessageBox 模态框）
+  const [info, setInfo] = useState<{ script: AutomationScriptInfo | null } | null>(null)
   return (
     <Dialog
       title={tPlain('Automation Manager')}
       onClose={onClose}
       footer={
         <>
-          <button onClick={onAdd}>{tPlain('Add')}</button>
-          <button onClick={onClose}>{tPlain('Close')}</button>
+          <button onClick={onAdd}>{tPlain('&Add')}</button>
+          <button disabled={!selected} onClick={() => selected && onRemove(selected.id)}>
+            {tPlain('&Remove')}
+          </button>
+          <button disabled={!selected} onClick={() => selected && onReload(selected.id)}>
+            {tPlain('Re&load')}
+          </button>
+          <button onClick={() => setInfo({ script: selected })}>{tPlain('Show &Info')}</button>
+          <button onClick={onClose}>{tPlain('&Close')}</button>
         </>
       }
     >
@@ -2153,12 +2405,20 @@ export function AutomationManagerDialog({
         )}
         {scripts.map((script) => (
           <div
-            className={`automation-row${script.error ? ' automation-error' : ''}`}
+            className={`automation-row${script.id === selectedId ? ' is-selected' : ''}${
+              script.error
+                ? ' automation-error'
+                : script.warnings.length
+                  ? ' automation-warning'
+                  : ''
+            }`}
             role="row"
+            aria-selected={script.id === selectedId}
             key={script.id}
+            onClick={() => setSelectedId(script.id)}
           >
             <span>L</span>
-            <span title={script.macros.join(', ')}>
+            <span title={script.macros.map((macro) => macro.name).join(', ')}>
               {script.name}
               {script.macros.length > 0 && (
                 <em className="automation-macros"> ({script.macros.length} macros)</em>
@@ -2168,17 +2428,15 @@ export function AutomationManagerDialog({
             <span title={script.error ?? script.description}>
               {script.error ?? script.description}
             </span>
-            <span className="automation-actions">
-              <button onClick={() => onReload(script.id)} title={tPlain('Reload')}>
-                {tPlain('Reload')}
-              </button>
-              <button onClick={() => onRemove(script.id)} title={tPlain('Remove')}>
-                {tPlain('Remove')}
-              </button>
-            </span>
           </div>
         ))}
       </div>
+      {info && (
+        <div className="automation-info">
+          <pre>{automationInfoText(scripts, info.script)}</pre>
+          <button onClick={() => setInfo(null)}>{tPlain('Close')}</button>
+        </div>
+      )}
     </Dialog>
   )
 }
@@ -2792,28 +3050,123 @@ export function TimingProcessorDialog({
 export interface ExportOptions {
   format: 'ass' | 'srt'
   includeComments: boolean
+  /** 勾选的导出过滤器（当前列表序 = 执行顺序，见 AssExporter::AddFilter/Export） */
+  filters: AutomationFilterDisplayInfo[]
 }
 
 interface ExportSubtitlesDialogProps {
+  /** 全部已注册过滤器（链序，AssExportFilterChain::GetFilterList） */
+  filters: AutomationFilterDisplayInfo[]
+  /** 初始勾选（文档 [Aegisub Project Garbage] 的 Export Filters，按展示名匹配） */
+  initialSelected: string[]
+  onConfigure: (filter: AutomationFilterDisplayInfo) => void
   onClose: () => void
   onApply: (options: ExportOptions) => void
 }
 
-export function ExportSubtitlesDialog({ onClose, onApply }: ExportSubtitlesDialogProps) {
+export function ExportSubtitlesDialog({
+  filters,
+  initialSelected,
+  onConfigure,
+  onClose,
+  onApply,
+}: ExportSubtitlesDialogProps) {
   const [format, setFormat] = useState<ExportOptions['format']>('ass')
   const [includeComments, setIncludeComments] = useState(false)
+  // 列表序可变（Move Up/Down 交换相邻项，勾选态随项一起交换）
+  const [order, setOrder] = useState<AutomationFilterDisplayInfo[]>(filters)
+  const [checked, setChecked] = useState<Set<string>>(() => new Set(initialSelected))
+  const [selected, setSelected] = useState<string | null>(null)
+  const selectedFilter = order.find((item) => item.displayName === selected) ?? null
+
+  // swap(list, idx, sel_dir)（dialog_export.cpp:87）：选中项移动一格并保持选中
+  const move = (delta: -1 | 1) => {
+    const index = order.findIndex((item) => item.displayName === selected)
+    const target = index + delta
+    if (index < 0 || target < 0 || target >= order.length) return
+    const next = [...order]
+    ;[next[index], next[target]] = [next[target], next[index]]
+    setOrder(next)
+    setSelected(next[target].displayName)
+  }
+
+  const toggle = (name: string, value: boolean) =>
+    setChecked((current) => {
+      const next = new Set(current)
+      if (value) next.add(name)
+      else next.delete(name)
+      return next
+    })
+
   return (
     <Dialog
       title={tPlain('Export Subtitles')}
       onClose={onClose}
       footer={
         <>
-          <button onClick={() => onApply({ format, includeComments })}>{tPlain('Export')}</button>
+          <button
+            onClick={() =>
+              onApply({
+                format,
+                includeComments,
+                filters: order.filter((item) => checked.has(item.displayName)),
+              })
+            }
+          >
+            {tPlain('Export')}
+          </button>
           <button onClick={onClose}>{tPlain('Cancel')}</button>
         </>
       }
     >
-      <div className="dialog-fields">
+      <div className="dialog-fields export-dialog-body">
+        <fieldset className="dialog-fieldset export-filter-box">
+          <legend>{tPlain('Filters')}</legend>
+          <div className="export-filter-list" role="listbox" aria-label={tPlain('Filters')}>
+            {order.map((filter) => (
+              <div
+                key={filter.displayName}
+                className={
+                  filter.displayName === selected
+                    ? 'export-filter-row is-selected'
+                    : 'export-filter-row'
+                }
+                role="option"
+                aria-selected={filter.displayName === selected}
+                onClick={() => setSelected(filter.displayName)}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked.has(filter.displayName)}
+                  onChange={(event) => toggle(filter.displayName, event.target.checked)}
+                />
+                <span>{filter.displayName}</span>
+              </div>
+            ))}
+          </div>
+          <div className="export-filter-actions">
+            <button onClick={() => move(-1)}>{tPlain('Move &Up')}</button>
+            <button onClick={() => move(1)}>{tPlain('Move &Down')}</button>
+            <button onClick={() => setChecked(new Set(order.map((item) => item.displayName)))}>
+              {tPlain('Select &All')}
+            </button>
+            <button onClick={() => setChecked(new Set())}>{tPlain('Select &None')}</button>
+          </div>
+          <textarea
+            className="export-filter-description"
+            readOnly
+            value={selectedFilter?.description ?? ''}
+          />
+          <button
+            className="export-filter-configure"
+            disabled={!selectedFilter?.hasConfig}
+            onClick={() => {
+              if (selectedFilter) onConfigure(selectedFilter)
+            }}
+          >
+            {tPlain('Configure')}
+          </button>
+        </fieldset>
         <fieldset className="dialog-fieldset">
           <legend>{tPlain('Format')}</legend>
           <label className="dialog-check">

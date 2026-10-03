@@ -603,6 +603,33 @@ void apply_move_cues(AegisubDocument& doc, json::UnknownElement const& cmd) {
 	} catch (...) {}
 }
 
+/// SubtitleStyle JSON 字段 → AssStyle（updateStyle 补丁与 replaceDocument 重建共用）
+void set_style_field(AssStyle& style, std::string const& key, json::UnknownElement const& value) {
+	if (key == "name") style.name = json_str(value);
+	else if (key == "fontName") style.font = json_str(value);
+	else if (key == "fontSize") style.fontsize = json_double(value);
+	else if (key == "primaryColor") style.primary = agi::Color(json_str(value));
+	else if (key == "secondaryColor") style.secondary = agi::Color(json_str(value));
+	else if (key == "outlineColor") style.outline = agi::Color(json_str(value));
+	else if (key == "backColor") style.shadow = agi::Color(json_str(value));
+	else if (key == "bold") style.bold = json_bool(value);
+	else if (key == "italic") style.italic = json_bool(value);
+	else if (key == "underline") style.underline = json_bool(value);
+	else if (key == "strikeout") style.strikeout = json_bool(value);
+	else if (key == "scaleX") style.scalex = json_double(value);
+	else if (key == "scaleY") style.scaley = json_double(value);
+	else if (key == "spacing") style.spacing = json_double(value);
+	else if (key == "angle") style.angle = json_double(value);
+	else if (key == "borderStyle") style.borderstyle = json_int(value);
+	else if (key == "outline") style.outline_w = json_double(value);
+	else if (key == "shadow") style.shadow_w = json_double(value);
+	else if (key == "alignment") style.alignment = json_int(value);
+	else if (key == "marginL") style.Margin[0] = json_int(value);
+	else if (key == "marginR") style.Margin[1] = json_int(value);
+	else if (key == "marginV") style.Margin[2] = json_int(value);
+	else if (key == "encoding") style.encoding = json_int(value);
+}
+
 void apply_update_style(AegisubDocument& doc, json::UnknownElement const& cmd) {
 	std::string id = obj_get(cmd, "id");
 	AssStyle* style = find_style(*doc.file, id);
@@ -612,31 +639,7 @@ void apply_update_style(AegisubDocument& doc, json::UnknownElement const& cmd) {
 		auto patch_it = cmd_obj.find("patch");
 		if (patch_it == cmd_obj.end()) return;
 		json::Object const& p = static_cast<json::Object const&>(patch_it->second);
-		for (auto const& [key, value] : p) {
-			if (key == "name") style->name = json_str(value);
-			else if (key == "fontName") style->font = json_str(value);
-			else if (key == "fontSize") style->fontsize = json_double(value);
-			else if (key == "primaryColor") style->primary = agi::Color(json_str(value));
-			else if (key == "secondaryColor") style->secondary = agi::Color(json_str(value));
-			else if (key == "outlineColor") style->outline = agi::Color(json_str(value));
-			else if (key == "backColor") style->shadow = agi::Color(json_str(value));
-			else if (key == "bold") style->bold = json_bool(value);
-			else if (key == "italic") style->italic = json_bool(value);
-			else if (key == "underline") style->underline = json_bool(value);
-			else if (key == "strikeout") style->strikeout = json_bool(value);
-			else if (key == "scaleX") style->scalex = json_double(value);
-			else if (key == "scaleY") style->scaley = json_double(value);
-			else if (key == "spacing") style->spacing = json_double(value);
-			else if (key == "angle") style->angle = json_double(value);
-			else if (key == "borderStyle") style->borderstyle = json_int(value);
-			else if (key == "outline") style->outline_w = json_double(value);
-			else if (key == "shadow") style->shadow_w = json_double(value);
-			else if (key == "alignment") style->alignment = json_int(value);
-			else if (key == "marginL") style->Margin[0] = json_int(value);
-			else if (key == "marginR") style->Margin[1] = json_int(value);
-			else if (key == "marginV") style->Margin[2] = json_int(value);
-			else if (key == "encoding") style->encoding = json_int(value);
-		}
+		for (auto const& [key, value] : p) set_style_field(*style, key, value);
 		style->UpdateData();
 	} catch (...) {}
 }
@@ -769,41 +772,67 @@ void apply_sort_cues_by(AegisubDocument& doc, json::UnknownElement const& cmd) {
 }
 
 // Automation 整表重放：以 Lua subtitles 表最终对白重建 Events（与 TS runtime 一致）
-void apply_replace_cues(AegisubDocument& doc, json::UnknownElement const& cmd) {
+void replace_events(AegisubDocument& doc, json::Array const& cues) {
+	while (!doc.file->Events.empty())
+		doc.file->Events.erase_and_dispose(doc.file->Events.begin(), [](AssDialogue* e) { delete e; });
+	for (auto const& cue_el : cues) {
+		json::Object const& c = static_cast<json::Object const&>(cue_el);
+		auto sget = [&](char const* k) -> std::string {
+			auto it = c.find(k);
+			return it == c.end() ? std::string() : json_str(it->second);
+		};
+		auto iget = [&](char const* k) -> int {
+			auto it = c.find(k);
+			return it == c.end() ? 0 : json_int(it->second);
+		};
+		auto* entry = new AssDialogue;
+		entry->Layer = iget("layer");
+		entry->Start = agi::Time(iget("startMs"));
+		entry->End = agi::Time(iget("endMs"));
+		std::string style = sget("style");
+		if (!style.empty()) entry->Style = boost::flyweight<std::string>(style);
+		entry->Actor = boost::flyweight<std::string>(sget("actor"));
+		entry->Margin[0] = iget("marginL");
+		entry->Margin[1] = iget("marginR");
+		entry->Margin[2] = iget("marginV");
+		entry->Effect = boost::flyweight<std::string>(sget("effect"));
+		entry->Text = boost::flyweight<std::string>(sget("text"));
+		auto comment_it = c.find("comment");
+		entry->Comment = comment_it == c.end() ? false : json_bool(comment_it->second);
+		doc.file->Events.push_back(*entry);
+	}
+	if (doc.file->Events.empty()) doc.file->Events.push_back(*new AssDialogue);
+}
+
+// Automation 整表重放（auto4_lua_assfile.cpp ProcessingComplete 的 apply_lines）：
+// info 缺省表示脚本未触碰信息段（保留现状）；styles 空数组保留原样（web 侧约定）
+void apply_replace_document(AegisubDocument& doc, json::UnknownElement const& cmd) {
 	try {
 		json::Object const& cmd_obj = static_cast<json::Object const&>(cmd);
-		auto cues_it = cmd_obj.find("cues");
-		if (cues_it == cmd_obj.end()) return;
-		json::Array const& cues = static_cast<json::Array const&>(cues_it->second);
-		while (!doc.file->Events.empty())
-			doc.file->Events.erase_and_dispose(doc.file->Events.begin(), [](AssDialogue* e) { delete e; });
-		for (auto const& cue_el : cues) {
-			json::Object const& c = static_cast<json::Object const&>(cue_el);
-			auto sget = [&](char const* k) -> std::string {
-				auto it = c.find(k);
-				return it == c.end() ? std::string() : json_str(it->second);
-			};
-			auto iget = [&](char const* k) -> int {
-				auto it = c.find(k);
-				return it == c.end() ? 0 : json_int(it->second);
-			};
-			auto* entry = new AssDialogue;
-			entry->Layer = iget("layer");
-			entry->Start = agi::Time(iget("startMs"));
-			entry->End = agi::Time(iget("endMs"));
-			std::string style = sget("style");
-			if (!style.empty()) entry->Style = boost::flyweight<std::string>(style);
-			entry->Actor = boost::flyweight<std::string>(sget("actor"));
-			entry->Margin[0] = iget("marginL");
-			entry->Margin[1] = iget("marginR");
-			entry->Margin[2] = iget("marginV");
-			entry->Effect = boost::flyweight<std::string>(sget("effect"));
-			entry->Text = boost::flyweight<std::string>(sget("text"));
-			auto comment_it = c.find("comment");
-			entry->Comment = comment_it == c.end() ? false : json_bool(comment_it->second);
-			doc.file->Events.push_back(*entry);
+		auto info_it = cmd_obj.find("info");
+		if (info_it != cmd_obj.end()) {
+			doc.file->Info.clear();
+			json::Object const& info = static_cast<json::Object const&>(info_it->second);
+			for (auto const& [key, value] : info) doc.file->SetScriptInfo(key, json_str(value));
 		}
-		if (doc.file->Events.empty()) doc.file->Events.push_back(*new AssDialogue);
+		auto styles_it = cmd_obj.find("styles");
+		if (styles_it != cmd_obj.end()) {
+			json::Array const& styles = static_cast<json::Array const&>(styles_it->second);
+			if (!styles.empty()) {
+				while (!doc.file->Styles.empty())
+					doc.file->Styles.erase_and_dispose(doc.file->Styles.begin(), [](AssStyle* e) { delete e; });
+				for (auto const& style_el : styles) {
+					json::Object const& s = static_cast<json::Object const&>(style_el);
+					auto* style = new AssStyle;
+					for (auto const& [key, value] : s) set_style_field(*style, key, value);
+					style->UpdateData();
+					doc.file->Styles.push_back(*style);
+				}
+			}
+		}
+		auto cues_it = cmd_obj.find("cues");
+		if (cues_it != cmd_obj.end())
+			replace_events(doc, static_cast<json::Array const&>(cues_it->second));
 	} catch (...) {}
 }
 
@@ -823,7 +852,7 @@ void apply_commands(AegisubDocument& doc, json::Array const& commands) {
 		else if (type == "updateScriptInfo") apply_update_script_info(doc, cmd);
 		else if (type == "sortCues") apply_sort_cues(doc);
 		else if (type == "sortCuesBy") apply_sort_cues_by(doc, cmd);
-		else if (type == "replaceCues") apply_replace_cues(doc, cmd);
+		else if (type == "replaceDocument") apply_replace_document(doc, cmd);
 	}
 }
 

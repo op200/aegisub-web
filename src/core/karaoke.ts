@@ -100,6 +100,22 @@ export function parseKaraokeSyllables(text: string, lineStartMs: number): Karaok
     : [{ tagType: '\\k', startMs: lineStartMs, durationMs: 0, text: '', ovrTags: new Map() }]
 }
 
+/**
+ * libaegisub Syllable::GetText：kTag 时加 `{tag cs}` 前缀；ovrTags 按偏移插回。
+ * 与 Karaoke.getMessage 的逐音节实现共用（aegisub.parse_karaoke_data 需要单音节文本）。
+ */
+export function syllableGetText(syllable: KaraokeSyllable, kTag: boolean): string {
+  let result = kTag ? `{${syllable.tagType}${Math.floor((syllable.durationMs + 5) / 10)}}` : ''
+  const entries = [...syllable.ovrTags.entries()].sort((a, b) => a[0] - b[0])
+  let cursor = 0
+  for (const [offset, tag] of entries) {
+    const index = Math.min(offset, syllable.text.length)
+    result += syllable.text.slice(cursor, index) + tag
+    cursor = index
+  }
+  return result + syllable.text.slice(cursor)
+}
+
 /** libaegisub Karaoke::SetLine 的 Normalize：音节总长对齐行时长 */
 function normalize(syllables: KaraokeSyllable[], lineStartMs: number, lineEndMs: number): void {
   const total = syllables.reduce((sum, syl) => sum + syl.durationMs, 0)
@@ -244,24 +260,10 @@ export class Karaoke {
     )
   }
 
-  /** GetText：序列化（(d+5)/10 整除回厘秒；ovrTags 按偏移插回） */
-  getText(): string {
+  /** GetText：k_tag 时加 `{tag cs}` 前缀；(d+5)/10 整除回厘秒；ovrTags 按偏移插回 */
+  getText(kTag = true): string {
     let result = ''
-    for (const syl of this.syllables) {
-      result += `{${syl.tagType}${Math.floor((syl.durationMs + 5) / 10)}}`
-      let text = syl.text
-      const entries = [...syl.ovrTags.entries()].sort((a, b) => a[0] - b[0])
-      let rebuilt = ''
-      let cursor = 0
-      for (const [offset, tag] of entries) {
-        const index = Math.min(offset, text.length)
-        rebuilt += text.slice(cursor, index) + tag
-        cursor = index
-      }
-      rebuilt += text.slice(cursor)
-      text = rebuilt
-      result += text
-    }
+    for (const syl of this.syllables) result += syllableGetText(syl, kTag)
     return result
   }
 }

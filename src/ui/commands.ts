@@ -829,6 +829,11 @@ export const COMMANDS: Record<string, CommandInfo> = {
     help: 'Check to see if there is a new version of Aegisub available',
   },
   'app/log': { label: 'Log window', help: 'View the event log' },
+  // Web 特有：便携虚拟文件系统（VFS）文件管理器（见 components/FileManagerDialog.tsx）
+  'app/file_manager': {
+    label: 'File Manager...',
+    help: 'Browse and manage Aegisub Web portable files',
+  },
 
   // ===== help（help.cpp）=====
   'help/contents': { label: 'Contents', help: 'Help topics', shortcuts: { Default: ['F1'] } },

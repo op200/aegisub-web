@@ -310,6 +310,15 @@ export const DEFAULT_CONFIG = {
       Maximized: false,
       'Preview Text': 'Aegisub\\N0123 日本語',
     },
+    // dialog_search_replace.cpp：查找/替换对话框的持久化状态（OPT_GET/OPT_SET 六项）
+    'Search Replace': {
+      Affect: 0,
+      Field: 0,
+      'Match Case': false,
+      RegExp: false,
+      'Skip Comments': false,
+      'Skip Tags': false,
+    },
     'Select Lines': {
       Action: 0,
       Condition: 0,

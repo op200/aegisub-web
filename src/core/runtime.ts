@@ -257,8 +257,19 @@ export class TypeScriptCoreRuntime {
         this.document.cues.splice(afterIndex + 1, 0, cue)
         break
       }
-      case 'replaceCues': {
-        // Automation：以 Lua subtitles 表的最终对白整表替换（无对白时保留一行占位）
+      case 'replaceDocument': {
+        // Automation：以 Lua subtitles 表最终内容整表重放（auto4_lua_assfile.cpp ProcessingComplete）
+        // 信息段：仅脚本触碰过（script_info_copied）才携带，整替
+        if (command.info !== undefined) this.document.scriptInfo = { ...command.info }
+        // 样式段：源码无条件清空后回填；web 端空样式表保留原样（下游 UI 依赖至少一个样式）
+        if (command.styles && command.styles.length) {
+          this.document.styles = command.styles.map((style) => ({
+            ...createDefaultStyle(),
+            ...style,
+            id: makeId('style'),
+          }))
+        }
+        // 对白段：整表重建（无对白时保留一行占位）
         const rebuilt = command.cues.map((cue) => ({
           ...createCue(0, 5000),
           ...cue,

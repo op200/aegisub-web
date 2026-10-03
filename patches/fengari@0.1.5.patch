@@ -1,0 +1,38 @@
+diff --git a/src/liolib.js b/src/liolib.js
+index 92dda580e726cf5d4914132df363869cef6fefe2..231197f4636fec409dbbb3bdbe736987bd3212b4 100644
+--- a/src/liolib.js
++++ b/src/liolib.js
+@@ -131,7 +131,7 @@ const io_output = function(L) {
+ };
+ 
+ /* node <= 6 doesn't support passing a Uint8Array to fs.writeSync */
+-const prepare_string_for_write = process.versions.node > 6 ?
++const prepare_string_for_write = (typeof process !== "undefined" && process.versions.node > 6) ?
+     (s) => s : // identity function
+     (s) => Buffer.from(s.buffer, s.byteOffset, s.byteLength);
+ 
+@@ -221,9 +221,9 @@ const luaopen_io = function(L) {
+     luaL_newlib(L, iolib);
+     createmeta(L);
+     /* create (and set) default files */
+-    createstdfile(L, process.stdin, IO_INPUT, to_luastring("stdin"));
+-    createstdfile(L, process.stdout, IO_OUTPUT, to_luastring("stdout"));
+-    createstdfile(L, process.stderr, null, to_luastring("stderr"));
++    createstdfile(L, typeof process !== "undefined" ? process.stdin : null, IO_INPUT, to_luastring("stdin"));
++    createstdfile(L, typeof process !== "undefined" ? process.stdout : null, IO_OUTPUT, to_luastring("stdout"));
++    createstdfile(L, typeof process !== "undefined" ? process.stderr : null, null, to_luastring("stderr"));
+     return 1;
+ };
+ 
+diff --git a/src/luaconf.js b/src/luaconf.js
+index 5fb91cd70840b5721009ecf440f950aa9478c833..1b08a7b17216c512bd543df76ff0f960e2db1c10 100644
+--- a/src/luaconf.js
++++ b/src/luaconf.js
+@@ -1,6 +1,6 @@
+ "use strict";
+ 
+-const conf = (process.env.FENGARICONF ? JSON.parse(process.env.FENGARICONF) : {});
++const conf = (typeof process !== "undefined" && process.env.FENGARICONF ? JSON.parse(process.env.FENGARICONF) : {});
+ 
+ const {
+     LUA_VERSION_MAJOR,

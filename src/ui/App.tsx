@@ -2,10 +2,31 @@ import { Captions, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 
 import {
+  applyLuaPayload,
+  documentExportFilters,
+  documentToLuaRows,
+  withExportFilters,
+} from '../automation/luaAssFile'
+import {
+  defaultDialogValues,
+  dialogConfigTable,
+  readBackButton,
+  type DialogSpec,
+  type DialogValue,
+} from '../automation/luaDialog'
+import {
+  configureAutomationFilter,
+  isActiveAutomationMacro,
   loadAutomationScript,
+  orderedAutomationFilters,
+  runAutomationFilter,
   runAutomationMacro,
+  validateAutomationMacro,
+  type AutomationFilterDisplayInfo,
+  type AutomationFilterInfo,
+  type AutomationHost,
   type AutomationMacroInfo,
-  type LuaRow,
+  type DialogResponseLike,
 } from '../automation/luaEngine'
 import {
   getOptionBool,
@@ -18,6 +39,14 @@ import { hasStyleOverride } from '../core/assTags'
 import { CoreClient } from '../core/client'
 import { createDocument } from '../core/defaults'
 import { exportSubtitle } from '../core/format'
+import {
+  compileMatcher,
+  findNext as findNextMatch,
+  replaceAllMatches,
+  replaceNext as replaceNextMatch,
+  SEARCH_FIELDS,
+  type SearchReplaceSettings,
+} from '../core/searchReplace'
 import type { CoreCommand, CoreState, SubtitleDocument } from '../core/types'
 import {
   Framerate,
@@ -33,19 +62,25 @@ import { BrowserHostAdapter, MEDIA_FILE_TYPES, SUBTITLE_FILE_TYPES } from '../pl
 import { createNativeHostAdapter } from '../platform/nativeHost'
 import type { AppFileHandle, HostAdapter, MediaSource } from '../platform/types'
 import {
+  automationScriptPath,
   loadAutomationScripts,
-  saveAutomationScripts,
-  type StoredAutomationScript,
+  readAutomationScriptFile,
+  removeAutomationScriptFile,
+  writeAutomationScript,
 } from '../storage/automationStore'
+import { restoreFactoryScripts } from '../storage/factoryScripts'
 import { importFontFiles } from '../storage/fontStore'
 import { loadCachedKeyframes, storeCachedKeyframes } from '../storage/keyframeCacheStore'
 import { loadLatestAutosave, saveAutosave, saveSubtitleBackup } from '../storage/projectStore'
 import {
   loadRecentLists,
+  loadSearchMru,
   pushRecent,
+  pushSearchMru,
   RECENT_TYPES,
   type RecentLists,
   type RecentType,
+  type SearchMruLists,
 } from '../storage/recentStore'
 import { invertLightness } from './color'
 import {
@@ -69,6 +104,8 @@ import {
   FontCollectorDialog,
   JumpToDialog,
   LanguageDialog,
+  LuaConfigDialog,
+  LuaProgressDialog,
   ResampleDialog,
   ScriptPropertiesDialog,
   SelectLinesDialog,
@@ -85,6 +122,7 @@ import {
   type SelectLinesSettings,
 } from './components/dialogs'
 import { EditPanel } from './components/EditPanel'
+import { FileManagerDialog } from './components/FileManagerDialog'
 import { LogPanel } from './components/LogPanel'
 import { MenuBar } from './components/MenuBar'
 import { PreferencesDialog } from './components/PreferencesDialog'
@@ -93,7 +131,7 @@ import { StyleEditorDialog } from './components/StyleEditorDialog'
 import { StyleManagerDialog } from './components/StyleManagerDialog'
 import { gridRowHeight, SubtitleGrid } from './components/SubtitleGrid'
 import { Toolbar } from './components/Toolbar'
-import { initLocale, tPlain, useLocaleVersion } from './i18n'
+import { initLocale, tFmt, tPlain, tPlural, useLocaleVersion } from './i18n'
 import { calculateAttachedVideoLayout } from './layout/videoLayout'
 import { installGlobalLogHandlers, logError, logInfo, getLogEntries, subscribeLogs } from './log'
 import { useSystemTheme } from './theme'
@@ -150,6 +188,13 @@ const DROP_AUDIO_EXTS = [
 ]
 /** LoadList 之外的 Web 扩展：字体文件拖入 → IndexedDB 字体缓存 */
 const DROP_FONT_EXTS = ['.ttf', '.otf', '.ttc', '.woff', '.woff2', '.fon']
+/** 查找/替换 In Field 单选标签（dialog_search_replace.cpp：&Text/St&yle/A&ctor/&Effect） */
+const SEARCH_FIELD_LABELS: Record<string, string> = {
+  text: 'Text',
+  style: 'Style',
+  actor: 'Actor',
+  effect: 'Effect',
+}
 
 /** FrameMain::StatusTimeout 默认超时（frame_main.h ms=10000，到期 OnStatusClear 清空右字段） */
 const STATUS_TIMEOUT_MS = 10000
@@ -169,72 +214,12 @@ interface LoadedAutomationEntry {
   stateId: number
   name: string
   description: string
+  author: string
+  version: string
+  warnings: string[]
   macros: AutomationMacroInfo[]
+  filters: AutomationFilterInfo[]
   error?: string
-}
-
-/** 文档 → Lua 全空间行（Info + Styles + Dialogue，auto4_lua_assfile.cpp 索引空间） */
-function buildLuaRows(document: SubtitleDocument): LuaRow[] {
-  const rows: LuaRow[] = []
-  for (const [key, value] of Object.entries(document.scriptInfo)) {
-    rows.push({ class: 'info', key, value, section: 'Script Info', raw: `${key}: ${value}` })
-  }
-  for (const style of document.styles) {
-    rows.push({
-      class: 'style',
-      name: style.name,
-      fontname: style.fontName,
-      fontsize: style.fontSize,
-      bold: style.bold,
-      italic: style.italic,
-      underline: style.underline,
-      strikeout: style.strikeout,
-      section: 'V4+ Styles',
-      raw: '',
-    })
-  }
-  for (const cue of document.cues) {
-    rows.push({
-      class: 'dialogue',
-      layer: cue.layer,
-      start_time: cue.startMs,
-      end_time: cue.endMs,
-      style: cue.style,
-      actor: cue.actor,
-      margin_l: cue.marginL,
-      margin_r: cue.marginR,
-      margin_t: cue.marginV,
-      margin_b: cue.marginV,
-      effect: cue.effect,
-      comment: cue.comment,
-      text: cue.text,
-      section: 'Events',
-      raw: '',
-    })
-  }
-  return rows
-}
-
-function rowToCuePatch(row: LuaRow): Partial<Omit<import('../core/types').SubtitleCue, 'id'>> {
-  const number = (value: unknown) =>
-    typeof value === 'number' && Number.isFinite(value) ? value : 0
-  return {
-    layer: number(row.layer),
-    startMs: number(row.start_time),
-    endMs: number(row.end_time),
-    style: typeof row.style === 'string' ? row.style : 'Default',
-    actor: typeof row.actor === 'string' ? row.actor : '',
-    marginL: number(row.margin_l),
-    marginR: number(row.margin_r),
-    marginV: number(row.margin_t),
-    effect: typeof row.effect === 'string' ? row.effect : '',
-    comment: row.comment === true,
-    text: typeof row.text === 'string' ? row.text : '',
-  }
-}
-
-function toStoredAutomation(entry: LoadedAutomationEntry): StoredAutomationScript {
-  return { id: entry.key, filename: entry.filename, code: entry.code }
 }
 
 function selectedOrActive(
@@ -363,8 +348,32 @@ export function App() {
   const [findMode, setFindMode] = useState<'find' | 'replace' | null>(null)
   // 查找/替换弹窗 ESC 关闭（不响应点击外部关闭）
   useEscapeClose(() => setFindMode(null), findMode !== null)
-  const [findQuery, setFindQuery] = useState('')
-  const [replaceQuery, setReplaceQuery] = useState('')
+  // 查找/替换设置（dialog_search_replace.cpp：初值取 Tool/Search Replace/* 与 MRU 首项）
+  const [findSettings, setFindSettings] = useState<SearchReplaceSettings>(() => {
+    const mru = loadSearchMru()
+    const field = SEARCH_FIELDS[getOptionInt('Tool/Search Replace/Field')] ?? 'text'
+    return {
+      find: mru.Find[0] ?? '',
+      replaceWith: mru.Replace[0] ?? '',
+      field,
+      limitTo: getOptionInt('Tool/Search Replace/Affect') === 1 ? 'selected' : 'all',
+      matchCase: getOptionBool('Tool/Search Replace/Match Case'),
+      useRegex: getOptionBool('Tool/Search Replace/RegExp'),
+      ignoreComments: getOptionBool('Tool/Search Replace/Skip Comments'),
+      skipTags: getOptionBool('Tool/Search Replace/Skip Tags'),
+    }
+  })
+  // Find/Replace 最近记录（wxComboBox 下拉；源码 mru.cpp "Find"/"Replace"）
+  const [findMru, setFindMru] = useState<SearchMruLists>(() => loadSearchMru())
+  const [findError, setFindError] = useState('')
+  // 编辑框当前文本选区（源码 GetSelectionStart/End()）：由 EditPanel 上报，供查找起点使用
+  const textSelectionRef = useRef({ pos: 0, start: 0, end: 0 })
+  // 查找/替换命中后回写编辑框选区（覆盖一次 core.textSelection 快照）
+  const [findTextSelection, setFindTextSelection] = useState<{
+    pos: number
+    start: number
+    end: number
+  } | null>(null)
   // Audio/Spectrum 选项决定音频默认显示模式
   const [audioView, setAudioView] = useState<AudioView>(() =>
     getOptionBool('Audio/Spectrum') ? 'spectrum' : 'waveform',
@@ -439,6 +448,29 @@ export function App() {
   const [detectedFps, setDetectedFps] = useState<number | null>(null)
   // Lua Automation（auto4_base ScriptManager）
   const [automationScripts, setAutomationScripts] = useState<LoadedAutomationEntry[]>([])
+  // 宏运行期的 aegisub.dialog.display 请求与进度对话框（替代源码的模态对话框）
+  const [luaDialog, setLuaDialog] = useState<{
+    spec: DialogSpec
+    /** 导出过滤器 Configure 重开时的回填值 */
+    initialValues?: DialogValue[]
+    resolve: (response: DialogResponseLike) => void
+  } | null>(null)
+  const [luaProgress, setLuaProgress] = useState<{
+    title: string
+    task: string
+    value: number
+  } | null>(null)
+  const luaCancelledRef = useRef(false)
+  // 导出过滤器的 Configure 结果（键 `${stateId}:${name}`；spec + 最后一次回读值）。
+  // 对应桌面的 automation_settings 持久化（本版本不落盘，仅会话内缓存）
+  const [filterConfigs, setFilterConfigs] = useState<
+    Record<string, { spec: DialogSpec; values: DialogValue[] }>
+  >({})
+  // Automation 菜单项的 validate / isactive 结果缓存（menu.cpp CommandManager::UpdateItem：
+  // 打开菜单时刷新 dynamic 项 → 禁用/勾选态）。键为宏命令 id
+  const [macroMenuState, setMacroMenuState] = useState<
+    Record<string, { enabled: boolean; checked: boolean }>
+  >({})
   const loadedRef = useRef(false)
   // autosaved_commit_id 对应物：最近一次自动保存/文档替换时的 revision
   const lastAutosaveRevisionRef = useRef(0)
@@ -506,8 +538,13 @@ export function App() {
       if (document.revision === lastAutosaveRevisionRef.current) return
       lastAutosaveRevisionRef.current = document.revision
       const name = document.sourceName || 'Untitled'
-      void saveAutosave(name, document)
-        .then((fileName) => setStatus(`File backup saved as "${fileName}".`))
+      const client = coreRef.current
+      if (!client) return
+      // 自动保存写真实 .ass 文本到 Path/Auto/Save（源码 SubtitleFormat::GetWriter(path)->WriteFile）
+      void client
+        .export('ass')
+        .then((bytes) => saveAutosave(name, decodeText(bytes)))
+        .then((path) => setStatus(`File backup saved as "${path}".`))
         .catch(() => undefined)
     }
     if (getOptionBool('App/Auto/Save on Every Change')) {
@@ -676,59 +713,70 @@ export function App() {
   // keyframes 文件优先（project.cpp：文件加载 > 视频自带）
   const activeKeyframes = keyframesFromFile ? keyframes : videoKeyframes
 
+  /** 从 autoload 目录重新加载全部 Automation 脚本（启动恢复 + 文件管理器改动后刷新） */
+  const reloadAllAutomationScripts = useCallback(async () => {
+    const stored = await loadAutomationScripts()
+    const entries = await Promise.all(
+      stored.map(async (script) => {
+        try {
+          const loaded = await loadAutomationScript(script.code, script.id)
+          return {
+            key: script.id,
+            filename: script.filename,
+            code: script.code,
+            ...loaded,
+            error: undefined,
+          }
+        } catch (error) {
+          return {
+            key: script.id,
+            filename: script.filename,
+            code: script.code,
+            stateId: -1,
+            name: script.filename,
+            description: '',
+            author: '',
+            version: '',
+            warnings: [],
+            macros: [],
+            filters: [],
+            error: error instanceof Error ? error.message : tPlain('Failed to load script'),
+          }
+        }
+      }),
+    )
+    setAutomationScripts(entries)
+  }, [])
+
   useEffect(() => {
     // 启动时恢复持久化的 Automation 脚本（LocalScriptManager 语义）
-    void (async () => {
-      const stored = await loadAutomationScripts()
-      if (!stored.length) return
-      const entries = await Promise.all(
-        stored.map(async (script) => {
-          try {
-            const loaded = await loadAutomationScript(script.code, script.filename)
-            return {
-              key: script.id,
-              filename: script.filename,
-              code: script.code,
-              ...loaded,
-              error: undefined,
-            }
-          } catch (error) {
-            return {
-              key: script.id,
-              filename: script.filename,
-              code: script.code,
-              stateId: -1,
-              name: script.filename,
-              description: '',
-              macros: [],
-              error: error instanceof Error ? error.message : tPlain('Failed to load script'),
-            }
-          }
-        }),
-      )
-      setAutomationScripts(entries)
-    })()
-  }, [])
+    void reloadAllAutomationScripts()
+  }, [reloadAllAutomationScripts])
 
   const addAutomationScript = async () => {
     const file = await host.openFile([
       { description: 'Lua scripts', accept: { 'text/plain': ['.lua'] } },
     ])
     if (!file) return
+    // 桌面 DialogAutomation::OnAdd：同名脚本已加载时报错（"Script '%s' is already loaded"）
+    if (automationScripts.some((script) => script.filename === file.name)) {
+      setStatus(`Automation: script "${file.name}" is already loaded`)
+      return
+    }
     const code = decodeText(await host.readFile(file))
     try {
-      const loaded = await loadAutomationScript(code, file.name)
+      // 脚本以 autoload 目录下的虚拟路径为 filename：include 相对该父目录解析
+      const path = automationScriptPath(file.name)
+      const loaded = await loadAutomationScript(code, path)
+      // Add 的落盘：写入 /automation/autoload，跨会话由 autoload 扫描恢复
+      await writeAutomationScript(file.name, code)
       const entry: LoadedAutomationEntry = {
-        key: `${file.name}-${Date.now()}`,
+        key: path,
         filename: file.name,
         code,
         ...loaded,
       }
-      setAutomationScripts((current) => {
-        const next = [...current, entry]
-        void saveAutomationScripts(next.map(toStoredAutomation))
-        return next
-      })
+      setAutomationScripts((current) => [...current, entry])
       setStatus(`Automation: ${loaded.name} loaded (${loaded.macros.length} macros)`)
     } catch (error) {
       setStatus(
@@ -738,32 +786,120 @@ export function App() {
   }
 
   const removeAutomationScript = (key: string) => {
-    setAutomationScripts((current) => {
-      const next = current.filter((script) => script.key !== key)
-      void saveAutomationScripts(next.map(toStoredAutomation))
-      return next
-    })
+    // Remove 的落盘：删除 autoload 中的脚本文件（否则下次启动会被重新收录，有意偏差）
+    void removeAutomationScriptFile(key).catch(() => undefined)
+    setAutomationScripts((current) => current.filter((script) => script.key !== key))
   }
 
   const reloadAutomationScript = async (key: string) => {
     const script = automationScripts.find((item) => item.key === key)
     if (!script) return
+    // Script::Reload：重新读取脚本文件内容
+    const code = (await readAutomationScriptFile(key)) ?? script.code
     try {
-      const loaded = await loadAutomationScript(script.code, script.filename)
+      const loaded = await loadAutomationScript(code, key)
       setAutomationScripts((current) =>
-        current.map((item) => (item.key === key ? { ...item, ...loaded, error: undefined } : item)),
+        current.map((item) =>
+          item.key === key ? { ...item, ...loaded, code, error: undefined } : item,
+        ),
       )
     } catch (error) {
       const message = error instanceof Error ? error.message : tPlain('Failed to load script')
       setAutomationScripts((current) =>
         current.map((item) =>
-          item.key === key ? { ...item, stateId: -1, macros: [], error: message } : item,
+          item.key === key
+            ? { ...item, stateId: -1, macros: [], filters: [], warnings: [], error: message }
+            : item,
         ),
       )
     }
   }
 
-  /** 宏命令入口：整表重放 + 以宏名为 undo描述（auto4_lua.cpp ProcessingComplete） */
+  /**
+   * 刷新 Automation 菜单项的禁用/勾选态（menu.cpp CommandManager::UpdateItem）：
+   * 仅在宏注册了 validate（COMMAND_VALIDATE）或 isactive（COMMAND_TOGGLE）时才调用脚本。
+   * 打开 Automation 菜单时触发，对齐源码 wxEVT_MENU_OPEN 的 lazy 求值。
+   */
+  const refreshMacroMenuStates = async () => {
+    if (!core) return
+    const macros = automationScripts.flatMap((script) =>
+      script.stateId < 0 ? [] : script.macros.map((macro) => ({ stateId: script.stateId, macro })),
+    )
+    if (!macros.some(({ macro }) => macro.hasValidate || macro.hasIsActive)) return
+
+    const rows = documentToLuaRows(core.document)
+    const cueIndex = (cueId: string) => core.document.cues.findIndex((cue) => cue.id === cueId)
+    const selectedIndexes = selectedOrActive(core.document, selectedSet, activeId)
+      .map((cueId) => cueIndex(cueId))
+      .filter((index) => index >= 0)
+    const activeIndex = activeId ? cueIndex(activeId) : -1
+    const menuHost: AutomationHost = {
+      log: (message) => logInfo('automation', message),
+      setStatusText: (text) => setStatus(text),
+    }
+
+    const next: Record<string, { enabled: boolean; checked: boolean }> = {}
+    for (const { stateId, macro } of macros) {
+      let enabled = true
+      let checked = false
+      try {
+        if (macro.hasValidate) {
+          // 各宏共享同一 Lua 状态机，必须串行求值
+          // oxlint-disable-next-line no-await-in-loop
+          const result = await validateAutomationMacro(
+            stateId,
+            macro.name,
+            rows,
+            selectedIndexes,
+            activeIndex,
+            menuHost,
+          )
+          enabled = result.ok
+          // 校验函数内 log/错误走 wxLogWarning 语义（源码 Validate 的 wxLogWarning）
+          for (const message of result.log) logInfo('automation', message)
+        }
+        if (macro.hasIsActive) {
+          // oxlint-disable-next-line no-await-in-loop
+          const result = await isActiveAutomationMacro(
+            stateId,
+            macro.name,
+            rows,
+            selectedIndexes,
+            activeIndex,
+            menuHost,
+          )
+          checked = result.ok && result.active
+          for (const message of result.log) logInfo('automation', message)
+        }
+      } catch {
+        // validate/isactive 求值失败按 Aegisub 语义视为禁用（源码 Validate 返回 false）
+        enabled = false
+      }
+      next[macro.id] = { enabled, checked }
+    }
+    setMacroMenuState(next)
+  }
+
+  /** 宏/过滤器运行的宿主（aegisub.* 的 UI 出口：配置对话框、进度、取消、日志） */
+  const makeAutomationHost = (): AutomationHost => ({
+    showDialog: (spec) =>
+      new Promise<DialogResponseLike>((resolve) => setLuaDialog({ spec, resolve })),
+    setProgress: (value) =>
+      setLuaProgress((current) => (current ? { ...current, value } : current)),
+    setTask: (task) => setLuaProgress((current) => (current ? { ...current, task } : current)),
+    setTitle: (title) =>
+      setLuaProgress((current) =>
+        current ? { ...current, title } : { title, task: '', value: 0 },
+      ),
+    isCancelled: () => luaCancelledRef.current,
+    log: (message) => logInfo('automation', message),
+    setStatusText: (text) => setStatus(text),
+  })
+
+  /**
+   * 宏命令入口：按撤销点顺序整表重放（auto4_lua.cpp ProcessingComplete →
+   * 每个 LuaSetUndoPoint 一次 Commit，末尾修改以宏名为描述提交）。
+   */
   const runAutomationMacroById = async (id: string) => {
     if (!core || !coreRef.current) return
     const entry = automationScripts.find((script) => script.macros.some((macro) => macro.id === id))
@@ -772,46 +908,59 @@ export function App() {
       setStatus(tPlain('Automation macro is not loaded'))
       return
     }
-    const rows = buildLuaRows(core.document)
-    const offset = rows.length - core.document.cues.length
+    const rows = documentToLuaRows(core.document)
     const cueIndex = (cueId: string) => core.document.cues.findIndex((cue) => cue.id === cueId)
     const selectedIndexes = selectedOrActive(core.document, selectedSet, activeId)
       .map((cueId) => cueIndex(cueId))
       .filter((index) => index >= 0)
     const activeIndex = activeId ? cueIndex(activeId) : -1
+
+    luaCancelledRef.current = false
+    setLuaProgress({ title: macro.name, task: '', value: 0 })
+    const luaHost = makeAutomationHost()
+
     try {
-      const result = runAutomationMacro(
+      const result = await runAutomationMacro(
         entry.stateId,
         macro.name,
         rows,
         selectedIndexes,
         activeIndex,
-        {
-          width: Number(core.document.scriptInfo.PlayResX) || 640,
-          height: Number(core.document.scriptInfo.PlayResY) || 480,
-        },
+        luaHost,
       )
-      const finalDialogues = result.rows
-        .filter((row) => row.class === 'dialogue')
-        .map(rowToCuePatch)
-      const next = await apply([{ type: 'replaceCues', cues: finalDialogues }], macro.name)
-      if (!next) return
-      const toDialogueIndex = (full: number) => full - offset - 1
-      if (result.selected?.length) {
-        const ids = result.selected
-          .map(toDialogueIndex)
-          .filter((index) => index >= 0 && index < next.document.cues.length)
-          .map((index) => next.document.cues[index].id)
-        if (ids.length) setSelectedIds(new Set(ids))
+      if (!result.ok) {
+        setStatus(
+          result.error === 'cancelled'
+            ? tPlain('Cancelled')
+            : `Automation error: ${result.error ?? 'unknown error'}`,
+        )
+        return
       }
-      if (result.active !== null) {
-        const active = toDialogueIndex(result.active)
-        if (active >= 0 && active < next.document.cues.length)
-          setActiveId(next.document.cues[active].id)
+      let next: CoreState | null = core
+      for (const commit of result.commits) {
+        // 各撤销点必须按顺序串行提交，后一个提交依赖前一个的结果
+        // oxlint-disable-next-line no-await-in-loop
+        next = await apply([{ type: 'replaceDocument', ...commit.payload }], commit.label)
+        if (!next) return
+      }
+      if (next) {
+        const cues = next.document.cues
+        // selected / active 已是最终文档的对白序数（0-based）
+        if (result.selected?.length) {
+          const ids = result.selected
+            .filter((index) => index >= 0 && index < cues.length)
+            .map((index) => cues[index].id)
+          if (ids.length) setSelectedIds(new Set(ids))
+        }
+        if (result.active !== null && result.active >= 0 && result.active < cues.length)
+          setActiveId(cues[result.active].id)
       }
       setStatus(`Automation: ${macro.name}`)
     } catch (error) {
       setStatus(`Automation error: ${error instanceof Error ? error.message : 'unknown error'}`)
+    } finally {
+      setLuaProgress(null)
+      setLuaDialog(null)
     }
   }
 
@@ -1078,13 +1227,24 @@ export function App() {
     if (!coreRef.current) return
     try {
       const saved = await loadLatestAutosave()
-      if (!saved?.document) {
+      if (!saved) {
         setStatus(tPlain('No autosave found'))
         return
       }
-      const state = await coreRef.current.restore(saved.document)
+      // VFS 保存的新格式把 .ass 当普通文件打开（源码 subtitle/open/autosave →
+      // load_subtitles(c, filename)）；legacy 为旧内存文档快照，走 restore
+      const state =
+        saved.kind === 'file'
+          ? await coreRef.current.open(new TextEncoder().encode(saved.text), saved.fileName)
+          : await coreRef.current.restore(saved.document)
       setCore(state)
-      setDirty(true)
+      // Load()：新载入文档视为已自动保存（autosaved_commit_id = commit_id）
+      if (saved.kind === 'file') {
+        lastAutosaveRevisionRef.current = state.document.revision
+        setDirty(false)
+      } else {
+        setDirty(true)
+      }
       const id = state.document.cues[0]?.id ?? null
       setActiveId(id)
       setSelectedIds(id ? new Set([id]) : new Set())
@@ -1481,21 +1641,137 @@ export function App() {
     setStatus(`Selected ${nextSelection.size} line${nextSelection.size === 1 ? '' : 's'}`)
   }
 
-  // ---- Export Subtitles（dialog_export.cpp 的 Web 版子集）----
-  const applyExport = (options: ExportOptions) => {
+  // ---- Export Subtitles（dialog_export.cpp + ass_exporter.cpp 的导出过滤器链）----
+  // 链序同 AssExportFilterChain::GetFilterList（优先级降序 + 重名去重）
+  const exportFilters = useMemo(
+    () => orderedAutomationFilters(automationScripts),
+    [automationScripts],
+  )
+  const exportFilterKey = (filter: AutomationFilterDisplayInfo) =>
+    `${filter.stateId}:${filter.name}`
+
+  /**
+   * 过滤器 Configure（web 偏差：用按钮替代桌面的内嵌配置面板）：调 config 函数
+   * （只读 subtitles）生成 spec，确认后的回读值按控件名转 config 表缓存。
+   */
+  const openFilterConfig = async (filter: AutomationFilterDisplayInfo) => {
     if (!core) return
-    const doc = options.includeComments
-      ? core.document
-      : { ...core.document, cues: core.document.cues.filter((cue) => !cue.comment) }
-    const output = exportSubtitle(doc, options.format)
-    const base = core.document.sourceName.replace(/\.(ass|ssa|srt)$/i, '') || 'untitled'
-    const extension = options.format === 'srt' ? 'srt' : 'ass'
-    void host.saveFile(`${base}.${extension}`, new TextEncoder().encode(output), {
-      description: 'Subtitle',
-      accept: { 'text/plain': [`.${extension}`] },
+    const key = exportFilterKey(filter)
+    const cached = filterConfigs[key]
+    if (cached) {
+      setLuaDialog({
+        spec: cached.spec,
+        initialValues: cached.values,
+        resolve: (response) => {
+          if (readBackButton(cached.spec.buttons, response.button) !== false)
+            setFilterConfigs((current) => ({
+              ...current,
+              [key]: { spec: cached.spec, values: response.values },
+            }))
+        },
+      })
+      return
+    }
+    // LuaExportFilter::GenerateConfigDialog：以当前文档（只读）求值，失败视为无对话框
+    const result = await configureAutomationFilter(
+      filter.stateId,
+      filter.name,
+      documentToLuaRows(core.document),
+      makeAutomationHost(),
+    )
+    if (!result.ok || !result.spec) return
+    const spec = result.spec
+    const values = defaultDialogValues(spec)
+    setFilterConfigs((current) => ({ ...current, [key]: { spec, values } }))
+    setLuaDialog({
+      spec,
+      initialValues: values,
+      resolve: (response) => {
+        if (readBackButton(spec.buttons, response.button) !== false)
+          setFilterConfigs((current) => ({ ...current, [key]: { spec, values: response.values } }))
+      },
     })
-    setDialog(null)
-    setStatus(`Exported ${base}.${extension}`)
+  }
+
+  /**
+   * 运行单个导出过滤器（LuaExportFilter::ProcessSubs：在文档副本上跑、返回值丢弃、
+   * ProcessingComplete 行集整表应用）；返回 null 表示取消（UserCancelException 中止导出）。
+   */
+  const runExportFilter = async (
+    filter: AutomationFilterDisplayInfo,
+    doc: SubtitleDocument,
+    liveRows: ReturnType<typeof documentToLuaRows>,
+  ): Promise<SubtitleDocument | null> => {
+    const luaHost = makeAutomationHost()
+    let config: Record<string, DialogValue> | null = null
+    if (filter.hasConfig) {
+      const cached = filterConfigs[exportFilterKey(filter)]
+      if (cached) config = dialogConfigTable(cached.spec, cached.values)
+      else {
+        // 未配置过：以控件默认值生成（等价桌面导出对话框打开时的初始内嵌配置）
+        const specResult = await configureAutomationFilter(
+          filter.stateId,
+          filter.name,
+          liveRows,
+          luaHost,
+        )
+        if (specResult.ok && specResult.spec)
+          config = dialogConfigTable(specResult.spec, defaultDialogValues(specResult.spec))
+      }
+    }
+    const result = await runAutomationFilter(
+      filter.stateId,
+      filter.name,
+      documentToLuaRows(doc),
+      config,
+      luaHost,
+    )
+    if (!result.ok) {
+      setStatus(
+        result.error === 'cancelled'
+          ? tPlain('Cancelled')
+          : `Export filter error: ${result.error ?? 'unknown error'}`,
+      )
+      return null
+    }
+    return result.payload ? applyLuaPayload(doc, result.payload) : doc
+  }
+
+  const applyExport = async (options: ExportOptions) => {
+    if (!core) return
+    try {
+      let doc: SubtitleDocument = core.document
+      // config 函数以当前文档求值（LuaExportFilter::GenerateConfigDialog 的 c->ass）
+      const liveRows = documentToLuaRows(core.document)
+      for (const filter of options.filters) {
+        luaCancelledRef.current = false
+        setLuaProgress({ title: filter.displayName, task: '', value: 0 })
+        // 过滤器链必须串行：后一个过滤器处理前一个的输出（AssExporter::Export 顺序执行）
+        // oxlint-disable-next-line no-await-in-loop
+        const next = await runExportFilter(filter, doc, liveRows)
+        if (!next) return
+        doc = next
+      }
+      const filtered = options.includeComments
+        ? doc
+        : { ...doc, cues: doc.cues.filter((cue) => !cue.comment) }
+      // Export Filters 写入导出副本（桌面写在 c->ass->Properties，web 不触碰活文档）
+      const written = withExportFilters(
+        filtered,
+        options.filters.map((filter) => filter.displayName),
+      )
+      const output = exportSubtitle(written, options.format)
+      const base = core.document.sourceName.replace(/\.(ass|ssa|srt)$/i, '') || 'untitled'
+      const extension = options.format === 'srt' ? 'srt' : 'ass'
+      void host.saveFile(`${base}.${extension}`, new TextEncoder().encode(output), {
+        description: 'Subtitle',
+        accept: { 'text/plain': [`.${extension}`] },
+      })
+      setStatus(`Exported ${base}.${extension}`)
+    } finally {
+      setLuaProgress(null)
+      setDialog(null)
+    }
   }
 
   const openAudioHandle = async (file: AppFileHandle) => {
@@ -1540,65 +1816,160 @@ export function App() {
   const sendAudioAction = (type: string) =>
     setAudioAction((current) => ({ sequence: current.sequence + 1, type }))
 
-  const findNext = async () => {
-    if (!core || !findQuery.trim()) {
-      setFindMode('find')
-      return
-    }
+  // 设置项局部更新（查找/替换对话框）
+  const patchFindSettings = (patch: Partial<SearchReplaceSettings>) =>
+    setFindSettings((current) => ({ ...current, ...patch }))
+
+  /** 编译匹配器；正则非法时显示错误（源码 FindReplace 捕获后 wxMessageBox(Error)） */
+  const buildMatcher = (current: SearchReplaceSettings) => {
     try {
-      const matches = (await coreRef.current?.search({ find: findQuery, field: 'text' })) ?? []
-      if (!matches.length) {
-        setStatus(`Not found: ${findQuery}`)
-        return
-      }
-      const currentIndex = core.document.cues.findIndex((cue) => cue.id === activeId)
-      let next = matches.find((match) => {
-        const index = core.document.cues.findIndex((cue) => cue.id === match.id)
-        return index >= 0 && index > currentIndex
-      })
-      if (!next) next = matches[0]
-      const found = core.document.cues.find((cue) => cue.id === next?.id)
-      if (found) {
-        selectOnly(found.id)
-        setStatus(`Found in line ${core.document.cues.indexOf(found) + 1}`)
-      }
-    } catch {
-      setStatus(tPlain('Search failed'))
+      const matcher = compileMatcher(current)
+      setFindError('')
+      return matcher
+    } catch (error) {
+      setFindError(error instanceof Error ? error.message : String(error))
+      return null
     }
   }
 
-  const replaceCurrent = async () => {
-    if (!selectedCue || !findQuery) return
-    try {
-      const matches = (await coreRef.current?.search({ find: findQuery, field: 'text' })) ?? []
-      const match = matches.find((item) => item.id === selectedCue.id)
-      if (match) {
-        const text =
-          selectedCue.text.slice(0, match.start) + replaceQuery + selectedCue.text.slice(match.end)
-        void apply([{ type: 'updateCue', id: selectedCue.id, patch: { text } }], tPlain('replace'))
-      } else {
-        setStatus(tPlain('No match in current line'))
-      }
-    } catch {
-      setStatus(tPlain('Replace failed'))
+  /** 字段 → updateCue patch（search_replace_engine.cpp get_dialogue_field） */
+  const fieldPatch = (field: SearchReplaceSettings['field'], value: string) =>
+    field === 'text'
+      ? { text: value }
+      : field === 'style'
+        ? { style: value }
+        : field === 'actor'
+          ? { actor: value }
+          : { effect: value }
+
+  /** 源码 FindReplace 末尾：写回 Tool/Search Replace/*、更新 MRU 下拉 */
+  const finishFindAction = (current: SearchReplaceSettings, withReplace: boolean) => {
+    setOption('Tool/Search Replace/Match Case', current.matchCase)
+    setOption('Tool/Search Replace/RegExp', current.useRegex)
+    setOption('Tool/Search Replace/Skip Comments', current.ignoreComments)
+    setOption('Tool/Search Replace/Skip Tags', current.skipTags)
+    setOption('Tool/Search Replace/Field', SEARCH_FIELDS.indexOf(current.field))
+    setOption('Tool/Search Replace/Affect', current.limitTo === 'selected' ? 1 : 0)
+    pushSearchMru('Find', current.find)
+    if (withReplace) pushSearchMru('Replace', current.replaceWith)
+    setFindMru(loadSearchMru())
+  }
+
+  // 源码 SetSelectionAndActive/SetActiveLine + textSelectionController->SetSelection
+  const revealMatch = (
+    cueId: string,
+    selectionOnly: boolean,
+    start: number,
+    end: number,
+    viaLoop: boolean,
+  ) => {
+    if (viaLoop) {
+      setActiveId(cueId)
+      anchorRef.current = cueId
+      if (!selectionOnly) setSelectedIds(new Set([cueId]))
+    }
+    if (findSettings.field === 'text') {
+      setFindTextSelection({ pos: end, start, end })
+      setHistoryNonce((value) => value + 1)
+    }
+  }
+
+  const findNext = async () => {
+    if (!core) return
+    const current = findSettings
+    if (!current.find) {
+      setFindMode((mode) => mode ?? 'find')
+      return
+    }
+    const matcher = buildMatcher(current)
+    if (!matcher) return
+    finishFindAction(current, false)
+    const found = findNextMatch(core.document.cues, current, matcher, {
+      activeId,
+      selectedIds: selectedSet,
+      // 文本字段从选区终点起查找（源码 GetSelectionEnd()）
+      fieldStart: textSelectionRef.current.end,
+    })
+    if (!found) {
+      setStatus(tPlain('No matches found.'))
+      return
+    }
+    revealMatch(found.cueId, found.selectionOnly, found.start, found.end, true)
+    setStatus(`Found in line ${core.document.cues.findIndex((cue) => cue.id === found.cueId) + 1}`)
+  }
+
+  const replaceNext = async () => {
+    if (!core) return
+    const current = findSettings
+    if (!current.find) {
+      setFindMode((mode) => mode ?? 'replace')
+      return
+    }
+    const matcher = buildMatcher(current)
+    if (!matcher) return
+    finishFindAction(current, true)
+    const selection = textSelectionRef.current
+    const result = replaceNextMatch(core.document.cues, current, matcher, {
+      activeId,
+      selectedIds: selectedSet,
+      // 文本字段以选区起点作为匹配锚点（源码 GetSelectionStart()）
+      fieldStart: selection.start,
+      fieldEnd: selection.end,
+    })
+    if (result.replacement) {
+      await apply(
+        [
+          {
+            type: 'updateCue',
+            id: result.replacement.cueId,
+            patch: fieldPatch(current.field, result.replacement.value),
+          },
+        ],
+        tPlain('replace'),
+      )
+    }
+    if (result.found) {
+      revealMatch(
+        result.found.cueId,
+        result.found.selectionOnly,
+        result.found.start,
+        result.found.end,
+        result.foundViaLoop,
+      )
+    } else if (result.fallbackSelection) {
+      setFindTextSelection({
+        pos: result.fallbackSelection.end,
+        start: result.fallbackSelection.start,
+        end: result.fallbackSelection.end,
+      })
+      setHistoryNonce((value) => value + 1)
     }
   }
 
   const replaceAll = async () => {
-    if (!core || !findQuery.trim()) return
-    try {
-      const count =
-        (await coreRef.current?.replaceAll({
-          find: findQuery,
-          replaceWith: replaceQuery,
-          field: 'text',
-        })) ?? 0
-      setStatus(`Replaced ${count} occurrence${count === 1 ? '' : 's'}`)
-      const next = await coreRef.current?.state()
-      if (next) setCore(next)
-    } catch {
-      setStatus(tPlain('Replace all failed'))
+    if (!core) return
+    const current = findSettings
+    if (!current.find) {
+      setFindMode((mode) => mode ?? 'replace')
+      return
     }
+    const matcher = buildMatcher(current)
+    if (!matcher) return
+    finishFindAction(current, true)
+    const { updates, count } = replaceAllMatches(core.document.cues, current, matcher, selectedSet)
+    if (count === 0) {
+      setStatus(tPlain('No matches found.'))
+      return
+    }
+    await apply(
+      updates.map((item) => ({
+        type: 'updateCue' as const,
+        id: item.cueId,
+        patch: fieldPatch(current.field, item.value),
+      })),
+      tPlain('replace'),
+    )
+    setStatus(tFmt(tPlural('One match was replaced.', '%d matches were replaced.', count), count))
   }
 
   const api: CommandApi = {
@@ -1669,9 +2040,11 @@ export function App() {
       setSelectedIds(new Set(ids))
       anchorRef.current = ids[0] ?? null
     },
+    // 有意偏差：源码每次构造对话框都以 MRU 首项重置 Find；web 打开时不重置（保留上次输入），
+    // 仅在 App 初始化时取一次 mru.Find[0]
     openFind: (mode) => setFindMode(mode),
     findNext,
-    replaceCurrent,
+    replaceNext,
     replaceAll,
     openStyleManager: () => setShowStyleManager(true),
     openDialog: (kind) => setDialog(kind),
@@ -1770,12 +2143,16 @@ export function App() {
   })
 
   const isCommandEnabled = (id: string) => {
+    // Automation 宏：由 validate 结果决定（COMMAND_VALIDATE）；未求值前默认启用
+    if (id.startsWith('automation/lua/')) return macroMenuState[id]?.enabled ?? true
     const ctx = commandContext()
     const def = COMMAND_REGISTRY[id]
     return Boolean(ctx && def && (!def.enabled || def.enabled(ctx)))
   }
 
   const isCommandChecked = (id: string) => {
+    // Automation 宏：由 isactive 结果决定（COMMAND_TOGGLE）
+    if (id.startsWith('automation/lua/')) return macroMenuState[id]?.checked ?? false
     const ctx = commandContext()
     const def = COMMAND_REGISTRY[id]
     return Boolean(ctx && def?.checked?.(ctx))
@@ -1858,6 +2235,9 @@ export function App() {
         onCommand={executeCommand}
         isCommandEnabled={isCommandEnabled}
         isCommandChecked={isCommandChecked}
+        onMenuOpen={(menuId) => {
+          if (menuId === 'automation') void refreshMacroMenuStates()
+        }}
       />
       {toolbarVisible && (
         <Toolbar
@@ -2064,10 +2444,13 @@ export function App() {
                   activeStyle ? { id: activeStyle.id, name: activeStyle.name } : null,
                 )
               }
-              onTextSelection={(pos, start, end) =>
+              onTextSelection={(pos, start, end) => {
+                textSelectionRef.current = { pos, start, end }
+                // 命中回写编辑框选区后，随后的真实选区变更清除覆盖值
+                setFindTextSelection((current) => (current === null ? current : null))
                 coreRef.current?.notifyTextSelection(pos, start, end)
-              }
-              textSelection={core.textSelection}
+              }}
+              textSelection={findTextSelection ?? core.textSelection}
               historyNonce={historyNonce}
             />
           </div>
@@ -2175,16 +2558,14 @@ export function App() {
             className="app-dialog find-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label={findMode === 'replace' ? tPlain('Find and Replace') : tPlain('Find')}
+            aria-label={findMode === 'replace' ? tPlain('Replace') : tPlain('Find')}
             onSubmit={(event) => {
               event.preventDefault()
-              findNext()
+              void findNext()
             }}
           >
             <header>
-              <strong>
-                {findMode === 'replace' ? tPlain('Find and Replace') : tPlain('Find')}
-              </strong>
+              <strong>{findMode === 'replace' ? tPlain('Replace') : tPlain('Find')}</strong>
               <button
                 type="button"
                 className="dialog-close"
@@ -2195,41 +2576,144 @@ export function App() {
                 <X size={16} />
               </button>
             </header>
-            <div className="dialog-fields">
-              <label>
-                {tPlain('Find what:')}
-                <input
-                  autoFocus
-                  value={findQuery}
-                  onChange={(event) => setFindQuery(event.target.value)}
-                />
-              </label>
+            <div className="find-dialog-body">
+              <div className="find-dialog-top">
+                <div className="find-dialog-left">
+                  <div className="find-dialog-fields">
+                    <label htmlFor="find-what">{tPlain('Find what:')}</label>
+                    <input
+                      id="find-what"
+                      autoFocus
+                      list="find-mru-list"
+                      value={findSettings.find}
+                      onChange={(event) => patchFindSettings({ find: event.target.value })}
+                    />
+                    {findMode === 'replace' && (
+                      <>
+                        <label htmlFor="find-replace">{tPlain('Replace with:')}</label>
+                        <input
+                          id="find-replace"
+                          list="replace-mru-list"
+                          value={findSettings.replaceWith}
+                          onChange={(event) =>
+                            patchFindSettings({ replaceWith: event.target.value })
+                          }
+                          onKeyDown={(event) => {
+                            // wxEVT_TEXT_ENTER：替换框回车 = Replace next
+                            if (event.key === 'Enter') {
+                              event.preventDefault()
+                              void replaceNext()
+                            }
+                          }}
+                        />
+                      </>
+                    )}
+                  </div>
+                  <div className="find-dialog-options">
+                    <label className="find-dialog-check">
+                      <input
+                        type="checkbox"
+                        checked={findSettings.matchCase}
+                        onChange={(event) => patchFindSettings({ matchCase: event.target.checked })}
+                      />
+                      {tPlain('Match case')}
+                    </label>
+                    <label className="find-dialog-check">
+                      <input
+                        type="checkbox"
+                        checked={findSettings.useRegex}
+                        onChange={(event) => patchFindSettings({ useRegex: event.target.checked })}
+                      />
+                      {tPlain('Use regular expressions')}
+                    </label>
+                    <label className="find-dialog-check">
+                      <input
+                        type="checkbox"
+                        checked={findSettings.ignoreComments}
+                        onChange={(event) =>
+                          patchFindSettings({ ignoreComments: event.target.checked })
+                        }
+                      />
+                      {tPlain('Skip Comments')}
+                    </label>
+                    <label className="find-dialog-check">
+                      <input
+                        type="checkbox"
+                        checked={findSettings.skipTags}
+                        onChange={(event) => patchFindSettings({ skipTags: event.target.checked })}
+                      />
+                      {tPlain('Skip Override Tags')}
+                    </label>
+                  </div>
+                </div>
+                <div className="find-dialog-buttons">
+                  <button type="submit">{tPlain('Find next')}</button>
+                  {findMode === 'replace' && (
+                    <button type="button" onClick={() => void replaceNext()}>
+                      {tPlain('Replace next')}
+                    </button>
+                  )}
+                  {findMode === 'replace' && (
+                    <button type="button" onClick={() => void replaceAll()}>
+                      {tPlain('Replace all')}
+                    </button>
+                  )}
+                  <button type="button" onClick={() => setFindMode(null)}>
+                    {tPlain('Cancel')}
+                  </button>
+                </div>
+              </div>
+              <div className="find-dialog-scope">
+                <fieldset className="dialog-fieldset">
+                  <legend>{tPlain('In Field')}</legend>
+                  {SEARCH_FIELDS.map((field) => (
+                    <label className="dialog-check" key={field}>
+                      <input
+                        type="radio"
+                        name="find-field"
+                        checked={findSettings.field === field}
+                        onChange={() => patchFindSettings({ field })}
+                      />
+                      {tPlain(SEARCH_FIELD_LABELS[field] ?? field)}
+                    </label>
+                  ))}
+                </fieldset>
+                <fieldset className="dialog-fieldset">
+                  <legend>{tPlain('Limit to')}</legend>
+                  <label className="dialog-check">
+                    <input
+                      type="radio"
+                      name="find-limit"
+                      checked={findSettings.limitTo === 'all'}
+                      onChange={() => patchFindSettings({ limitTo: 'all' })}
+                    />
+                    {tPlain('All rows')}
+                  </label>
+                  <label className="dialog-check">
+                    <input
+                      type="radio"
+                      name="find-limit"
+                      checked={findSettings.limitTo === 'selected'}
+                      onChange={() => patchFindSettings({ limitTo: 'selected' })}
+                    />
+                    {tPlain('Selected rows')}
+                  </label>
+                </fieldset>
+              </div>
+              {findError && <p className="dialog-error">{findError}</p>}
+              <datalist id="find-mru-list">
+                {findMru.Find.map((item, index) => (
+                  <option key={`${item}-${index}`} value={item} />
+                ))}
+              </datalist>
               {findMode === 'replace' && (
-                <label>
-                  {tPlain('Replace with:')}
-                  <input
-                    value={replaceQuery}
-                    onChange={(event) => setReplaceQuery(event.target.value)}
-                  />
-                </label>
+                <datalist id="replace-mru-list">
+                  {findMru.Replace.map((item, index) => (
+                    <option key={`${item}-${index}`} value={item} />
+                  ))}
+                </datalist>
               )}
             </div>
-            <footer>
-              {findMode === 'replace' && (
-                <>
-                  <button type="button" onClick={replaceCurrent}>
-                    {tPlain('Replace')}
-                  </button>
-                  <button type="button" onClick={replaceAll}>
-                    {tPlain('Replace all')}
-                  </button>
-                </>
-              )}
-              <button type="submit">{tPlain('Find Next')}</button>
-              <button type="button" onClick={() => setFindMode(null)}>
-                {tPlain('Cancel')}
-              </button>
-            </footer>
           </form>
         </div>
       )}
@@ -2320,7 +2804,13 @@ export function App() {
         <SelectLinesDialog onClose={() => setDialog(null)} onApply={applySelectLines} />
       )}
       {dialog === 'export' && (
-        <ExportSubtitlesDialog onClose={() => setDialog(null)} onApply={applyExport} />
+        <ExportSubtitlesDialog
+          filters={exportFilters}
+          initialSelected={core ? documentExportFilters(core.document) : []}
+          onConfigure={(filter) => void openFilterConfig(filter)}
+          onClose={() => setDialog(null)}
+          onApply={(options) => void applyExport(options)}
+        />
       )}
       {dialog === 'resample' && core && (
         <ResampleDialog
@@ -2339,13 +2829,24 @@ export function App() {
             name: script.name,
             description: script.description,
             filename: script.filename,
-            macros: script.macros.map((macro) => macro.name),
+            macros: script.macros.map((macro) => ({ id: macro.id, name: macro.name })),
+            filters: script.filters.map((filter) => filter.name),
+            author: script.author,
+            version: script.version,
+            warnings: script.warnings,
             error: script.error,
           }))}
           onAdd={() => void addAutomationScript()}
           onRemove={removeAutomationScript}
           onReload={(key) => void reloadAutomationScript(key)}
           onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog === 'file-manager' && (
+        <FileManagerDialog
+          onClose={() => setDialog(null)}
+          onRestoreDefaults={restoreFactoryScripts}
+          onChanged={() => void reloadAllAutomationScripts()}
         />
       )}
       {dialog === 'timing-postprocess' && core && (
@@ -2393,6 +2894,27 @@ export function App() {
           offsetMs={timecodesOffsetAsk}
           onChoice={(keep) => void doSaveTimecodes(keep)}
           onClose={() => setTimecodesOffsetAsk(null)}
+        />
+      )}
+      {luaProgress && (
+        <LuaProgressDialog
+          title={luaProgress.title}
+          task={luaProgress.task}
+          value={luaProgress.value}
+          onCancel={() => {
+            luaCancelledRef.current = true
+          }}
+        />
+      )}
+      {luaDialog && (
+        <LuaConfigDialog
+          spec={luaDialog.spec}
+          initialValues={luaDialog.initialValues}
+          onSubmit={(response) => {
+            const pending = luaDialog
+            setLuaDialog(null)
+            pending.resolve(response)
+          }}
         />
       )}
     </main>

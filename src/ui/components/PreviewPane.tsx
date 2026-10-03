@@ -3847,6 +3847,8 @@ export function PreviewPane({
         state.selChanged = false
       }
       // StartDrag：记录本次拖拽前的四角位置
+      // 首次透视拖拽约 2s 的帧停顿非应用缺陷，是每浏览器进程首次透视拖拽的一次性 GPU
+      // 预热（着色器编译），此后不再出现
       for (const feature of state.features)
         if (state.selected.has(feature.key)) feature.start = { ...feature.pos }
       state.dragStart = mouse

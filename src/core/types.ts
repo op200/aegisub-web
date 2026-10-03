@@ -76,8 +76,17 @@ export type CoreCommand =
   | { type: 'updateScriptInfo'; patch: Record<string, string> }
   | { type: 'sortCues' }
   | { type: 'sortCuesBy'; column: SortColumn }
-  /** Automation 整表重放（auto4_lua_assfile.cpp 的 modification 模型）：单步 undo */
-  | { type: 'replaceCues'; cues: Array<Partial<Omit<SubtitleCue, 'id'>>> }
+  /**
+   * Automation 整表重放（auto4_lua_assfile.cpp ProcessingComplete 的 apply_lines）：
+   * info/styles/cues 三段整替，每个撤销点一次 apply。info 缺省表示脚本未触碰信息段（保留现状）；
+   * styles 空数组语义为"保留原样式"（源码会清空，但 web 下游依赖至少一个样式）
+   */
+  | {
+      type: 'replaceDocument'
+      info?: Record<string, string>
+      styles?: Array<Partial<Omit<SubtitleStyle, 'id'>>>
+      cues: Array<Partial<Omit<SubtitleCue, 'id'>>>
+    }
 
 export interface CoreState {
   document: SubtitleDocument

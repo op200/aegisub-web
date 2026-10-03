@@ -1068,7 +1068,7 @@ button:disabled {
 }
 .automation-row {
   display: grid;
-  grid-template-columns: 24px 170px 120px 1fr 120px;
+  grid-template-columns: 24px 170px 120px 1fr;
   gap: 8px;
   padding: 4px 6px;
   border-bottom: 1px solid var(--border-fainter);
@@ -1082,21 +1082,38 @@ button:disabled {
 .automation-row.automation-error {
   background: var(--error-soft-bg);
 }
+/* 加载成功但有警告 = 黄底（dialog_automation.cpp SetItemBackgroundColour(255,255,128)） */
+.automation-row.automation-warning {
+  background: var(--warning-faint-bg);
+}
+/* 选中行（wxLC_SINGLE_SEL 高亮）；置于错误/警告底色之后以覆盖之 */
+.automation-row.is-selected {
+  background: var(--blue-soft);
+}
+.automation-info {
+  margin-top: 8px;
+  border: 1px solid var(--border-dark);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+  max-height: 260px;
+  overflow: auto;
+}
+.automation-info pre {
+  margin: 0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  font-family: inherit;
+}
 .automation-empty {
   color: var(--text-faint);
+  grid-column: 1 / -1;
 }
 .automation-macros {
   color: var(--text-faint);
   font-style: normal;
-}
-.automation-actions {
-  display: flex;
-  gap: 4px;
-  justify-content: flex-end;
-}
-.automation-actions button {
-  font-size: 11px;
-  padding: 1px 6px;
 }
 .edit-time-mode {
   display: flex;
@@ -1246,6 +1263,8 @@ button:disabled {
   border-bottom: 1px solid var(--grid-header-border);
   font-size: 12px;
   font-weight: 600;
+  /* 源码列名为 canvas 自绘文本，不可选中 */
+  user-select: none;
 }
 .subtitle-grid-header span {
   display: flex;
@@ -1277,6 +1296,11 @@ button:disabled {
   height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
+  /* 源码网格按整行滚动（base_grid.cpp 的 yPos 为行号，从 yPos*lineHeight 起绘制），顶部永远整行对齐。
+     交给浏览器原生 scroll-snap（惯性结束后吸附），不在 scroll 事件里改写 scrollTop，
+     避免与惯性滚动动画互相打架导致位置颤动 */
+  scroll-snap-type: y mandatory;
+  scroll-behavior: auto;
   /* 原生滚动条隐藏：滚动条由 .grid-scrollbar 自绘（源码为常驻 wxScrollBar） */
   scrollbar-width: none;
 }
@@ -1345,6 +1369,8 @@ button:disabled {
   left: 0;
   right: 0;
   height: var(--row-height);
+  /* 每行是一个 scroll-snap 吸附点（配合 viewport 的 scroll-snap-type: y mandatory） */
+  scroll-snap-align: start;
   color: var(--grid-fg, #000);
   border-bottom: 1px solid var(--grid-line, #bebebe);
   font-size: var(--grid-font-size, 12px);
@@ -1543,6 +1569,207 @@ button:disabled {
 }
 .dialog-close {
   color: white;
+}
+/* 文件管理器（web 特有，components/FileManagerDialog.tsx） */
+.dialog-button {
+  min-width: 68px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border-button);
+  border-radius: 2px;
+  background: var(--control-raised);
+  font-size: 12px;
+}
+.dialog-button:disabled {
+  color: var(--text-disabled);
+}
+.dialog-button.primary {
+  font-weight: 600;
+}
+.fm-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.fm-path {
+  padding: 4px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.fm-body {
+  display: flex;
+  width: min(720px, calc(100vw - 60px));
+  min-height: 320px;
+  max-height: 60vh;
+}
+.fm-list {
+  flex: 1 1 auto;
+  overflow: auto;
+  min-width: 300px;
+}
+.fm-row {
+  display: grid;
+  grid-template-columns: 1fr 76px 150px;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 8px;
+  text-align: left;
+  font-size: 12px;
+}
+.fm-row:hover {
+  background: var(--hover-bg);
+}
+.fm-row.selected {
+  background: var(--blue-soft);
+}
+.fm-size,
+.fm-time {
+  color: var(--muted);
+}
+.fm-empty {
+  padding: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.fm-status {
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.fm-editor {
+  flex: 0 0 46%;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border-soft);
+}
+.fm-editor-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.fm-editor textarea {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px;
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+  font-family: monospace;
+  font-size: 12px;
+  resize: none;
+}
+.fm-prompt-backdrop {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.2);
+}
+.fm-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+  padding: 12px;
+  background: var(--dialog-bg);
+  border: 1px solid var(--border-strong);
+  font-size: 12px;
+}
+.fm-prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+/* Lua Automation：配置对话框 / 进度对话框 */
+.lua-config-body {
+  min-width: 320px;
+  max-width: 560px;
+  max-height: 60vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+.lua-config-control {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+}
+.lua-config-control input[type='text'],
+.lua-config-control input[type='number'],
+.lua-config-control select,
+.lua-config-control textarea {
+  min-height: 24px;
+  padding: 2px 4px;
+  border: 1px solid var(--border-button);
+  border-radius: 2px;
+  background: var(--surface);
+  color: var(--text);
+}
+.lua-config-label {
+  color: var(--muted);
+}
+.lua-config-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.lua-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 320px;
+  padding: 16px;
+}
+.lua-progress progress {
+  width: 100%;
+}
+/* Export Subtitles：过滤器列表（dialog_export.cpp 的 wxCheckListBox + 按钮组） */
+.export-filter-list {
+  min-height: 110px;
+  max-height: 150px;
+  overflow: auto;
+  border: 1px solid var(--border-button);
+  border-radius: 2px;
+  background: var(--surface);
+}
+.export-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+}
+.export-filter-row.is-selected {
+  background: var(--blue-soft);
+}
+.export-filter-actions {
+  display: flex;
+  gap: 4px;
+}
+.export-filter-actions button {
+  flex: 1 1 0;
+}
+.export-filter-description {
+  min-height: 48px;
+  padding: 2px 4px;
+  border: 1px solid var(--border-button);
+  border-radius: 2px;
+  background: var(--surface);
+  color: var(--text);
+  resize: vertical;
+}
+.export-filter-configure {
+  align-self: flex-start;
 }
 .style-dialog {
   width: 560px;
@@ -1813,8 +2040,98 @@ button:disabled {
   height: 18px;
   border: 1px solid var(--border-strong);
 }
+/* 查找/替换（dialog_search_replace.cpp）：上排 = 左列（输入框 + 四个竖排复选）| 右列按钮竖排，
+   下排 = In Field / Limit to 两个 wxRadioBox 并排；按钮为 Find next/Replace next/Replace all/Cancel */
 .find-dialog {
-  width: 430px;
+  width: 470px;
+}
+.find-dialog-body {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+}
+.find-dialog-top {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.find-dialog-left {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 8px;
+}
+/* find_sizer = wxFlexGridSizer(2,2)：标签列右对齐到内容宽，编辑框占余宽 */
+.find-dialog-fields {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 5px 15px;
+  align-items: center;
+}
+.find-dialog-fields label {
+  font-size: 11px;
+}
+.find-dialog-fields input {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 2px 5px;
+  color: var(--text);
+  background: var(--control);
+  border: 1px solid var(--border);
+  border-radius: 1px;
+}
+.find-dialog-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.find-dialog-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.find-dialog-check input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+}
+.find-dialog-buttons {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.find-dialog-buttons button {
+  min-width: 96px;
+  height: 27px;
+  border: 1px solid var(--border-button);
+  border-radius: 2px;
+  background: var(--control-raised);
+}
+.find-dialog-scope {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.find-dialog-scope .dialog-fieldset {
+  flex: 1;
+  margin: 0;
+}
+.find-dialog-scope .dialog-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.find-dialog-scope .dialog-check input {
+  flex: 0 0 auto;
+}
+.find-dialog .dialog-error {
+  margin: 8px 0 0;
 }
 .dialog-fields {
   display: grid;

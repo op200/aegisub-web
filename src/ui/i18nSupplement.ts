@@ -67,6 +67,7 @@ export const WEB_SUPPLEMENT: Record<string, Record<string, string>> = {
     Color: '颜色',
     Compatibility: '兼容性',
     'config.json — preferences': 'config.json — 首选项',
+    Configure: '配置',
     'Copy to current script →': '复制到当前脚本 →',
     Core: '核心',
     'Could not open subtitles': '无法打开字幕',

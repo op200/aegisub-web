@@ -1,2 +1,8 @@
 allowBuilds:
   lfa-ponyfill: false
+# fengari 0.1.5 在浏览器下裸引用 process（luaconf.js 顶层 process.env.FENGARICONF、
+# liolib.js 顶层 process.versions.node 及 luaopen_io 的 stdin/stdout/stderr）会抛
+# ReferenceError。因 Vite 8 的 define 不作用于依赖预打包、optimizeDeps 的
+# rolldownOptions.define 被拒绝，只能以补丁做源码级修复（勿直接改 node_modules）。
+patchedDependencies:
+  fengari@0.1.5: patches/fengari@0.1.5.patch

@@ -31,6 +31,7 @@ export type DialogKind =
   | 'select-lines'
   | 'export'
   | 'language'
+  | 'file-manager'
   | null
 export type AudioView = 'waveform' | 'spectrum'
 export type GridTagsMode = 'show' | 'hide' | 'simplify'
@@ -105,7 +106,7 @@ export interface CommandApi {
   selectLines(ids: string[]): void
   openFind(mode: 'find' | 'replace'): void
   findNext(): void
-  replaceCurrent(): void
+  replaceNext(): void
   replaceAll(): void
   openStyleManager(): void
   openDialog(dialog: DialogKind): void
@@ -1121,6 +1122,10 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   },
   'app/log': {
     run: (_, api) => api.toggleLog(),
+  },
+  'app/file_manager': {
+    // Web 特有命令（无源码对应）
+    run: (_, api) => api.openDialog('file-manager'),
   },
   'time/snap/scene': {
     // time.cpp：把选中行的 Start/End 设为当前帧两侧关键帧区间的边界

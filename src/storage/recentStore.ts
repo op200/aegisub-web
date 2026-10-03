@@ -14,6 +14,56 @@ export function mruMaxEntries(): number {
   return Math.max(0, Math.min(16, getOptionInt('Limits/MRU')))
 }
 
+/**
+ * 字符串型 MRU：源码 mru.cpp 中 "Find"/"Replace" 两类（上限 Limits/Find Replace）。
+ * 条目为纯字符串（非文件句柄），存放在 localStorage（与文件型 MRU 的 IndexedDB 分离）。
+ */
+export type SearchMruType = 'Find' | 'Replace'
+
+export type SearchMruLists = Record<SearchMruType, string[]>
+
+const SEARCH_MRU_STORAGE_KEY = 'aegisub-web:search-mru'
+
+function emptySearchMru(): SearchMruLists {
+  return { Find: [], Replace: [] }
+}
+
+/** mru.cpp Prune：上限取 Limits/Find Replace（默认 16） */
+function searchMruLimit(): number {
+  return Math.max(0, getOptionInt('Limits/Find Replace'))
+}
+
+export function loadSearchMru(): SearchMruLists {
+  try {
+    const raw = localStorage.getItem(SEARCH_MRU_STORAGE_KEY)
+    const parsed = raw ? (JSON.parse(raw) as Partial<Record<SearchMruType, unknown>>) : {}
+    return {
+      Find: Array.isArray(parsed.Find) ? (parsed.Find as string[]) : [],
+      Replace: Array.isArray(parsed.Replace) ? (parsed.Replace as string[]) : [],
+    }
+  } catch {
+    // 私密模式 / 数据损坏：回退空列表
+    return emptySearchMru()
+  }
+}
+
+/** mru.cpp MRUManager::Add：已在首位为 no-op；否则前移/插入并裁剪 */
+export function pushSearchMru(type: SearchMruType, entry: string): SearchMruLists {
+  const lists = loadSearchMru()
+  const index = lists[type].indexOf(entry)
+  if (index !== 0) {
+    if (index > 0) lists[type].splice(index, 1)
+    lists[type].unshift(entry)
+    lists[type] = lists[type].slice(0, searchMruLimit())
+    try {
+      localStorage.setItem(SEARCH_MRU_STORAGE_KEY, JSON.stringify(lists))
+    } catch {
+      // 配额不足：仅本次内存生效
+    }
+  }
+  return lists
+}
+
 export interface RecentEntry {
   name: string
   file?: File

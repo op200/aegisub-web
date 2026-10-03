@@ -20,6 +20,8 @@ interface MenuBarProps {
   onCommand: (id: string) => void
   isCommandEnabled: (id: string) => boolean
   isCommandChecked?: (id: string) => boolean
+  /** 菜单打开时通知（menu.cpp CommandManager：wxEVT_MENU_OPEN 刷新 dynamic 项，如 Automation 宏 validate/isactive） */
+  onMenuOpen?: (menuId: string) => void
 }
 
 export function MenuBar({
@@ -31,6 +33,7 @@ export function MenuBar({
   onCommand,
   isCommandEnabled,
   isCommandChecked,
+  onMenuOpen,
 }: MenuBarProps) {
   // 语言版本号订阅：切换语言时触发重渲染，render 中 getAegisubMenus() 拿到新结构
   useLocaleVersion()
@@ -221,13 +224,16 @@ export function MenuBar({
                 // wx 菜单栏不抢键盘焦点：点击后焦点留在原窗口（各上下文热键不失效）
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => {
-                  setOpenMenu((current) => (current === menu.id ? null : menu.id))
+                  const next = openMenu === menu.id ? null : menu.id
+                  setOpenMenu(next)
                   setOpenSubmenu(null)
+                  if (next) onMenuOpen?.(menu.id)
                 }}
                 onPointerEnter={() => {
                   if (openMenu) {
                     setOpenMenu(menu.id)
                     setOpenSubmenu(null)
+                    onMenuOpen?.(menu.id)
                   }
                 }}
               >

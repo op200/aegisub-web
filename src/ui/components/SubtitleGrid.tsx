@@ -653,14 +653,19 @@ export function SubtitleGrid({
     return Math.floor((clientY - rect.top + viewport.scrollTop) / rowHeight)
   }
 
-  // MakeRowVisible：行不可见时滚动（row-1 / 可见行数-3 边距语义）
+  // 源码 base_grid.cpp:MakeRowVisible 的 h = GetClientSize().GetHeight()（含表头行），
+  // 故 h/lineHeight = 数据区可见行数 + 1；web 的 clientHeight 只含数据区，需补回表头行
+  const rowsPerScreen = (viewport: HTMLDivElement) =>
+    Math.max(1, Math.floor((viewport.clientHeight + rowHeight) / rowHeight))
+
+  // MakeRowVisible：行不可见时滚动（row-1 / h/lineHeight-3 边距语义）
   const makeRowVisible = (row: number) => {
     const viewport = viewportRef.current
     if (!viewport) return
-    const visibleRows = Math.max(1, Math.floor(viewport.clientHeight / rowHeight))
+    const drawPerScreen = rowsPerScreen(viewport)
     const first = Math.floor(viewport.scrollTop / rowHeight)
     if (row < first + 1) scrollToRow(row - 1)
-    else if (row > first + visibleRows - 3) scrollToRow(row - visibleRows + 3)
+    else if (row > first + drawPerScreen - 3) scrollToRow(row - drawPerScreen + 3)
   }
 
   const scrollToRow = (row: number) => {
@@ -733,11 +738,12 @@ export function SubtitleGrid({
     if (row !== drag.anchorIndex) {
       const viewport = viewportRef.current
       if (viewport) {
-        // 边缘自动滚动（源码 ScrollTo(yPos ± 3)）
+        // 边缘自动滚动（源码 ScrollTo(yPos ± 3)；阈值同 h/lineHeight，含表头行）
         const yPos = Math.floor(viewport.scrollTop / rowHeight)
-        const visibleRows = Math.max(1, Math.floor(viewport.clientHeight / rowHeight))
+        const drawPerScreen = rowsPerScreen(viewport)
         if (row <= yPos) scrollToRow(yPos - 3)
-        else if (row > yPos + visibleRows - (row > drag.anchorIndex ? 3 : 1)) scrollToRow(yPos + 3)
+        else if (row > yPos + drawPerScreen - (row > drag.anchorIndex ? 3 : 1))
+          scrollToRow(yPos + 3)
       }
     }
     if (row === dragLastRowRef.current) return
@@ -795,6 +801,8 @@ export function SubtitleGrid({
     <section className="grid-panel" aria-label={tPlain('Subtitle lines')}>
       <div className="subtitle-grid-scroll" onWheel={onGridWheel}>
         <div className="subtitle-grid-minwidth" style={{ minWidth: fixedWidth }}>
+          {/* 源码 base_grid.cpp 无任何 SetToolTip：网格文本单元格与表头的 hover 提示已移除；
+              列 description 仅用于表头右键「列显隐」菜单项文案 */}
           <div
             className="subtitle-grid-header grid-columns"
             role="row"

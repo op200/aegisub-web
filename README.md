@@ -28,7 +28,7 @@ Aegisub Web 目的在于尽可能在 Web 端实现 Aegisub 功能，同时提供
 
 ### Firefox
 
-v155.0.1
+v157.0
 
 - 不支持 [`window.queryLocalFonts`](https://caniuse.com/wf-local-fonts)，需要手动载入字体文件
 - 对 MKV 兼容性不如 Chrome

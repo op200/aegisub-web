@@ -79,6 +79,22 @@ function convertItems(items: RawMenuItem[], menus: RawMenuMap): MenuItemDefiniti
   return items.map((item) => convertItem(item, menus))
 }
 
+/**
+ * Web 附加菜单项（源码数据 aegisub-data/*.json 禁止修改）：
+ * 文件管理器为 web 特有功能，管理便携虚拟文件系统（自动保存/备份/样式库/
+ * 自动化脚本等），插在 File → Open Autosaved Subtitles... 之后。
+ */
+function appendWebMenuItems(menus: MenuDefinition[]): void {
+  const fileMenu = menus.find((menu) => menu.id === 'main/file')
+  if (!fileMenu) return
+  const extra: MenuItemDefinition = {
+    command: 'app/file_manager',
+    label: t(COMMANDS['app/file_manager'].label),
+  }
+  const index = fileMenu.items.findIndex((item) => item.command === 'subtitle/open/autosave')
+  fileMenu.items.splice(index >= 0 ? index + 1 : fileMenu.items.length, 0, extra)
+}
+
 function buildMenus(): MenuDefinition[] {
   const raw = menuData as unknown as RawMenuMap
   const platform = platformData as unknown as RawMenuMap
@@ -119,6 +135,7 @@ function buildMenus(): MenuDefinition[] {
       menus.push({ id: item.command, label, accessKey: accessKey ?? '', items: [] })
     }
   }
+  appendWebMenuItems(menus)
   return menus
 }
 
