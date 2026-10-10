@@ -1294,17 +1294,22 @@ button:disabled {
 .subtitle-grid-viewport {
   min-height: 0;
   height: 100%;
+  /* 默认纯 JS 虚拟列表：视口不滚动，偏移由内层 transform 表达（SubtitleGrid.tsx），
+     滚动操作全部走 JS（无原生滚动/吸附动画） */
+  overflow: hidden;
+  position: relative;
+}
+/* 可选：浏览器原生滚动（Subtitle/Grid/Native Scroll 打开时）。整行吸附依赖 scroll-snap，
+   top 永远整行对齐；不在 scroll 事件里改写 scrollTop，避免与惯性滚动动画互相打架 */
+.subtitle-grid-viewport.native-scroll {
   overflow-y: auto;
   overflow-x: hidden;
-  /* 源码网格按整行滚动（base_grid.cpp 的 yPos 为行号，从 yPos*lineHeight 起绘制），顶部永远整行对齐。
-     交给浏览器原生 scroll-snap（惯性结束后吸附），不在 scroll 事件里改写 scrollTop，
-     避免与惯性滚动动画互相打架导致位置颤动 */
   scroll-snap-type: y mandatory;
   scroll-behavior: auto;
   /* 原生滚动条隐藏：滚动条由 .grid-scrollbar 自绘（源码为常驻 wxScrollBar） */
   scrollbar-width: none;
 }
-.subtitle-grid-viewport::-webkit-scrollbar {
+.subtitle-grid-viewport.native-scroll::-webkit-scrollbar {
   display: none;
 }
 /* 自绘竖向滚动条（base_grid.cpp 的 wxScrollBar：常驻、全高含表头、rows<=1 时禁用置灰） */
@@ -1422,9 +1427,36 @@ button:disabled {
 .subtitle-row.at-time:not(.selected):not(.comment) {
   background: var(--grid-inframe-bg, #fffdea);
 }
+/* Colour/Subtitle Grid/Active Border：base_grid.cpp OnPaint 末段在整行之上补画一个
+   1px 矩形框（DrawRectangle(0, top, w, lineHeight + 1)），其上下边正好压在行的灰色
+   网格线上（相邻行共用同一像素）→ 语义是「把该行原有的灰线换成品红」。
+   因此这里必须改「线本身的颜色」，不能用覆盖层：每行的 transform 各自吸附设备像素，
+   覆盖层画的线与上一行画的线可能错开 1px，形成「品红在上、灰色在下」的双线。
+   活动行的下边线 = 本行自己的 border-bottom；上边线 = 上一行的下边线（相邻兄弟）。 */
 .subtitle-row.active {
-  /* Aegisub Colour/Subtitle Grid/Active Border：活动行整框粉色描边 */
-  box-shadow: inset 0 0 0 1px var(--grid-active-border, #ff5bef);
+  border-bottom-color: var(--grid-active-border, #ff5bef);
+}
+.subtitle-row:has(+ .subtitle-row.active) {
+  border-bottom-color: var(--grid-active-border, #ff5bef);
+}
+/* 左右竖边仍用覆盖层（无相邻行共用，不会错位）：绝对定位的覆盖层在行内容之上，
+   与源码「活动边框最后画」一致；bottom 外扩 1px 让竖边覆盖到下边线那一格 */
+.subtitle-row.active::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  border-left: 1px solid var(--grid-active-border, #ff5bef);
+  border-right: 1px solid var(--grid-active-border, #ff5bef);
+  pointer-events: none;
+}
+/* 首行贴顶时它的上边线就是表头的下边线，而该像素在视口之外（视口 overflow:hidden，
+   行内覆盖层画不出去）→ 只能由表头把这条线改色。条件（首行 active 且未滚动）在
+   SubtitleGrid.tsx 里判定后加 .active-top */
+.subtitle-grid-header.active-top {
+  border-bottom-color: var(--grid-active-border, #ff5bef);
 }
 .row-number {
   /* 行号列在源码里就是 columns[0]（GridColumnLineNumber::Centered()=true），

@@ -72,6 +72,31 @@ export interface RecentEntry {
 
 export type RecentLists = Record<RecentType, RecentEntry[]>
 
+/**
+ * 上次关闭浏览器标签页时打开的字幕（会话恢复）。只记文件名，File 句柄从 MRU
+ * 的 subtitle 列表取回（两者都在 IndexedDB 中跨会话持久）。新建/恢复自动保存/无
+ * 打开文件时清除，保证下次启动只在“上次确实开着某个 ASS”时自动打开。
+ */
+const LAST_SUBTITLE_KEY = 'aegisub-web:last-subtitle'
+
+export function loadLastSubtitleName(): string | null {
+  try {
+    return localStorage.getItem(LAST_SUBTITLE_KEY)
+  } catch {
+    // 私密模式下不可用：视为无会话
+    return null
+  }
+}
+
+export function saveLastSubtitleName(name: string | null): void {
+  try {
+    if (name) localStorage.setItem(LAST_SUBTITLE_KEY, name)
+    else localStorage.removeItem(LAST_SUBTITLE_KEY)
+  } catch {
+    // 私密模式下忽略
+  }
+}
+
 function emptyLists(): RecentLists {
   return { subtitle: [], video: [], audio: [], timecodes: [], keyframes: [] }
 }

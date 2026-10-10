@@ -6,12 +6,20 @@
  * 绘图标记与样式映射移植自 libaegisub/ass/dialogue_parser.cpp 的
  * MarkDrawings/SplitDrawing/SyntaxHighlighter；
  * 颜色/粗体/下划线/背景取自 default_config.json 的 Colour/Subtitle/Syntax（SetStyles）。
+ *
+ * web 版增强（源码无此行为）：模板行的 `!代码!` 块不再整块纯紫，块内按 Lua 语法上色
+ * （luaHighlight.ts + LUA_SYNTAX_COLORS：VS Code「现代深色」主题色，无配置项、
+ * 不做暗色反相），`!` 分界符用运算符白（LUA_DELIMITER），整块叠加 LUA_BLOCK_BACKGROUND
+ * 底纹（#1F1F1F，Dark Modern 编辑区底色，段级 background 覆盖块内 Background/* 配置色）。
+ * 该增强可用 Subtitle/Highlight/Template Lua 开关关闭（默认开启），关闭后与源码一致：
+ * 整块（含 `!`）Karaoke Template 紫、无 Lua 细分、无底纹。
  */
 import { getOptionBool, getOptionString } from '../config/options'
 import { invertLightness } from './color'
+import { LUA_BLOCK_BACKGROUND, LUA_SYNTAX_COLORS, tokenizeLuaCode } from './luaHighlight'
 
-/** 语法高亮样式（agi::ass::SyntaxStyle，dialogue_parser.h） */
-export type AssSyntaxType =
+/** 源码语法高亮样式（agi::ass::SyntaxStyle，dialogue_parser.h） */
+type AssSourceSyntaxType =
   | 'NORMAL'
   | 'COMMENT'
   | 'DRAWING_CMD'
@@ -28,13 +36,34 @@ export type AssSyntaxType =
   | 'KARAOKE_TEMPLATE'
   | 'KARAOKE_VARIABLE'
 
+/** web 增强：模板行 `!代码!` 块内 Lua 上色专用样式类（VS Code 主题配色，见 luaHighlight.ts） */
+export type LuaSyntaxType =
+  | 'LUA_DELIMITER'
+  | 'LUA_COMMENT'
+  | 'LUA_STRING'
+  | 'LUA_NUMBER'
+  | 'LUA_KEYWORD'
+  | 'LUA_CONSTANT'
+  | 'LUA_FUNCTION'
+  | 'LUA_VARIABLE'
+  | 'LUA_PROPERTY'
+  | 'LUA_OPERATOR'
+  | 'LUA_BRACKET1'
+  | 'LUA_BRACKET2'
+  | 'LUA_BRACKET3'
+  | 'LUA_BRACKET_UNEXPECTED'
+
+export type AssSyntaxType = AssSourceSyntaxType | LuaSyntaxType
+
 export interface AssHighlightSegment {
   text: string
   type: AssSyntaxType
+  /** 段级底纹（web 增强：模板 `!代码!` 块的 Dark Modern 编辑区底色；未设置则用样式配置背景） */
+  background?: string
 }
 
 /** Colour/Subtitle/Syntax 默认配色（default_config.json） */
-export const ASS_SYNTAX_COLORS: Record<AssSyntaxType, string> = {
+export const ASS_SYNTAX_COLORS: Record<AssSourceSyntaxType, string> = {
   NORMAL: 'rgb(0,0,0)',
   COMMENT: 'rgb(0,0,0)',
   DRAWING_CMD: 'rgb(0,0,0)',
@@ -56,7 +85,7 @@ export const ASS_SYNTAX_COLORS: Record<AssSyntaxType, string> = {
  * AssSyntaxType → Colour/Subtitle/Syntax 选项名（subs_edit_ctrl.cpp SetStyles）。
  * 绘图端点坐标与普通坐标共用 Drawing X/Y 的配色，下划线由 Underline/Drawing Endpoint 控制。
  */
-const SYNTAX_OPTION: Record<AssSyntaxType, string> = {
+const SYNTAX_OPTION: Record<AssSourceSyntaxType, string> = {
   NORMAL: 'Normal',
   COMMENT: 'Comment',
   DRAWING_CMD: 'Drawing Command',
@@ -85,7 +114,7 @@ export interface AssSyntaxStyle {
 /** 当前生效的语法高亮配色（dark 主题按亮度反相适配；源码无暗色主题概念） */
 export function getSyntaxColors(dark = false): Record<AssSyntaxType, AssSyntaxStyle> {
   const result = {} as Record<AssSyntaxType, AssSyntaxStyle>
-  for (const type of Object.keys(ASS_SYNTAX_COLORS) as AssSyntaxType[]) {
+  for (const type of Object.keys(ASS_SYNTAX_COLORS) as AssSourceSyntaxType[]) {
     const name = SYNTAX_OPTION[type]
     const color = getOptionString(`Colour/Subtitle/Syntax/${name}`) || ASS_SYNTAX_COLORS[type]
     const background = getOptionString(`Colour/Subtitle/Syntax/Background/${name}`)
@@ -102,6 +131,10 @@ export function getSyntaxColors(dark = false): Record<AssSyntaxType, AssSyntaxSt
           : background
         : '',
     }
+  }
+  // web 增强：模板行 `!代码!` 块内 Lua 类恒用 VS Code「现代深色」原色（无配置项，不反相）
+  for (const type of Object.keys(LUA_SYNTAX_COLORS) as LuaSyntaxType[]) {
+    result[type] = { color: LUA_SYNTAX_COLORS[type], bold: false, underline: false, background: '' }
   }
   return result
 }
@@ -137,6 +170,9 @@ export interface AssToken {
 
 const WHITESPACE_RE = /\s/
 const KARAOKE_VARIABLE_RE = /[A-Za-z_]/
+// 变量名续字符吃数字（有意偏离源码 parser.cpp 的 \$[A-Za-z_]+，见 未完成计划.md：
+// 否则 $syl2 被拆成 $syl + 2，`2` 按普通文本上色）
+const KARAOKE_VARIABLE_CHAR_RE = /[A-Za-z0-9_]/
 const TAG_NAME_LOWER_RE = /[a-z0-9]/
 // 粘滞（y）匹配：必须从 lastIndex 处开始，否则 exec 会向后搜索到无关的匹配
 const WHITESPACE_RUN_RE = /\s+/y
@@ -169,10 +205,11 @@ export function tokenizeDialogueBody(text: string, karaokeTemplater = false): As
     return end < 0 ? 0 : end - i + 1
   }
   const karaokeVariableLength = (i: number): number => {
-    if (!karaokeTemplater || text[i] !== '$') return 0
-    let j = i + 1
-    while (j < text.length && KARAOKE_VARIABLE_RE.test(text[j])) j++
-    return j > i + 1 ? j - i : 0
+    if (!karaokeTemplater || text[i] !== '$' || !KARAOKE_VARIABLE_RE.test(text[i + 1] ?? ''))
+      return 0
+    let j = i + 2
+    while (j < text.length && KARAOKE_VARIABLE_CHAR_RE.test(text[j])) j++
+    return j - i
   }
   const whitespaceRunLength = (i: number): number =>
     WHITESPACE_RE.test(text[i]) ? runLength(WHITESPACE_RUN_RE, text, i) : 0
@@ -551,21 +588,48 @@ function splitDrawings(text: string, tokens: AssToken[]): void {
 }
 
 /** token → 语法样式的映射（SyntaxHighlighter::Highlight，相邻同类合并） */
-function syntaxHighlight(text: string, tokens: AssToken[]): AssHighlightSegment[] {
-  const styled: { type: AssSyntaxType; length: number }[] = []
-  const setStyling = (length: number, type: AssSyntaxType) => {
+function syntaxHighlight(
+  text: string,
+  tokens: AssToken[],
+  templateLuaHighlight: boolean,
+): AssHighlightSegment[] {
+  const styled: { type: AssSyntaxType; length: number; background?: string }[] = []
+  const setStyling = (length: number, type: AssSyntaxType, background?: string) => {
     if (length <= 0) return
     const last = styled[styled.length - 1]
-    if (last && last.type === type) last.length += length
-    else styled.push({ type, length })
+    if (last && last.type === type && last.background === background) last.length += length
+    else styled.push({ type, length, background })
   }
 
+  let tokenPos = 0
   for (const token of tokens) {
     const len = token.length
     switch (token.type) {
-      case 'KARAOKE_TEMPLATE':
-        setStyling(len, 'KARAOKE_TEMPLATE')
+      case 'KARAOKE_TEMPLATE': {
+        // web 增强：模板行 `!代码!` 块内按 Lua 语法上色，`!` 分界符用运算符白；
+        // 关闭（Subtitle/Highlight/Template Lua = false）时与源码一致整块 Karaoke 紫
+        const inner =
+          templateLuaHighlight &&
+          len >= 2 &&
+          text[tokenPos] === '!' &&
+          text[tokenPos + len - 1] === '!'
+            ? text.slice(tokenPos + 1, tokenPos + len - 1)
+            : null
+        if (inner === null) {
+          setStyling(len, 'KARAOKE_TEMPLATE')
+        } else {
+          // 相邻 !块! 被词法器按「相邻同类合并」并成一个 token，故按 ! 拆回逐块；
+          // 输出恒为 '!' + inner0 + '!' + inner1 + ... + '!'，逐字符重建原 token；
+          // 整块（! 分界符 + 块内代码与空白）叠加 LUA_BLOCK_BACKGROUND 底纹
+          for (const part of inner.split('!')) {
+            setStyling(1, 'LUA_DELIMITER', LUA_BLOCK_BACKGROUND)
+            for (const segment of tokenizeLuaCode(part))
+              setStyling(segment.text.length, segment.type, LUA_BLOCK_BACKGROUND)
+          }
+          setStyling(1, 'LUA_DELIMITER', LUA_BLOCK_BACKGROUND)
+        }
         break
+      }
       case 'KARAOKE_VARIABLE':
         setStyling(len, 'KARAOKE_VARIABLE')
         break
@@ -624,12 +688,17 @@ function syntaxHighlight(text: string, tokens: AssToken[]): AssHighlightSegment[
         // DRAWING_FULL 已在 SplitWords 中拆开；兜底按普通文本以免丢失字符
         setStyling(len, 'NORMAL')
     }
+    tokenPos += len
   }
 
   const segments: AssHighlightSegment[] = []
   let pos = 0
   for (const style of styled) {
-    segments.push({ text: text.slice(pos, pos + style.length), type: style.type })
+    segments.push({
+      text: text.slice(pos, pos + style.length),
+      type: style.type,
+      ...(style.background ? { background: style.background } : null),
+    })
     pos += style.length
   }
   return segments
@@ -639,10 +708,16 @@ function syntaxHighlight(text: string, tokens: AssToken[]): AssHighlightSegment[
  * 把 ASS 文本分成带样式类型的片段。
  * karaokeTemplater = 源码 SubsTextEditCtrl::UpdateStyle 的 template_line：
  * 活动行是 Comment 且 Effect 以 "template" 开头（不区分大小写）。
+ * templateLuaHighlight = web 增强开关（调用方传 Subtitle/Highlight/Template Lua）：
+ * false 时 `!代码!` 整块按源码语义 Karaoke Template 紫，不做块内 Lua 上色。
  */
-export function tokenizeAss(text: string, karaokeTemplater = false): AssHighlightSegment[] {
+export function tokenizeAss(
+  text: string,
+  karaokeTemplater = false,
+  templateLuaHighlight = true,
+): AssHighlightSegment[] {
   const tokens = tokenizeDialogueBody(text, karaokeTemplater)
   markDrawings(text, tokens)
   splitDrawings(text, tokens)
-  return syntaxHighlight(text, tokens)
+  return syntaxHighlight(text, tokens, templateLuaHighlight)
 }

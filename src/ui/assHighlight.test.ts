@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { tokenizeAss, tokenizeDialogueBody, type AssSyntaxType } from './assHighlight'
+import { LUA_SYNTAX_COLORS } from './luaHighlight'
 
 /** 与源码 tok_str 宏等价的 token 断言（含相邻同类合并校验） */
 function expectTokens(text: string, karaokeTemplater: boolean, expected: [string, number][]) {
@@ -18,8 +19,9 @@ function expectStyles(
   text: string,
   karaokeTemplater: boolean,
   expected: [AssSyntaxType, number][],
+  templateLuaHighlight = true,
 ) {
-  const segments = tokenizeAss(text, karaokeTemplater)
+  const segments = tokenizeAss(text, karaokeTemplater, templateLuaHighlight)
   expect(segments.map((s) => [s.type, s.text.length])).toEqual(expected)
   // 高亮层必须与 textarea 文本逐字符对齐（丢字会整体错位）
   expect(segments.map((s) => s.text).join('')).toBe(text)
@@ -262,6 +264,13 @@ describe('tokenizeDialogueBody', () => {
 
   it('模板行识别 $变量', () => {
     expectTokens('$a', true, [['KARAOKE_VARIABLE', 2]])
+    // 变量名吃后续数字（有意偏离源码 \$[A-Za-z_]+ 正则，见 未完成计划.md：
+    // 否则 $syl2 被拆成 $syl + 2，`2` 按普通文本上色）
+    expectTokens('$syl2', true, [['KARAOKE_VARIABLE', 5]])
+    expectTokens('x$syl2', true, [
+      ['TEXT', 1],
+      ['KARAOKE_VARIABLE', 5],
+    ])
     expectTokens('{\\pos($x,$y)}a', true, [
       ['OVR_BEGIN', 1],
       ['TAG_START', 1],
@@ -493,6 +502,7 @@ describe('tokenizeAss', () => {
 
   it('模板行的 $变量', () => {
     expectStyles('$a', true, [['KARAOKE_VARIABLE', 2]])
+    expectStyles('$syl2', true, [['KARAOKE_VARIABLE', 5]])
 
     expectStyles('{\\pos($x,$y)}a', true, [
       ['OVERRIDE', 1],
@@ -529,17 +539,35 @@ describe('tokenizeAss', () => {
     ])
   })
 
-  it('模板行的 !表达式!', () => {
-    expectStyles('!5!', true, [['KARAOKE_TEMPLATE', 3]])
+  it('模板行的 !表达式!（web 增强：块内 Lua 上色，! 分界符运算符白）', () => {
+    expectStyles('!5!', true, [
+      ['LUA_DELIMITER', 1],
+      ['LUA_NUMBER', 1],
+      ['LUA_DELIMITER', 1],
+    ])
     expectStyles('!5', true, [['NORMAL', 2]])
-    expectStyles('!x * 10!', true, [['KARAOKE_TEMPLATE', 8]])
+    expectStyles('!x * 10!', true, [
+      ['LUA_DELIMITER', 1],
+      ['LUA_VARIABLE', 1],
+      ['NORMAL', 1],
+      ['LUA_OPERATOR', 1],
+      ['NORMAL', 1],
+      ['LUA_NUMBER', 2],
+      ['LUA_DELIMITER', 1],
+    ])
 
     expectStyles('{\\pos(!x + 1!, $y)}a', true, [
       ['OVERRIDE', 1],
       ['PUNCTUATION', 1],
       ['TAG', 3],
       ['PUNCTUATION', 1],
-      ['KARAOKE_TEMPLATE', 7],
+      ['LUA_DELIMITER', 1],
+      ['LUA_VARIABLE', 1],
+      ['NORMAL', 1],
+      ['LUA_OPERATOR', 1],
+      ['NORMAL', 1],
+      ['LUA_NUMBER', 1],
+      ['LUA_DELIMITER', 1],
       ['PUNCTUATION', 1],
       ['NORMAL', 1],
       ['KARAOKE_VARIABLE', 2],
@@ -551,16 +579,96 @@ describe('tokenizeAss', () => {
     // `}` 被 !表达式! 吞掉：无 OVR_END → 覆盖块按纯文本处理
     expectStyles("{\\b1!'}'!a", true, [
       ['NORMAL', 4],
-      ['KARAOKE_TEMPLATE', 5],
+      ['LUA_DELIMITER', 1],
+      ['LUA_STRING', 3],
+      ['LUA_DELIMITER', 1],
       ['NORMAL', 1],
     ])
   })
 
-  it('多个模板表达式', () => {
-    expectStyles('!1!2!3!', true, [
-      ['KARAOKE_TEMPLATE', 3],
-      ['NORMAL', 1],
-      ['KARAOKE_TEMPLATE', 3],
+  it('模板表达式内的 Lua 词法（函数名/字符串/关键字）', () => {
+    expectStyles('!retime("line",0,0)!', true, [
+      ['LUA_DELIMITER', 1],
+      ['LUA_FUNCTION', 6],
+      ['LUA_BRACKET1', 1],
+      ['LUA_STRING', 6],
+      ['LUA_OPERATOR', 1],
+      ['LUA_NUMBER', 1],
+      ['LUA_OPERATOR', 1],
+      ['LUA_NUMBER', 1],
+      ['LUA_BRACKET1', 1],
+      ['LUA_DELIMITER', 1],
     ])
+    expectStyles('!if x then 1 end!', true, [
+      ['LUA_DELIMITER', 1],
+      ['LUA_KEYWORD', 2],
+      ['NORMAL', 1],
+      ['LUA_VARIABLE', 1],
+      ['NORMAL', 1],
+      ['LUA_KEYWORD', 4],
+      ['NORMAL', 1],
+      ['LUA_NUMBER', 1],
+      ['NORMAL', 1],
+      ['LUA_KEYWORD', 3],
+      ['LUA_DELIMITER', 1],
+    ])
+  })
+
+  it('多个模板表达式（相邻 !块! 被词法器合并后仍逐块上色）', () => {
+    expectStyles('!1!2!3!', true, [
+      ['LUA_DELIMITER', 1],
+      ['LUA_NUMBER', 1],
+      ['LUA_DELIMITER', 1],
+      ['NORMAL', 1],
+      ['LUA_DELIMITER', 1],
+      ['LUA_NUMBER', 1],
+      ['LUA_DELIMITER', 1],
+    ])
+    expectStyles('!a!!b!', true, [
+      ['LUA_DELIMITER', 1],
+      ['LUA_VARIABLE', 1],
+      ['LUA_DELIMITER', 2],
+      ['LUA_VARIABLE', 1],
+      ['LUA_DELIMITER', 1],
+    ])
+  })
+
+  it('! 分界符与运算符同色（LUA_DELIMITER = VS Code 运算符白 #D4D4D4）', () => {
+    expect(LUA_SYNTAX_COLORS.LUA_DELIMITER).toBe(LUA_SYNTAX_COLORS.LUA_OPERATOR)
+  })
+
+  it('Subtitle/Highlight/Template Lua 关闭时与源码一致：整块 Karaoke 紫、无底纹', () => {
+    expectStyles('!5!', true, [['KARAOKE_TEMPLATE', 3]], false)
+    expectStyles(
+      'a !x + 1! b',
+      true,
+      [
+        ['NORMAL', 2],
+        ['KARAOKE_TEMPLATE', 7],
+        ['NORMAL', 2],
+      ],
+      false,
+    )
+    expect(tokenizeAss('a !x + 1! b', true, false).every((s) => s.background === undefined)).toBe(
+      true,
+    )
+  })
+
+  it('模板 !代码! 块整体叠加 Dark Modern 编辑区底色（web 增强）', () => {
+    // 块内所有段（! 分界符、代码、块内空白）统一带 #1F1F1F 段级底纹，连成整块
+    const segments = tokenizeAss('a !x + 1! b', true)
+    expect(segments.map((s) => [s.text, s.type, s.background])).toEqual([
+      ['a ', 'NORMAL', undefined],
+      ['!', 'LUA_DELIMITER', '#1F1F1F'],
+      ['x', 'LUA_VARIABLE', '#1F1F1F'],
+      [' ', 'NORMAL', '#1F1F1F'],
+      ['+', 'LUA_OPERATOR', '#1F1F1F'],
+      [' ', 'NORMAL', '#1F1F1F'],
+      ['1', 'LUA_NUMBER', '#1F1F1F'],
+      ['!', 'LUA_DELIMITER', '#1F1F1F'],
+      [' b', 'NORMAL', undefined],
+    ])
+    // 非模板行（`!` 按普通文本）无段级底纹
+    expect(tokenizeAss('!x!', false).every((s) => s.background === undefined)).toBe(true)
   })
 })

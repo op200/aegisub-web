@@ -287,8 +287,16 @@ export const DEFAULT_CONFIG = {
       'Hide Overrides': 1,
       'Hide Overrides Char': '☀',
       'Highlight Subtitles in Frame': true,
+      // Web 版偏离上游：网格滚动实现。false（默认）= 纯 JS 虚拟列表（自控滚动与渲染，
+      // 无原生滚动动画）；true = 浏览器原生滚动（scroll-snap 整行吸附）
+      'Native Scroll': false,
     },
-    Highlight: { Syntax: true },
+    Highlight: {
+      Syntax: true,
+      // Web 版偏离上游：模板行 `!代码!` 块内 Lua 上色（luaHighlight.ts）。true（默认）=
+      // 块内按 Lua 语法上色 + `!` 分界符运算符白；false = 源码语义整块 Karaoke Template 紫
+      'Template Lua': true,
+    },
     // Web 版偏离上游：'jassub'（libass WASM 渲染）| 'canvas'（内置 drawCue 兜底）；
     // 上游历史值 'libass'/'csri' 合并时一并视为 jassub
     Provider: 'jassub',

@@ -113,6 +113,10 @@ const OVERSCAN = 8
 const SCROLLBAR_WIDTH = 15
 /** 滚动条两端箭头按钮高度（Win32 滚动条箭头为正方形，与滚动条同宽） */
 const SCROLLBAR_ARROW = SCROLLBAR_WIDTH
+/** 滚轮一档的折算像素（浏览器每档 deltaY≈100；源码一档 = step 行） */
+const WHEEL_NOTCH_PX = 100
+/** 滚轮一档滚动的行数（源码 base_grid.cpp OnMouseEvent：step 默认 3） */
+const WHEEL_STEP_ROWS = 3
 
 /** 网格字号（px）：Subtitle/Grid/Font Size 由 pt 转 px（9pt → 12px） */
 function gridFontSize(): number {
@@ -475,6 +479,10 @@ export function SubtitleGrid({
   isCommandEnabled,
 }: SubtitleGridProps) {
   const viewportRef = useRef<HTMLDivElement>(null)
+  // 外层容器（承接滚轮事件；纯 JS 模式下需非 passive 监听以 preventDefault 阻止外层滚动）
+  const scrollHostRef = useRef<HTMLDivElement>(null)
+  // 滚动位置真源：native 模式下由 scroll 事件同步，JS 模式下由滚动操作直接写入
+  const scrollTopRef = useRef(0)
   const [scrollTop, setScrollTop] = useState(0)
   const [height, setHeight] = useState(300)
   const [context, setContext] = useState<{ x: number; y: number } | null>(null)
@@ -518,11 +526,109 @@ export function SubtitleGrid({
   // 行高随 Subtitle/Grid/Font Size 变化（源码 UpdateStyle 时重算 lineHeight）
   const rowHeight = gridRowHeight()
 
+  // 滚动实现（Subtitle/Grid/Native Scroll）：默认纯 JS 虚拟列表（无原生滚动/动画），
+  // 可选切回浏览器原生滚动。ref 供事件处理器读取最新值，避免闭包过期。
+  const nativeScroll = getOptionBool('Subtitle/Grid/Native Scroll')
+  const nativeScrollRef = useRef(nativeScroll)
+  nativeScrollRef.current = nativeScroll
+  const rowHeightRef = useRef(rowHeight)
+  rowHeightRef.current = rowHeight
+  const heightRef = useRef(height)
+  heightRef.current = height
+  const cuesLengthRef = useRef(cues.length)
+  cuesLengthRef.current = cues.length
+  // 滚轮累积量（像素）：源码 base_grid.cpp 按整数行滚动（yPos），滚轮档位需累积后换算
+  const wheelAccumRef = useRef(0)
+
+  /** 当前滚动偏移（像素）：JS 模式读真源，native 模式读视口（滚动事件可能晚一拍） */
+  const getScrollTop = useCallback(
+    () =>
+      nativeScrollRef.current
+        ? (viewportRef.current?.scrollTop ?? scrollTopRef.current)
+        : scrollTopRef.current,
+    [],
+  )
+
+  /** 统一滚动入口：钳制到 [0, (rows-1)*rowHeight]（源码 yPos 上限 rows-1），
+      JS 模式写入真源并重渲染，native 模式写入视口（scroll 事件回填状态） */
+  const setScroll = useCallback((value: number) => {
+    const max = Math.max(0, (cuesLengthRef.current - 1) * rowHeightRef.current)
+    const clamped = Math.max(0, Math.min(max, value))
+    if (nativeScrollRef.current) {
+      const viewport = viewportRef.current
+      if (viewport && viewport.scrollTop !== clamped) viewport.scrollTop = clamped
+      return
+    }
+    if (clamped === scrollTopRef.current) return
+    scrollTopRef.current = clamped
+    setScrollTop(clamped)
+  }, [])
+
+  // 切换滚动实现时迁移当前偏移：JS 模式把偏移从原生视口搬到真源（并清零原生滚动），
+  // native 模式从真源恢复到原生视口
+  useEffect(() => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    if (nativeScroll) {
+      viewport.scrollTop = scrollTopRef.current
+    } else {
+      if (viewport.scrollTop !== scrollTopRef.current) {
+        scrollTopRef.current = viewport.scrollTop
+        setScrollTop(viewport.scrollTop)
+      }
+      viewport.scrollTop = 0
+    }
+  }, [nativeScroll])
+
+  // 行数/行高变化后钳制偏移（末行删除等）
+  useEffect(() => {
+    setScroll(scrollTopRef.current)
+  }, [cues.length, rowHeight, setScroll])
+
+  // 滚轮：JS 模式整个网格由本函数滚动（需 preventDefault 阻止外层滚动）；
+  // native 模式下视口由浏览器处理，仅表头/滚动条区域由本函数滚动。
+  // 源码 base_grid.cpp OnMouseEvent：yPos 为整数行号，滚轮每档滚动 step 行
+  // （默认 3 行，Shift 为整屏 - 2 行），故这里按 100px≈一档累积后整行滚动，
+  // 保证顶部永远整行对齐（无 scroll-snap 也不出现半行）
+  useEffect(() => {
+    const host = scrollHostRef.current
+    if (!host) return
+    const onWheel = (event: WheelEvent) => {
+      if (
+        nativeScrollRef.current &&
+        (event.target as HTMLElement).closest('.subtitle-grid-viewport')
+      )
+        return
+      event.preventDefault()
+      const rh = rowHeightRef.current
+      const delta =
+        event.deltaMode === 1
+          ? event.deltaY * rh
+          : event.deltaMode === 2
+            ? event.deltaY * heightRef.current
+            : event.deltaY
+      wheelAccumRef.current += delta
+      const notches = Math.trunc(wheelAccumRef.current / WHEEL_NOTCH_PX)
+      if (notches === 0) return
+      wheelAccumRef.current -= notches * WHEEL_NOTCH_PX
+      const rowsPerNotch = event.shiftKey
+        ? Math.max(1, Math.floor(heightRef.current / rh) - 2)
+        : WHEEL_STEP_ROWS
+      setScroll(getScrollTop() + notches * rowsPerNotch * rh)
+    }
+    host.addEventListener('wheel', onWheel, { passive: false })
+    return () => host.removeEventListener('wheel', onWheel)
+  }, [getScrollTop, setScroll])
+
   const range = useMemo(() => {
     const start = Math.max(0, Math.floor(scrollTop / rowHeight) - OVERSCAN)
     const end = Math.min(cues.length, Math.ceil((scrollTop + height) / rowHeight) + OVERSCAN)
     return { start, end }
   }, [cues.length, height, scrollTop, rowHeight])
+
+  // 首行贴顶且为活动行时，它的上边线与表头下边线是同一个像素（base_grid.cpp 中该像素
+  // 被活动边框重绘）；该像素在视口之外，行内覆盖层画不到，只能由表头改色（.active-top）
+  const headerActiveTop = scrollTop === 0 && cues.length > 0 && cues[0].id === activeId
 
   /**
    * 自绘竖向滚动条几何（base_grid.cpp AdjustScrollbar）：
@@ -556,10 +662,8 @@ export function SubtitleGrid({
 
   /** 滚动到指定行位置（源码 ScrollTo：mid(0, y, GetRows()-1)） */
   const scrollToPos = (pos: number) => {
-    const viewport = viewportRef.current
-    if (!viewport) return
     const clamped = Math.max(0, Math.min(scrollGeom.maxPos, pos))
-    viewport.scrollTop = clamped * rowHeight
+    setScroll(clamped * rowHeight)
   }
 
   const onThumbPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -592,19 +696,7 @@ export function SubtitleGrid({
     if ((event.target as HTMLElement).closest('.grid-scrollbar-thumb')) return
     const rect = event.currentTarget.getBoundingClientRect()
     const up = event.clientY - rect.top < scrollGeom.thumbTop
-    scrollToPos(
-      Math.round((viewportRef.current?.scrollTop ?? 0) / rowHeight) +
-        (up ? -1 : 1) * scrollGeom.pageStep,
-    )
-  }
-
-  // 滚轮在表头/滚动条上时同样滚动网格（源码整窗处理 EVT_MOUSEWHEEL；数据区由原生滚动处理）
-  const onGridWheel = (event: React.WheelEvent<HTMLDivElement>) => {
-    if ((event.target as HTMLElement).closest('.subtitle-grid-viewport')) return
-    const viewport = viewportRef.current
-    if (!viewport) return
-    const delta = event.deltaMode === 1 ? event.deltaY * rowHeight : event.deltaY
-    viewport.scrollTop += delta
+    scrollToPos(Math.round(getScrollTop() / rowHeight) + (up ? -1 : 1) * scrollGeom.pageStep)
   }
 
   const toggleColumn = (key: string) => {
@@ -650,7 +742,7 @@ export function SubtitleGrid({
     const viewport = viewportRef.current
     if (!viewport) return -1
     const rect = viewport.getBoundingClientRect()
-    return Math.floor((clientY - rect.top + viewport.scrollTop) / rowHeight)
+    return Math.floor((clientY - rect.top + getScrollTop()) / rowHeight)
   }
 
   // 源码 base_grid.cpp:MakeRowVisible 的 h = GetClientSize().GetHeight()（含表头行），
@@ -663,16 +755,14 @@ export function SubtitleGrid({
     const viewport = viewportRef.current
     if (!viewport) return
     const drawPerScreen = rowsPerScreen(viewport)
-    const first = Math.floor(viewport.scrollTop / rowHeight)
+    const first = Math.floor(getScrollTop() / rowHeight)
     if (row < first + 1) scrollToRow(row - 1)
     else if (row > first + drawPerScreen - 3) scrollToRow(row - drawPerScreen + 3)
   }
 
   const scrollToRow = (row: number) => {
-    const viewport = viewportRef.current
-    if (!viewport) return
     const clamped = Math.max(0, Math.min(row, Math.max(0, cues.length - 1)))
-    viewport.scrollTop = clamped * rowHeight
+    setScroll(clamped * rowHeight)
   }
 
   const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -739,7 +829,7 @@ export function SubtitleGrid({
       const viewport = viewportRef.current
       if (viewport) {
         // 边缘自动滚动（源码 ScrollTo(yPos ± 3)；阈值同 h/lineHeight，含表头行）
-        const yPos = Math.floor(viewport.scrollTop / rowHeight)
+        const yPos = Math.floor(getScrollTop() / rowHeight)
         const drawPerScreen = rowsPerScreen(viewport)
         if (row <= yPos) scrollToRow(yPos - 3)
         else if (row > yPos + drawPerScreen - (row > drag.anchorIndex ? 3 : 1))
@@ -799,12 +889,12 @@ export function SubtitleGrid({
 
   return (
     <section className="grid-panel" aria-label={tPlain('Subtitle lines')}>
-      <div className="subtitle-grid-scroll" onWheel={onGridWheel}>
+      <div className="subtitle-grid-scroll" ref={scrollHostRef}>
         <div className="subtitle-grid-minwidth" style={{ minWidth: fixedWidth }}>
           {/* 源码 base_grid.cpp 无任何 SetToolTip：网格文本单元格与表头的 hover 提示已移除；
               列 description 仅用于表头右键「列显隐」菜单项文案 */}
           <div
-            className="subtitle-grid-header grid-columns"
+            className={`subtitle-grid-header grid-columns${headerActiveTop ? ' active-top' : ''}`}
             role="row"
             onContextMenu={(event) => event.preventDefault()}
           >
@@ -825,7 +915,7 @@ export function SubtitleGrid({
           </div>
           <div
             ref={viewportRef}
-            className="subtitle-grid-viewport"
+            className={`subtitle-grid-viewport${nativeScroll ? ' native-scroll' : ''}`}
             tabIndex={0}
             data-shortcut-context="Subtitle Grid"
             onPointerDown={onViewportPointerDown}
@@ -838,7 +928,13 @@ export function SubtitleGrid({
               if (getOptionBool('Subtitle/Grid/Focus Allow')) viewportRef.current?.focus()
             }}
             onKeyDown={moveByKeyboard}
-            onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+            onScroll={(event) => {
+              // native 模式滚动事件回填真源；JS 模式视口不滚动（偏移由 transform 表达，
+              // 切换实现时清零视口会触发一次 scroll，须忽略以免覆盖真源）
+              if (!nativeScroll) return
+              scrollTopRef.current = event.currentTarget.scrollTop
+              setScrollTop(event.currentTarget.scrollTop)
+            }}
             role="grid"
             aria-rowcount={cues.length}
             onContextMenu={(event) => event.preventDefault()}
@@ -848,6 +944,8 @@ export function SubtitleGrid({
                 // 末尾补足可滚动空间：源码 yPos 上限为 rows - 1（末行可停在表头下方）
                 height: cues.length * rowHeight + Math.max(0, height - rowHeight),
                 position: 'relative',
+                // JS 虚拟列表：偏移由本层 transform 表达（无原生滚动，彻底消除滚动动画）
+                transform: nativeScroll ? undefined : `translateY(${-scrollTop}px)`,
               }}
             >
               {(() => {
@@ -895,9 +993,7 @@ export function SubtitleGrid({
         >
           <div
             className="grid-scrollbar-btn up"
-            onPointerDown={() =>
-              scrollToPos(Math.round((viewportRef.current?.scrollTop ?? 0) / rowHeight) - 1)
-            }
+            onPointerDown={() => scrollToPos(Math.round(getScrollTop() / rowHeight) - 1)}
           />
           <div className="grid-scrollbar-track" onPointerDown={onTrackPointerDown}>
             <div
@@ -911,9 +1007,7 @@ export function SubtitleGrid({
           </div>
           <div
             className="grid-scrollbar-btn down"
-            onPointerDown={() =>
-              scrollToPos(Math.round((viewportRef.current?.scrollTop ?? 0) / rowHeight) + 1)
-            }
+            onPointerDown={() => scrollToPos(Math.round(getScrollTop() / rowHeight) + 1)}
           />
         </div>
       </div>

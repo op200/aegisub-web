@@ -1,6 +1,12 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
 
-import { getOptionBool, getOptionInt, getOptionString, setOption } from '../../config/options'
+import {
+  getOptionBool,
+  getOptionInt,
+  getOptionString,
+  setOption,
+  useOptionsVersion,
+} from '../../config/options'
 import {
   assOverrideColor,
   blockAtPos,
@@ -16,11 +22,18 @@ import type { SubtitleCue, SubtitleStyle } from '../../core/types'
 import { Framerate } from '../../core/vfr'
 import { listFontFaces } from '../../storage/fontStore'
 import { aegisubIconUrl } from '../aegisubIcons'
-import { tokenizeAss, getSyntaxColors } from '../assHighlight'
+import {
+  getSyntaxColors,
+  tokenizeAss,
+  type AssHighlightSegment,
+  type AssSyntaxStyle,
+  type AssSyntaxType,
+} from '../assHighlight'
 import { assColorToHex } from '../color'
 import { editCursorState } from '../commandRegistry'
 import { COMMANDS, commandTooltip } from '../commands'
 import { tPlain } from '../i18n'
+import { LUA_BLOCK_BACKGROUND, LUA_BLOCK_CARET } from '../luaHighlight'
 import { useSystemTheme } from '../theme'
 import { Dialog } from './dialogs'
 import { MenuPopup } from './MenuPopup'
@@ -99,6 +112,189 @@ function reportTextSelection(
   // 反向选区（backward）光标在 start，否则在 end
   onTextSelection(element.selectionDirection === 'backward' ? start : end, start, end)
 }
+
+/** 光标当前偏移（反向选区时在 start，否则在 end，同 reportTextSelection 语义） */
+function caretOffsetOf(element: HTMLTextAreaElement): number {
+  return element.selectionDirection === 'backward' ? element.selectionStart : element.selectionEnd
+}
+
+/** 光标偏移是否落在带段级底纹的段内（模板 `!代码!` 块的 #1F1F1F 底纹，见 assHighlight） */
+function offsetInBackedSegment(segments: AssHighlightSegment[], offset: number): boolean {
+  let pos = 0
+  for (const segment of segments) {
+    if (offset < pos + segment.text.length) return segment.background !== undefined
+    pos += segment.text.length
+  }
+  // 光标在文本末尾（最后一段的尾边缘）：按最后一段判定
+  return segments.length > 0 && segments[segments.length - 1].background !== undefined
+}
+
+/** 高亮异步计算结果：连同输入（文本 + 各开关）一起记录，供渲染期判定是否为当前值 */
+interface HighlightResult {
+  text: string
+  templateLine: boolean
+  templateLua: boolean
+  syntax: boolean
+  segments: AssHighlightSegment[]
+}
+
+/** 高亮渲染视图：base 为可整体复用（引用相等 → React.memo 跳渲染）的稳定段前缀，
+ *  tail 为尚未着色的新增尾巴（异步结果未就绪的过渡帧） */
+interface HighlightView {
+  base: AssHighlightSegment[]
+  baseLength: number
+  tail: string
+}
+
+/** 光标是否落在带底纹段内（视图形态）：尾巴（异步过渡帧的新输入）一律无底纹；光标位于
+ *  base 末尾且无尾巴（结果已落定）时按最后一段判定（同 offsetInBackedSegment 尾边缘语义） */
+function caretInBackedSegment(
+  base: AssHighlightSegment[],
+  baseLength: number,
+  tail: string,
+  offset: number,
+): boolean {
+  if (offset > baseLength || (offset === baseLength && tail !== '')) return false
+  return offsetInBackedSegment(base, offset)
+}
+
+/** 过渡视图（异步结果未就绪的帧）：pre 层文本必须始终等于 textarea 文本（两层逐字符
+ *  对齐约束），故 base 文本 + tail 必须覆盖当前文本。追加输入（最常见）时旧段表整段
+ *  原样复用，数千 span 的重渲染被 React.memo 短路；中间编辑截取公共前缀段，变化处先
+ *  回退一帧无样式，避免渲染过期文本造成字形错位 */
+function transitionalView(result: HighlightResult | null, text: string): HighlightView {
+  if (!result) return { base: [], baseLength: 0, tail: text }
+  if (text.startsWith(result.text)) {
+    return {
+      base: result.segments,
+      baseLength: result.text.length,
+      tail: text.slice(result.text.length),
+    }
+  }
+  const base: AssHighlightSegment[] = []
+  const old = result.text
+  const max = Math.min(old.length, text.length)
+  let prefix = 0
+  while (prefix < max && old[prefix] === text[prefix]) prefix++
+  let pos = 0
+  for (const segment of result.segments) {
+    if (pos >= prefix) break
+    const end = Math.min(pos + segment.text.length, prefix)
+    base.push({ ...segment, text: text.slice(pos, end) })
+    pos += segment.text.length
+  }
+  return { base, baseLength: prefix, tail: text.slice(prefix) }
+}
+
+/** 高亮计算异步化（同步分词 + 数千 span 渲染会在长模板行上阻塞每次按键，见 未完成计划.md）：
+ *  以 rAF 合并同帧内的连续输入、每帧至多计算一次；结果未就绪的帧用 transitionalView
+ *  复用旧样式过渡。开关/模板行变化同样使旧结果过期（判定含全部输入字段） */
+function useAsyncHighlight(
+  text: string,
+  templateLine: boolean,
+  templateLua: boolean,
+  syntax: boolean,
+): HighlightView {
+  const [result, setResult] = useState<HighlightResult | null>(null)
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      // 关闭语法高亮时整段 NORMAL（对应源码 SetStyling(line_text.size(), 0)）
+      const segments = syntax
+        ? tokenizeAss(text, templateLine, templateLua)
+        : [{ text, type: 'NORMAL' as const }]
+      setResult({ text, templateLine, templateLua, syntax, segments })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [text, templateLine, templateLua, syntax])
+  if (
+    result !== null &&
+    result.text === text &&
+    result.templateLine === templateLine &&
+    result.templateLua === templateLua &&
+    result.syntax === syntax
+  ) {
+    return { base: result.segments, baseLength: text.length, tail: '' }
+  }
+  return transitionalView(result, text)
+}
+
+/** span 内联样式缓存：按「类型 × 底纹」预建样式对象并复用引用——React 对 style 浅比较
+ *  时引用不变即跳过 DOM 写入；配色表由 getSpanStyleCache 按（主题 × 选项版本）键控复用 */
+interface SpanStyleCache {
+  colors: Record<AssSyntaxType, AssSyntaxStyle>
+  styles: Map<string, CSSProperties>
+}
+
+/** 段样式（取代原内联 JSX）：Bold 对齐源码 Colour/Subtitle/Syntax/Bold/* 选项，但用
+ *  text-stroke 模拟加粗——fontWeight 会改变字形宽度，导致高亮层与 textarea 纯文本
+ *  换行位置/光标位置错位（源码 Scintilla 单控件无此问题） */
+function buildSpanStyle(base: AssSyntaxStyle, background: string | undefined): CSSProperties {
+  return {
+    color: base.color,
+    ...(base.bold ? { WebkitTextStroke: '0.45px currentColor' } : null),
+    // 绘图端点坐标下划线（Underline/Drawing Endpoint，源码 StyleSetUnderline）
+    ...(base.underline ? { textDecoration: 'underline' } : null),
+    // 底纹：段级底纹（模板 `!代码!` 块的 Dark Modern 编辑区底色）优先于 Background/* 配置色
+    ...(background
+      ? {
+          backgroundColor: background,
+          // 块级底纹向下沉降 2px：背景盒底边与 `_` 等下伸字符擦边看不清，阴影扩展
+          // 绘制区留出间距（ink overflow，不产生滚动溢出、不影响两层对齐）
+          boxShadow: `0 2px 0 0 ${background}`,
+        }
+      : base.background
+        ? { backgroundColor: base.background }
+        : null),
+  }
+}
+
+function buildSpanStyleCache(colors: Record<AssSyntaxType, AssSyntaxStyle>): SpanStyleCache {
+  const styles = new Map<string, CSSProperties>()
+  for (const [type, style] of Object.entries(colors) as [AssSyntaxType, AssSyntaxStyle][]) {
+    styles.set(type, buildSpanStyle(style, undefined))
+    styles.set(`${type}\u0000${LUA_BLOCK_BACKGROUND}`, buildSpanStyle(style, LUA_BLOCK_BACKGROUND))
+  }
+  return { colors, styles }
+}
+
+/** 段 → 缓存样式（未命中则即时构建：非块底纹的不常见底纹颜色走此路径） */
+function spanStyleFor(cache: SpanStyleCache, segment: AssHighlightSegment): CSSProperties {
+  const key = segment.background ? `${segment.type}\u0000${segment.background}` : segment.type
+  return cache.styles.get(key) ?? buildSpanStyle(cache.colors[segment.type], segment.background)
+}
+
+/** span 样式表（单槽缓存）：按「主题 × 选项版本」键控复用同一引用——React 对 style 浅比较
+ *  时引用不变即跳过 DOM 写入；选项提交后版本号变化，配色表（Colour/Syntax/*）自然重建 */
+let styleCacheKey = ''
+let styleCacheEntry: SpanStyleCache | null = null
+
+function getSpanStyleCache(dark: boolean, version: number): SpanStyleCache {
+  const key = `${dark ? 'dark' : 'light'}\u0000${version}`
+  if (!styleCacheEntry || styleCacheKey !== key) {
+    styleCacheKey = key
+    styleCacheEntry = buildSpanStyleCache(getSyntaxColors(dark))
+  }
+  return styleCacheEntry
+}
+
+/** 稳定段渲染：segments 引用不变时整段跳渲染（追加输入的中间帧只多渲染尾巴一个 span） */
+const HighlightBase = memo(function HighlightBase({
+  segments,
+  cache,
+}: {
+  segments: AssHighlightSegment[]
+  cache: SpanStyleCache
+}) {
+  return (
+    <>
+      {segments.map((segment, index) => (
+        <span key={index} style={spanStyleFor(cache, segment)}>
+          {segment.text}
+        </span>
+      ))}
+    </>
+  )
+})
 
 /** 静态子树（Comment/Style/Actor/Effect、时间/边距、格式工具栏）拖动期间不重建：
  *  subs_edit_box.cpp OnCommit 对 COMMIT_DIAG_TEXT 只执行 edit_ctrl->SetTextTo +
@@ -739,6 +935,37 @@ export function EditPanel({
       setOriginalText(cue?.text ?? '')
     }
   }, [cue])
+  // 高亮渲染视图（异步计算，hook 必须在「无选中行」提前 return 之前调用）。
+  // 模板行判据 subs_edit_ctrl.cpp UpdateStyle：仅「Comment 且 Effect 以 template
+  // 开头」的行启用卡拉OK模板词法（源码 boost::istarts_with(Effect, "template")）
+  const {
+    base: highlightBase,
+    baseLength: highlightBaseLength,
+    tail: highlightTail,
+  } = useAsyncHighlight(
+    draft?.text ?? '',
+    !!(draft && draft.comment && draft.effect.toLowerCase().startsWith('template')),
+    getOptionBool('Subtitle/Highlight/Template Lua'),
+    getOptionBool('Subtitle/Highlight/Syntax'),
+  )
+  // span 样式表（按主题×选项版本复用引用，见 getSpanStyleCache）：React 对 style 浅比较
+  // 时引用不变即跳过，稳定段在重渲染中不产生样式开销
+  const optionsVersion = useOptionsVersion()
+  const spanStyleCache = getSpanStyleCache(darkTheme, optionsVersion)
+  // 高亮异步到达（或过渡/开关变化）时同步光标色：光标未动时 textarea 的 ref 回调
+  // 不保证重跑，只有工具函数 trackCursor 的路径会漏掉「仅高亮变化」的重渲染
+  useEffect(() => {
+    const editor = editorRef.current
+    if (!editor) return
+    editor.style.caretColor = caretInBackedSegment(
+      highlightBase,
+      highlightBaseLength,
+      highlightTail,
+      caretOffsetOf(editor),
+    )
+      ? LUA_BLOCK_CARET
+      : ''
+  }, [highlightBase, highlightBaseLength, highlightTail])
   // 静态子树处理器转发：每次渲染后在 layout effect（首帧绘制前）替换为最新闭包，
   // 子组件 memo 跳渲染时事件回调仍读到最新 draft/cue（latest-ref 模式：effect 回调
   // 在渲染完成后才执行，不存在初始化期访问；无依赖表是刻意的——每次渲染都要刷新）
@@ -1039,16 +1266,6 @@ export function EditPanel({
     commitText(text, 'set font')
     requestAnimationFrame(() => editor?.setSelectionRange(selStart + shift, selEnd + shift))
   }
-  // subs_edit_ctrl.cpp UpdateStyle：仅「Comment 且 Effect 以 template 开头」的行启用卡拉OK模板词法
-  // （源码 boost::istarts_with(Effect, "template")，模板行才对 !表达式! 与 $变量 上色）
-  const templateLine = !!(draft.comment && draft.effect.toLowerCase().startsWith('template'))
-  const highlighted = tokenizeAss(draft.text, templateLine)
-  const syntaxColors = getSyntaxColors(darkTheme)
-  const syntaxHighlight = getOptionBool('Subtitle/Highlight/Syntax')
-  // 关闭语法高亮时源码整段用 NORMAL 样式（SetStyling(line_text.size(), 0)）
-  const highlightSegments = syntaxHighlight
-    ? highlighted
-    : [{ text: draft.text, type: 'NORMAL' as const }]
   // 字符计数（Subtitle/Character Limit 选项；超限红底，UpdateCharacterCount 只显示数字）
   const characterCount = longestVisibleLine(
     draft.text,
@@ -1062,11 +1279,31 @@ export function EditPanel({
     fontSize: `${editFontSize}px`,
     fontFamily: editFontFace ? `"${editFontFace}", sans-serif` : undefined,
   }
+  // 模板 `!代码!` 块的 #1F1F1F 底纹内光标用 VS Code 深色光标色（浅色主题下 CSS 的
+  // --text 深色 caret 在深色底纹上不可见）；直接写 DOM style，光标纯移动不触发重渲染。
+  // 同值重复写入无副作用（CSSOM 对相同值提前返回），不做变化判断、保持最简；
+  // Firefox 下光标静置 5-6 秒后停闪为 Windows 插入符超时的浏览器级行为，与本写入无关。
+  // 光标纯移动走 trackCursor；重渲染路径（改文本/切换行/撤销跳转恢复光标）的兜底同步挂在
+  // textarea 的内联回调 ref 上（每次提交都会重调）——不用 useEffect：本组件在「无选中行」
+  // 时提前 return，晚于早返回的 hook 会使 hook 数量随状态变化，违反 hooks 规则
+  const applyCaretColor = (element: HTMLTextAreaElement) => {
+    const next = caretInBackedSegment(
+      highlightBase,
+      highlightBaseLength,
+      highlightTail,
+      caretOffsetOf(element),
+    )
+      ? LUA_BLOCK_CARET
+      : ''
+    element.style.caretColor = next
+  }
   // 帧号模式（timeedit_ctrl SetByFrame）：Start=FrameAtTime(START)，End=FrameAtTime(END)，时长含首帧
   const frameTiming = frameMode && frameRate.isLoaded()
   const frameRateLoaded = frameRate.isLoaded()
-  const trackCursor = (element: HTMLTextAreaElement) =>
+  const trackCursor = (element: HTMLTextAreaElement) => {
     reportTextSelection(element, onTextSelection)
+    applyCaretColor(element)
+  }
   const pasteIntoEditor = async () => {
     const editor = editorRef.current
     if (!editor) return
@@ -1170,33 +1407,23 @@ export function EditPanel({
           aria-hidden="true"
           style={editorStyle}
         >
-          {highlightSegments.map((segment, index) => {
-            const style = syntaxColors[segment.type]
-            return (
-              <span
-                key={index}
-                style={{
-                  color: style.color,
-                  // Bold 对齐源码 Colour/Subtitle/Syntax/Bold/* 选项，但用 text-stroke
-                  // 模拟加粗：fontWeight 会改变字形宽度，导致高亮层与 textarea 纯文本
-                  // 换行位置/光标位置错位（源码 Scintilla 单控件无此问题）
-                  ...(style.bold ? { WebkitTextStroke: '0.45px currentColor' } : null),
-                  // 绘图端点坐标下划线（Underline/Drawing Endpoint，源码 StyleSetUnderline）
-                  ...(style.underline ? { textDecoration: 'underline' } : null),
-                  // Background/* 为颜色类型时的底纹（默认仅 Error 有淡红底）
-                  ...(style.background ? { backgroundColor: style.background } : null),
-                }}
-              >
-                {segment.text}
-              </span>
-            )
-          })}
+          {/* 稳定段（引用不变时整段跳渲染）+ 尾巴段（异步过渡帧的新输入，无样式） */}
+          <HighlightBase segments={highlightBase} cache={spanStyleCache} />
+          {highlightTail ? (
+            <span style={spanStyleFor(spanStyleCache, { text: highlightTail, type: 'NORMAL' })}>
+              {highlightTail}
+            </span>
+          ) : null}
           {/* textarea 保留尾随换行的空行盒而 pre 会丢弃末个换行：补一个 \n 保持
               两层行数一致，否则行数不同步时滚动错位、光标与可见文字错位 */}
           {draft.text.endsWith('\n') ? '\n' : null}
         </pre>
         <textarea
-          ref={editorRef}
+          ref={(element) => {
+            editorRef.current = element
+            // 重渲染路径兜底同步光标色（见 applyCaretColor）；内联回调 ref 每次提交都会重调
+            if (element) applyCaretColor(element)
+          }}
           className="cue-editor"
           data-shortcut-context="Subtitle Edit Box"
           aria-label={tPlain('Subtitle text')}

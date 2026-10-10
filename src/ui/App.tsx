@@ -73,11 +73,13 @@ import { importFontFiles } from '../storage/fontStore'
 import { loadCachedKeyframes, storeCachedKeyframes } from '../storage/keyframeCacheStore'
 import { loadLatestAutosave, saveAutosave, saveSubtitleBackup } from '../storage/projectStore'
 import {
+  loadLastSubtitleName,
   loadRecentLists,
   loadSearchMru,
   pushRecent,
   pushSearchMru,
   RECENT_TYPES,
+  saveLastSubtitleName,
   type RecentLists,
   type RecentType,
   type SearchMruLists,
@@ -406,6 +408,22 @@ export function App() {
     query.addEventListener('change', onChange)
     return () => query.removeEventListener('change', onChange)
   }, [])
+  // frame_main.cpp OnAudioOpen(provider)：音频 provider 载入 → SetDisplayMode(-1, 1)（显示音频栏），
+  // 关闭 → SetDisplayMode(-1, 0)（隐藏音频栏）；参数为 -1 的维度保持现状，故只换算音频维度
+  const setDisplayModeAudio = (shown: boolean) =>
+    setDisplayMode((mode) =>
+      shown
+        ? mode === 'subs'
+          ? 'audio_subs'
+          : mode === 'video_subs'
+            ? 'full'
+            : mode
+        : mode === 'full'
+          ? 'video_subs'
+          : mode === 'audio_subs'
+            ? 'subs'
+            : mode,
+    )
   const [dialog, setDialog] = useState<DialogKind>(null)
   const [videoOverscan, setVideoOverscan] = useState(false) // Video/Overscan Mask 默认 false
   const [aspectOverride, setAspectOverride] = useState<number | null>(null) // video/aspect/*
@@ -1187,6 +1205,8 @@ export function App() {
       }
       setStatus(`Opened ${file.name}`)
       void recordRecent('subtitle', file)
+      // 会话恢复标记：下次打开标签页默认重新打开该文件
+      saveLastSubtitleName(file.name)
       return true
     } catch (error) {
       setStatus(error instanceof Error ? error.message : tPlain('Could not open subtitles'))
@@ -1201,6 +1221,19 @@ export function App() {
     if (!file) return
     await openSubtitleHandle(file)
   }
+
+  // 会话恢复：启动后若上次关闭标签页时有打开的字幕，且 MRU 中仍能取到文件句柄，
+  // 则默认重新打开（等价“打开标签页即恢复上次的 ASS”）
+  const startupRestoreRef = useRef(false)
+  useEffect(() => {
+    if (startupRestoreRef.current || !core || !loadedRef.current) return
+    startupRestoreRef.current = true
+    const name = loadLastSubtitleName()
+    if (!name) return
+    const entry = recentLists.subtitle.find((item) => item.name === name && item.file)
+    if (entry?.file) void openSubtitleHandle({ name: entry.name, file: entry.file })
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- startupRestoreRef 保证仅执行一次，openSubtitleHandle 每次渲染新建
+  }, [core, recentLists, openSubtitleHandle])
 
   const newSubtitles = async () => {
     if (!coreRef.current) return
@@ -1221,6 +1254,7 @@ export function App() {
     setActiveId(id)
     setSelectedIds(id ? new Set([id]) : new Set())
     setStatus(tPlain('New subtitles'))
+    saveLastSubtitleName(null)
   }
 
   const restoreAutosave = async () => {
@@ -1249,6 +1283,7 @@ export function App() {
       setActiveId(id)
       setSelectedIds(id ? new Set([id]) : new Set())
       setStatus(tPlain('Autosaved subtitles restored'))
+      saveLastSubtitleName(null)
     } catch {
       setStatus(tPlain('Could not restore autosave'))
     }
@@ -1286,6 +1321,7 @@ export function App() {
       setAudioMedia(source)
       setAudioTimeMs(0)
       setAudioDurationMs(0)
+      setDisplayModeAudio(true)
       if (previousAudio && previousAudio !== previousVideo) URL.revokeObjectURL(previousAudio.url)
     }
     setVideoMedia(source)
@@ -1781,6 +1817,7 @@ export function App() {
     setAudioMedia(source)
     setAudioTimeMs(0)
     setAudioDurationMs(0)
+    setDisplayModeAudio(true)
     setStatus(`Audio: ${file.name}`)
     void recordRecent('audio', file)
   }
@@ -1800,6 +1837,7 @@ export function App() {
     setAudioMedia(videoMedia)
     setAudioTimeMs(0)
     setAudioDurationMs(videoDurationMs)
+    setDisplayModeAudio(true)
     setStatus(tPlain('Audio loaded from video'))
   }
 
@@ -1808,6 +1846,7 @@ export function App() {
     setAudioMedia(null)
     setAudioDurationMs(0)
     setAudioTimeMs(0)
+    setDisplayModeAudio(false)
     setStatus(tPlain('Audio closed'))
   }
 
@@ -2024,6 +2063,7 @@ export function App() {
       })
       setAudioDurationMs(lengthMs)
       setAudioTimeMs(0)
+      setDisplayModeAudio(true)
       setStatus(
         kind === 'blank' ? tPlain('2h30 blank audio loaded') : tPlain('2h30 noise audio loaded'),
       )
@@ -2206,6 +2246,18 @@ export function App() {
     return () => window.removeEventListener('keydown', onKeyDown)
   })
 
+  // frame_main.cpp SetDisplayMode(_, audio)：audio != 0 时 sa = !!project->AudioProvider()——
+  // 没有载入音频时 ToolsSizer->Show(audioBox, false, true)，AudioBox 连同底边 sash 一起隐藏，
+  // 空间全给 EditBox
+  const showAudioBox = !!audioMedia && (displayMode === 'full' || displayMode === 'audio_subs')
+  const rightWorkspaceRows = showAudioBox
+    ? isNarrowViewport
+      ? undefined // 移动端音频/编辑栏为固定高度块（styles.css @media），不设行高
+      : `${audioBoxHeight}px 4px minmax(0, 1fr)`
+    : isNarrowViewport
+      ? 'auto' // 只剩 EditPanel 一行：行高取其自身固定高度
+      : 'minmax(0, 1fr)'
+
   if (!core)
     return (
       <main className="loading-screen">
@@ -2339,15 +2391,9 @@ export function App() {
           )}
           <div
             className="right-workspace"
-            style={
-              // 源码 AudioBox 恒有底边 sash（SetSashVisible(wxSASH_BOTTOM, true)），
-              // 与是否加载音频无关；video_subs 布局无音频框才没有
-              !isNarrowViewport && displayMode !== 'video_subs'
-                ? { gridTemplateRows: `${audioBoxHeight}px 4px minmax(0, 1fr)` }
-                : undefined
-            }
+            style={rightWorkspaceRows ? { gridTemplateRows: rightWorkspaceRows } : undefined}
           >
-            {(displayMode === 'full' || displayMode === 'audio_subs') && (
+            {showAudioBox && (
               <AudioPane
                 media={audioMedia}
                 durationMs={audioDurationMs}
@@ -2375,7 +2421,7 @@ export function App() {
                 onPatchCue={(id, patch, label) => apply([{ type: 'updateCue', id, patch }], label)}
               />
             )}
-            {!isNarrowViewport && displayMode !== 'video_subs' && (
+            {!isNarrowViewport && showAudioBox && (
               <div
                 className="audio-sash"
                 role="separator"
