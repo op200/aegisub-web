@@ -129,6 +129,63 @@ function offsetInBackedSegment(segments: AssHighlightSegment[], offset: number):
   return segments.length > 0 && segments[segments.length - 1].background !== undefined
 }
 
+/** 选区覆盖色（CSS 变量）：与 textarea 的半透明选区叠色后恰为 VS Code 选区色 (39,80,119) */
+const SELECTION_BACKED_BACKGROUND = 'var(--editor-selection-backed)'
+
+/**
+ * 段级深色底纹（模板 `!代码!` 的 #1F1F1F）被选区覆盖的部分单独渲染：
+ * 底纹直接叠半透明选区太浅（约 (33,49,61)），选中处要换成 `--editor-selection-backed`。
+ * 只在选区与底纹段相交时把该段按选区边界切成「前 / 选中 / 后」三片——不能整段换色，
+ * 否则拖选 2 个字符时整段（往往就是一个单词/整块代码）都会看起来被选中。
+ * 无选区相交时原样返回同一数组引用，保证 HighlightBase 的 memo 仍然整段跳渲染。
+ */
+function splitSegmentsBySelection(
+  segments: AssHighlightSegment[],
+  selection: { start: number; end: number } | null,
+): AssHighlightSegment[] {
+  if (!selection) return segments
+  let offset = 0
+  let changed = false
+  const result: AssHighlightSegment[] = []
+  for (const segment of segments) {
+    const length = segment.text.length
+    const from = Math.max(selection.start, offset) - offset
+    const to = Math.min(selection.end, offset + length) - offset
+    if (segment.background === undefined || to <= from) {
+      result.push(segment)
+    } else {
+      changed = true
+      if (from > 0) result.push({ ...segment, text: segment.text.slice(0, from) })
+      result.push({
+        ...segment,
+        text: segment.text.slice(from, to),
+        background: SELECTION_BACKED_BACKGROUND,
+      })
+      if (to < length) result.push({ ...segment, text: segment.text.slice(to) })
+    }
+    offset += length
+  }
+  return changed ? result : segments
+}
+
+/** 选区是否与段级底纹（模板 `!代码!` 块）相交：相交时返回选区范围，否则 null */
+function backedSelectionFor(
+  element: HTMLTextAreaElement,
+  segments: AssHighlightSegment[],
+): { start: number; end: number } | null {
+  const start = element.selectionStart
+  const end = element.selectionEnd
+  if (start === end || document.activeElement !== element) return null
+  let offset = 0
+  for (const segment of segments) {
+    const length = segment.text.length
+    if (segment.background !== undefined && offset < end && offset + length > start)
+      return { start, end }
+    offset += length
+  }
+  return null
+}
+
 /** 高亮异步计算结果：连同输入（文本 + 各开关）一起记录，供渲染期判定是否为当前值 */
 interface HighlightResult {
   text: string
@@ -138,55 +195,122 @@ interface HighlightResult {
   segments: AssHighlightSegment[]
 }
 
-/** 高亮渲染视图：base 为可整体复用（引用相等 → React.memo 跳渲染）的稳定段前缀，
- *  tail 为尚未着色的新增尾巴（异步结果未就绪的过渡帧） */
+/** 高亮渲染视图：base 为可整体复用（引用相等 → React.memo 跳渲染）的稳定段，
+ *  tail 为追加输入尚未着色的新尾巴（异步结果未就绪的过渡帧） */
 interface HighlightView {
   base: AssHighlightSegment[]
   baseLength: number
   tail: string
+  /** 尾巴沿用最后一段的类型/底纹：新输入在过渡帧不掉色，结果到达后再按词法修正 */
+  tailType: AssSyntaxType
+  tailBackground?: string
 }
 
-/** 光标是否落在带底纹段内（视图形态）：尾巴（异步过渡帧的新输入）一律无底纹；光标位于
- *  base 末尾且无尾巴（结果已落定）时按最后一段判定（同 offsetInBackedSegment 尾边缘语义） */
-function caretInBackedSegment(
-  base: AssHighlightSegment[],
-  baseLength: number,
-  tail: string,
-  offset: number,
-): boolean {
-  if (offset > baseLength || (offset === baseLength && tail !== '')) return false
-  return offsetInBackedSegment(base, offset)
+/** 光标是否落在带底纹段内（视图形态）：光标位于 base 末尾且存在尾巴时按尾巴样式判定，
+ *  其余按段表判定（同 offsetInBackedSegment 尾边缘语义） */
+function caretInBackedSegment(view: HighlightView, offset: number): boolean {
+  if (offset > view.baseLength) return false
+  if (offset === view.baseLength && view.tail !== '') return view.tailBackground !== undefined
+  return offsetInBackedSegment(view.base, offset)
+}
+
+/** 取旧段表在指定偏移处的样式（用于变化区过渡上色）；偏移越界时退回末段 */
+function styleAt(segments: AssHighlightSegment[], offset: number): AssHighlightSegment | null {
+  let pos = 0
+  for (const segment of segments) {
+    if (offset < pos + segment.text.length) return segment
+    pos += segment.text.length
+  }
+  return segments.length > 0 ? segments[segments.length - 1] : null
+}
+
+/** 中间编辑的过渡视图：把旧段表重映射到新文本（公共前缀/后缀段原样保留，仅变化区
+ *  沿用插入点处的旧样式）。此前只保留公共前缀、光标后的整片文本回退一帧无样式，
+ *  每次按键都闪一下；重映射后 cursor 之后的区域样式连续，视觉与稳态一致 */
+function remapSegments(
+  oldText: string,
+  oldSegments: AssHighlightSegment[],
+  text: string,
+): AssHighlightSegment[] {
+  const max = Math.min(oldText.length, text.length)
+  let prefix = 0
+  while (prefix < max && oldText[prefix] === text[prefix]) prefix++
+  let suffix = 0
+  while (
+    suffix < max - prefix &&
+    oldText[oldText.length - 1 - suffix] === text[text.length - 1 - suffix]
+  )
+    suffix++
+  const oldSuffixStart = oldText.length - suffix
+  const newMiddleEnd = text.length - suffix
+  const segments: AssHighlightSegment[] = []
+
+  // 公共前缀：按旧段切片（边界段被切开时才新建对象，其余原样复用）
+  let pos = 0
+  for (const segment of oldSegments) {
+    if (pos >= prefix) break
+    const end = Math.min(pos + segment.text.length, prefix)
+    if (end > pos) {
+      segments.push(
+        end - pos === segment.text.length ? segment : { ...segment, text: text.slice(pos, end) },
+      )
+    }
+    pos += segment.text.length
+  }
+  // 变化区：沿用插入点的旧样式（典型为原地打字/删字，视觉上与周围一致）
+  if (prefix < newMiddleEnd) {
+    const style = styleAt(oldSegments, prefix)
+    segments.push({
+      text: text.slice(prefix, newMiddleEnd),
+      type: style?.type ?? 'NORMAL',
+      ...(style?.background ? { background: style.background } : null),
+    })
+  }
+  // 公共后缀：旧段从 oldSuffixStart 起切片（新文本尾部与旧文本尾部逐字符相同）
+  pos = 0
+  for (const segment of oldSegments) {
+    const segmentStart = pos
+    pos += segment.text.length
+    if (pos <= oldSuffixStart) continue
+    const from = Math.max(segmentStart, oldSuffixStart)
+    if (from === segmentStart) segments.push(segment)
+    else
+      segments.push({
+        ...segment,
+        text: text.slice(
+          newMiddleEnd + (from - oldSuffixStart),
+          newMiddleEnd + (pos - oldSuffixStart),
+        ),
+      })
+  }
+  return segments
 }
 
 /** 过渡视图（异步结果未就绪的帧）：pre 层文本必须始终等于 textarea 文本（两层逐字符
  *  对齐约束），故 base 文本 + tail 必须覆盖当前文本。追加输入（最常见）时旧段表整段
- *  原样复用，数千 span 的重渲染被 React.memo 短路；中间编辑截取公共前缀段，变化处先
- *  回退一帧无样式，避免渲染过期文本造成字形错位 */
+ *  原样复用，数千 span 的重渲染被 React.memo 短路；中间编辑按前缀/变化区/后缀重映射，
+ *  只有变化区使用过渡样式 */
 function transitionalView(result: HighlightResult | null, text: string): HighlightView {
-  if (!result) return { base: [], baseLength: 0, tail: text }
+  if (!result) return { base: [], baseLength: 0, tail: text, tailType: 'NORMAL' }
   if (text.startsWith(result.text)) {
+    const last = result.segments[result.segments.length - 1]
     return {
       base: result.segments,
       baseLength: result.text.length,
       tail: text.slice(result.text.length),
+      tailType: last?.type ?? 'NORMAL',
+      tailBackground: last?.background,
     }
   }
-  const base: AssHighlightSegment[] = []
-  const old = result.text
-  const max = Math.min(old.length, text.length)
-  let prefix = 0
-  while (prefix < max && old[prefix] === text[prefix]) prefix++
-  let pos = 0
-  for (const segment of result.segments) {
-    if (pos >= prefix) break
-    const end = Math.min(pos + segment.text.length, prefix)
-    base.push({ ...segment, text: text.slice(pos, end) })
-    pos += segment.text.length
+  return {
+    base: remapSegments(result.text, result.segments, text),
+    baseLength: text.length,
+    tail: '',
+    tailType: 'NORMAL',
   }
-  return { base, baseLength: prefix, tail: text.slice(prefix) }
 }
 
-/** 高亮计算异步化（同步分词 + 数千 span 渲染会在长模板行上阻塞每次按键，见 未完成计划.md）：
+/** 高亮计算异步化（同步分词 + 数千 span 渲染会在长模板行上阻塞每次按键）：
  *  以 rAF 合并同帧内的连续输入、每帧至多计算一次；结果未就绪的帧用 transitionalView
  *  复用旧样式过渡。开关/模板行变化同样使旧结果过期（判定含全部输入字段） */
 function useAsyncHighlight(
@@ -213,7 +337,7 @@ function useAsyncHighlight(
     result.templateLua === templateLua &&
     result.syntax === syntax
   ) {
-    return { base: result.segments, baseLength: text.length, tail: '' }
+    return { base: result.segments, baseLength: text.length, tail: '', tailType: 'NORMAL' }
   }
   return transitionalView(result, text)
 }
@@ -942,12 +1066,32 @@ export function EditPanel({
     base: highlightBase,
     baseLength: highlightBaseLength,
     tail: highlightTail,
+    tailType: highlightTailType,
+    tailBackground: highlightTailBackground,
   } = useAsyncHighlight(
     draft?.text ?? '',
     !!(draft && draft.comment && draft.effect.toLowerCase().startsWith('template')),
     getOptionBool('Subtitle/Highlight/Template Lua'),
     getOptionBool('Subtitle/Highlight/Syntax'),
   )
+  const [backedSelection, setBackedSelection] = useState<{ start: number; end: number } | null>(
+    null,
+  )
+  const highlightBaseRef = useRef(highlightBase)
+  useEffect(() => {
+    // 原生 selectionchange 监听只挂一次，段表经 ref 读取最新值（effect 内更新以满足 refs 规则）
+    highlightBaseRef.current = highlightBase
+  }, [highlightBase])
+  // 渲染期把与选区相交的底纹段切成「前 / 选中 / 后」三片（未相交时原样返回同一引用）
+  const displayBase = splitSegmentsBySelection(highlightBase, backedSelection)
+  // 渲染期视图对象（caret 判定与尾巴 span 共用；每帧新建、不做 memo）
+  const highlightView = {
+    base: highlightBase,
+    baseLength: highlightBaseLength,
+    tail: highlightTail,
+    tailType: highlightTailType,
+    tailBackground: highlightTailBackground,
+  }
   // span 样式表（按主题×选项版本复用引用，见 getSpanStyleCache）：React 对 style 浅比较
   // 时引用不变即跳过，稳定段在重渲染中不产生样式开销
   const optionsVersion = useOptionsVersion()
@@ -957,15 +1101,39 @@ export function EditPanel({
   useEffect(() => {
     const editor = editorRef.current
     if (!editor) return
-    editor.style.caretColor = caretInBackedSegment(
-      highlightBase,
-      highlightBaseLength,
-      highlightTail,
+    const next = caretInBackedSegment(
+      {
+        base: highlightBase,
+        baseLength: highlightBaseLength,
+        tail: highlightTail,
+        tailType: highlightTailType,
+        tailBackground: highlightTailBackground,
+      },
       caretOffsetOf(editor),
     )
       ? LUA_BLOCK_CARET
       : ''
-  }, [highlightBase, highlightBaseLength, highlightTail])
+    editor.style.caretColor = next
+    // 段表重建后相交判定可能变化：重新计算底纹段要按选区切分的范围
+    setBackedSelection(backedSelectionFor(editor, highlightBase))
+  }, [
+    highlightBase,
+    highlightBaseLength,
+    highlightTail,
+    highlightTailType,
+    highlightTailBackground,
+  ])
+  // 按住鼠标拖选时只有原生 selectionchange，React 的 onSelect 要等 mouseup 才触发：
+  // 若只在 onSelect 里换色，拖拽过程中底纹段仍是 #1F1F1F（选区很浅），松手才变深蓝
+  useEffect(() => {
+    const onSelectionChange = () => {
+      const editor = editorRef.current
+      if (!editor) return
+      setBackedSelection(backedSelectionFor(editor, highlightBaseRef.current))
+    }
+    document.addEventListener('selectionchange', onSelectionChange)
+    return () => document.removeEventListener('selectionchange', onSelectionChange)
+  }, [])
   // 静态子树处理器转发：每次渲染后在 layout effect（首帧绘制前）替换为最新闭包，
   // 子组件 memo 跳渲染时事件回调仍读到最新 draft/cue（latest-ref 模式：effect 回调
   // 在渲染完成后才执行，不存在初始化期访问；无依赖表是刻意的——每次渲染都要刷新）
@@ -1282,19 +1450,14 @@ export function EditPanel({
   // 模板 `!代码!` 块的 #1F1F1F 底纹内光标用 VS Code 深色光标色（浅色主题下 CSS 的
   // --text 深色 caret 在深色底纹上不可见）；直接写 DOM style，光标纯移动不触发重渲染。
   // 同值重复写入无副作用（CSSOM 对相同值提前返回），不做变化判断、保持最简；
-  // Firefox 下光标静置 5-6 秒后停闪为 Windows 插入符超时的浏览器级行为，与本写入无关。
+  // Firefox 下光标静置 5-6 秒后停闪为 Windows 插入符超时的浏览器级行为（注册表
+  // CaretTimeout 默认 5000ms，Gecko 折算约 5 个闪烁周期后 StopBlinking；
+  // about:config 新建 ui.caretBlinkCount = 1000000 可关闭计数），与本写入无关。
   // 光标纯移动走 trackCursor；重渲染路径（改文本/切换行/撤销跳转恢复光标）的兜底同步挂在
   // textarea 的内联回调 ref 上（每次提交都会重调）——不用 useEffect：本组件在「无选中行」
   // 时提前 return，晚于早返回的 hook 会使 hook 数量随状态变化，违反 hooks 规则
   const applyCaretColor = (element: HTMLTextAreaElement) => {
-    const next = caretInBackedSegment(
-      highlightBase,
-      highlightBaseLength,
-      highlightTail,
-      caretOffsetOf(element),
-    )
-      ? LUA_BLOCK_CARET
-      : ''
+    const next = caretInBackedSegment(highlightView, caretOffsetOf(element)) ? LUA_BLOCK_CARET : ''
     element.style.caretColor = next
   }
   // 帧号模式（timeedit_ctrl SetByFrame）：Start=FrameAtTime(START)，End=FrameAtTime(END)，时长含首帧
@@ -1407,10 +1570,17 @@ export function EditPanel({
           aria-hidden="true"
           style={editorStyle}
         >
-          {/* 稳定段（引用不变时整段跳渲染）+ 尾巴段（异步过渡帧的新输入，无样式） */}
-          <HighlightBase segments={highlightBase} cache={spanStyleCache} />
+          {/* 稳定段（引用不变时整段跳渲染）+ 尾巴段（异步过渡帧的新输入，沿用末段样式
+              以免新字符掉色；结果到达后由词法修正） */}
+          <HighlightBase segments={displayBase} cache={spanStyleCache} />
           {highlightTail ? (
-            <span style={spanStyleFor(spanStyleCache, { text: highlightTail, type: 'NORMAL' })}>
+            <span
+              style={spanStyleFor(spanStyleCache, {
+                text: highlightTail,
+                type: highlightTailType,
+                background: highlightTailBackground,
+              })}
+            >
               {highlightTail}
             </span>
           ) : null}
@@ -1428,11 +1598,13 @@ export function EditPanel({
           data-shortcut-context="Subtitle Edit Box"
           aria-label={tPlain('Subtitle text')}
           value={draft.text}
-          spellCheck
+          spellCheck={false}
           style={editorStyle}
           onFocus={() => setEditingField('text')}
-          onBlur={() => {
+          onBlur={(event) => {
             if (editingField === 'text') setEditingField(null)
+            // 失焦后浏览器不再画选区，底纹段的选中色要还原
+            setBackedSelection(backedSelectionFor(event.currentTarget, highlightBase))
           }}
           onSelect={(event) => trackCursor(event.currentTarget)}
           onChange={(event) => {

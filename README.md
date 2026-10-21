@@ -34,6 +34,6 @@ v157.0.1
 - 不支持 [`window.queryLocalFonts`](https://caniuse.com/wf-local-fonts)，需要手动载入字体文件
 - 对 MKV 兼容性不如 Chrome
 - 对 HEVC 等格式的部分视频（疑似因为 open-gop）随机 seek 有无法从 IDR 帧解码、会从头解码的 bug
-
+>
 - Windows 端遵循注册表 `HKEY_CURRENT_USER\Control Panel\Desktop\CaretTimeout`，导致光标会在超时后停止闪烁  
   解决方法: 修改注册表 or `about:config` -> `ui.caretBlinkCount` 设为负值

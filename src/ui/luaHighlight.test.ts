@@ -135,7 +135,7 @@ describe('tokenizeLuaCode', () => {
       ['LUA_FUNCTION', 'f'],
       ['LUA_BRACKET1', '()'],
     ])
-    // 名字按 Lua 标识符规则吃后续数字（有意偏离 var_replacer 的 $([%a_]+)，见 未完成计划.md：
+    // 名字按 Lua 标识符规则吃后续数字（有意偏离 var_replacer 的 $([%a_]+)：
     // 引擎正则会把 $a2b 拆成 $a + 2，导致 `2` 被染成数字色）
     expectLua('$a2b', [
       ['LUA_VARIABLE', '$'],

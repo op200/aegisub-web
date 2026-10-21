@@ -2921,7 +2921,7 @@ export function App() {
         <ToolInfoDialog
           title={tPlain('Spell Checker')}
           message={tPlain(
-            'Browser spell checking is enabled directly in the subtitle edit box. Right-click a misspelled word to use the browser dictionary.',
+            'Spell checking is disabled in the subtitle edit box so ASS override tags and template blocks are not marked as misspelled. The desktop spell checker is not available in this build.',
           )}
           onClose={() => setDialog(null)}
         />

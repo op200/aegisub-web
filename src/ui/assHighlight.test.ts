@@ -264,7 +264,7 @@ describe('tokenizeDialogueBody', () => {
 
   it('模板行识别 $变量', () => {
     expectTokens('$a', true, [['KARAOKE_VARIABLE', 2]])
-    // 变量名吃后续数字（有意偏离源码 \$[A-Za-z_]+ 正则，见 未完成计划.md：
+    // 变量名吃后续数字（有意偏离源码 \$[A-Za-z_]+ 正则：
     // 否则 $syl2 被拆成 $syl + 2，`2` 按普通文本上色）
     expectTokens('$syl2', true, [['KARAOKE_VARIABLE', 5]])
     expectTokens('x$syl2', true, [

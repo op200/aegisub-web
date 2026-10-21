@@ -379,7 +379,7 @@ export function tokenizeLuaCode(text: string): AssHighlightSegment[] {
     // $变量：kara-templater 的 var_replacer 规则为 $([%a_]+)（先于表达式求值）。
     // `$` 视为 `table.`：`$` 用表/命名空间位颜色，name 用成员位颜色（后接调用则函数色）。
     // 名字按 Lua 标识符规则吃后续数字（`$a2b` 整体成段）：引擎正则不含数字，
-    // 但那会把 `$syl2` 拆成 `$syl`+`2`（数字色）——有意偏离，见 未完成计划.md
+    // 但那会把 `$syl2` 拆成 `$syl`+`2`（数字色）——有意偏离
     if (c === '$' && NAME_START_RE.test(text[i + 1] ?? '')) {
       let j = i + 2
       while (j < n && NAME_CHAR_RE.test(text[j])) j++

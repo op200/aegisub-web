@@ -113,8 +113,6 @@ const OVERSCAN = 8
 const SCROLLBAR_WIDTH = 15
 /** 滚动条两端箭头按钮高度（Win32 滚动条箭头为正方形，与滚动条同宽） */
 const SCROLLBAR_ARROW = SCROLLBAR_WIDTH
-/** 滚轮一档的折算像素（浏览器每档 deltaY≈100；源码一档 = step 行） */
-const WHEEL_NOTCH_PX = 100
 /** 滚轮一档滚动的行数（源码 base_grid.cpp OnMouseEvent：step 默认 3） */
 const WHEEL_STEP_ROWS = 3
 
@@ -181,6 +179,27 @@ function gridCharHeight(): number {
 /** 网格行高 / 表头行高（base_grid.cpp UpdateStyle：lineHeight = dc.GetCharHeight() + 4） */
 export function gridRowHeight(): number {
   return gridCharHeight() + 4
+}
+
+/**
+ * 设备像素比：网格线宽取 1/dpr，正好覆盖 1 个设备像素。
+ * 随浏览器缩放、跨屏拖动变化（resolution 媒体查询在 dpr 改变时触发）。
+ */
+function useDevicePixelRatio(): number {
+  const [dpr, setDpr] = useState(() => window.devicePixelRatio || 1)
+  useEffect(() => {
+    let query: MediaQueryList | null = null
+    const update = () => {
+      const next = window.devicePixelRatio || 1
+      setDpr(next)
+      query?.removeEventListener('change', update)
+      query = window.matchMedia(`(resolution: ${next}dppx)`)
+      query.addEventListener('change', update)
+    }
+    update()
+    return () => query?.removeEventListener('change', update)
+  }, [])
+  return dpr
 }
 /**
  * Aegisub GridColumn::UpdateWidth：width = 10 + max(内容宽, 表头宽)。
@@ -525,6 +544,21 @@ export function SubtitleGrid({
 
   // 行高随 Subtitle/Grid/Font Size 变化（源码 UpdateStyle 时重算 lineHeight）
   const rowHeight = gridRowHeight()
+  // 网格线宽 = 1 个设备像素（base_grid.cpp 的 1px 画笔）：非整数 dpr 下 1 CSS px 会被
+  // Chrome 画成「1 实 + 1 半透明」两个设备像素行，故按 dpr 折算并交给 SVG 吸附像素
+  const dpr = useDevicePixelRatio()
+  const hairline = 1 / dpr
+
+  // 网格绘制宽度 w（base_grid.cpp OnPaint：w = clientWidth - scrollBarWidth）：
+  // 滚动条容器的 content box 正好排除右侧 15px 常驻滚动条
+  const [visibleWidth, setVisibleWidth] = useState(0)
+  useEffect(() => {
+    const host = scrollHostRef.current
+    if (!host) return
+    const observer = new ResizeObserver(([entry]) => setVisibleWidth(entry.contentRect.width))
+    observer.observe(host)
+    return () => observer.disconnect()
+  }, [])
 
   // 滚动实现（Subtitle/Grid/Native Scroll）：默认纯 JS 虚拟列表（无原生滚动/动画），
   // 可选切回浏览器原生滚动。ref 供事件处理器读取最新值，避免闭包过期。
@@ -537,8 +571,6 @@ export function SubtitleGrid({
   heightRef.current = height
   const cuesLengthRef = useRef(cues.length)
   cuesLengthRef.current = cues.length
-  // 滚轮累积量（像素）：源码 base_grid.cpp 按整数行滚动（yPos），滚轮档位需累积后换算
-  const wheelAccumRef = useRef(0)
 
   /** 当前滚动偏移（像素）：JS 模式读真源，native 模式读视口（滚动事件可能晚一拍） */
   const getScrollTop = useCallback(
@@ -585,36 +617,33 @@ export function SubtitleGrid({
     setScroll(scrollTopRef.current)
   }, [cues.length, rowHeight, setScroll])
 
-  // 滚轮：JS 模式整个网格由本函数滚动（需 preventDefault 阻止外层滚动）；
-  // native 模式下视口由浏览器处理，仅表头/滚动条区域由本函数滚动。
+  // 滚轮：两种滚动实现都由本函数统一按源码规则滚动（base_grid.cpp OnMouseEvent 的
+  // step 映射），不把 native 模式交给浏览器——浏览器一档按系统行高/像素滚（Chromium
+  // Windows 约 120px ≈ 6 行，源码是 3 行）且 Shift+滚轮不做整屏滚动。preventDefault 后
+  // 用 setScroll 写偏移：JS 模式写真源，native 模式直接写视口 scrollTop（再由 scroll
+  // 事件回填状态），两种模式行为一致。
   // 源码 base_grid.cpp OnMouseEvent：yPos 为整数行号，滚轮每档滚动 step 行
-  // （默认 3 行，Shift 为整屏 - 2 行），故这里按 100px≈一档累积后整行滚动，
-  // 保证顶部永远整行对齐（无 scroll-snap 也不出现半行）
+  // （默认 3 行，Shift 为整屏 - 2 行 = 可见行数 - 1，即把当前末行滚到首行；
+  //  整屏按 h/lineHeight 计，h 含表头行）。对齐源码「一次滚轮事件 = 一档刻度」的语义
+  // （wx GetWheelRotation 按 OS 物理刻度计，不解析浏览器像素 delta）。
   useEffect(() => {
     const host = scrollHostRef.current
     if (!host) return
     const onWheel = (event: WheelEvent) => {
-      if (
-        nativeScrollRef.current &&
-        (event.target as HTMLElement).closest('.subtitle-grid-viewport')
-      )
-        return
       event.preventDefault()
       const rh = rowHeightRef.current
-      const delta =
-        event.deltaMode === 1
-          ? event.deltaY * rh
-          : event.deltaMode === 2
-            ? event.deltaY * heightRef.current
-            : event.deltaY
-      wheelAccumRef.current += delta
-      const notches = Math.trunc(wheelAccumRef.current / WHEEL_NOTCH_PX)
-      if (notches === 0) return
-      wheelAccumRef.current -= notches * WHEEL_NOTCH_PX
-      const rowsPerNotch = event.shiftKey
-        ? Math.max(1, Math.floor(heightRef.current / rh) - 2)
+      // Chromium 在 Shift+滚轮时会把纵向滚轮换成横向轴（deltaX），Firefox 仍给 deltaY；
+      // 取绝对量更大的轴，两浏览器的 Shift 行为一致
+      const rawTick =
+        event.shiftKey && Math.abs(event.deltaX) > Math.abs(event.deltaY)
+          ? event.deltaX
+          : event.deltaY
+      // 一次事件记一档（正 = 向下滚）；偏移为整档，无需跨事件累积
+      const notches = Math.sign(rawTick)
+      const step = event.shiftKey
+        ? Math.max(1, Math.floor((heightRef.current + rh) / rh) - 2)
         : WHEEL_STEP_ROWS
-      setScroll(getScrollTop() + notches * rowsPerNotch * rh)
+      setScroll(getScrollTop() + notches * step * rh)
     }
     host.addEventListener('wheel', onWheel, { passive: false })
     return () => host.removeEventListener('wheel', onWheel)
@@ -625,10 +654,6 @@ export function SubtitleGrid({
     const end = Math.min(cues.length, Math.ceil((scrollTop + height) / rowHeight) + OVERSCAN)
     return { start, end }
   }, [cues.length, height, scrollTop, rowHeight])
-
-  // 首行贴顶且为活动行时，它的上边线与表头下边线是同一个像素（base_grid.cpp 中该像素
-  // 被活动边框重绘）；该像素在视口之外，行内覆盖层画不到，只能由表头改色（.active-top）
-  const headerActiveTop = scrollTop === 0 && cues.length > 0 && cues[0].id === activeId
 
   /**
    * 自绘竖向滚动条几何（base_grid.cpp AdjustScrollbar）：
@@ -736,6 +761,58 @@ export function SubtitleGrid({
     column.fill
       ? { flex: '1 1 0%', minWidth: column.width }
       : { width: isHidden(column, index) ? 0 : widths[index] }
+
+  // ---- 网格线几何（base_grid.cpp OnPaint）----
+  // 表头下边线、行横线、列竖线、活动边框全部由 .grid-lines 覆盖层（内联 SVG）绘制：
+  // 矩形高度 = 1/dpr CSS px，shape-rendering="crispEdges" 让浏览器把线吸附到设备像素
+  // 网格，恒为 1 个纯色设备像素（与元素是否落在整数设备像素位置无关，Chrome/Firefox 一致）。
+  // 坐标原点 = .subtitle-grid-minwidth 顶部（表头第一行），x 方向与列宽一致。
+  // 活动行索引：滚动每帧都会重渲染本组件，避免对全表反复 findIndex
+  const activeRowIndex = useMemo(
+    () => (activeId ? cues.findIndex((cue) => cue.id === activeId) : -1),
+    [cues, activeId],
+  )
+  // 数据区竖线的下端：最后一条已绘制行的下边线（源码 maxH = (nDraw+1)*lineHeight）
+  const dataBottom = Math.max(
+    rowHeight,
+    Math.min(rowHeight + height, rowHeight + cues.length * rowHeight - scrollTop),
+  )
+  // 横向线的绘制宽度 = w（滚动条左侧）；宽度未知时先铺满，避免首帧缺线
+  const lineWidth = visibleWidth > 0 ? visibleWidth : '100%'
+
+  // 行横线：row i 的下边线 = (i+1)*lineHeight（窗口坐标），视口之外（含与表头下边线
+  // 重合的那条）不画
+  const hLines: { y: number; active: boolean }[] = []
+  for (let index = range.start; index < range.end; index += 1) {
+    const y = rowHeight + (index + 1) * rowHeight - scrollTop
+    if (y < rowHeight + 0.5 || y > rowHeight + height + 0.5) continue
+    // 活动边框的上下边与该行相邻的灰线是同一个像素 → 改线本身颜色
+    hLines.push({
+      y,
+      active: index === activeRowIndex || index + 1 === activeRowIndex,
+    })
+  }
+
+  // 列竖线：x = 可见列宽累计（源码对每列 x += Width()，x < w 才画，另有 x=0 与 x=w）
+  const vLineXs: number[] = []
+  if (visibleWidth > 0) {
+    vLineXs.push(0)
+    let x = 0
+    for (let i = 0; i < GRID_COLUMNS.length - 1; i += 1) {
+      if (isHidden(GRID_COLUMNS[i], i)) continue
+      x += widths[i]
+      if (x > 0 && x < visibleWidth) vLineXs.push(x)
+    }
+    vLineXs.push(visibleWidth)
+  }
+
+  // 活动边框（源码最后 DrawRectangle(0, (Row-yPos+1)*lineHeight, w, lineHeight+1)）
+  const activeTop = activeRowIndex >= 0 ? rowHeight + activeRowIndex * rowHeight - scrollTop : 0
+  const activeBottom = activeTop + rowHeight
+  const activeVisible =
+    activeRowIndex >= 0 && activeBottom > rowHeight && activeTop < rowHeight + height
+  const activeVertTop = Math.max(activeTop, rowHeight)
+  const activeVertBottom = Math.min(activeBottom, rowHeight + height)
 
   // ---- 鼠标选择（对齐 base_grid.cpp OnMouseEvent）----
   const rowFromClientY = (clientY: number): number => {
@@ -894,7 +971,7 @@ export function SubtitleGrid({
           {/* 源码 base_grid.cpp 无任何 SetToolTip：网格文本单元格与表头的 hover 提示已移除；
               列 description 仅用于表头右键「列显隐」菜单项文案 */}
           <div
-            className={`subtitle-grid-header grid-columns${headerActiveTop ? ' active-top' : ''}`}
+            className="subtitle-grid-header grid-columns"
             role="row"
             onContextMenu={(event) => event.preventDefault()}
           >
@@ -985,6 +1062,88 @@ export function SubtitleGrid({
               })()}
             </div>
           </div>
+          {/* 网格线覆盖层（绘制顺序同 base_grid.cpp OnPaint：表头下边线 → 行横线 →
+              列竖线 → 活动边框最后画） */}
+          <svg
+            className="grid-lines"
+            width="100%"
+            height={rowHeight + height}
+            shapeRendering="crispEdges"
+            aria-hidden="true"
+          >
+            <rect
+              className="grid-line-header"
+              x={0}
+              y={rowHeight - hairline}
+              width={lineWidth}
+              height={hairline}
+            />
+            {hLines.map((line, index) => (
+              <rect
+                className={`grid-line-h${line.active ? ' active' : ''}`}
+                x={0}
+                y={line.y - hairline}
+                width={lineWidth}
+                height={hairline}
+                key={`h-${index}`}
+              />
+            ))}
+            {vLineXs.map((x) => {
+              // 竖线向列内收 1 个设备像素（x=0 在最左沿）
+              const left = x === 0 ? 0 : x - hairline
+              return (
+                <g key={`v-${x}`}>
+                  <rect
+                    className="grid-line-v header"
+                    x={left}
+                    y={0}
+                    width={hairline}
+                    height={rowHeight}
+                  />
+                  {dataBottom > rowHeight && (
+                    <rect
+                      className="grid-line-v"
+                      x={left}
+                      y={rowHeight}
+                      width={hairline}
+                      height={dataBottom - rowHeight}
+                    />
+                  )}
+                </g>
+              )
+            })}
+            {activeVisible && (
+              <>
+                {/* 活动行贴顶时其上边线与表头下边线是同一个像素（不在 hLines 范围内），
+                    由这里改色；其余上下边线已由 hLines 的 active 项处理 */}
+                {activeTop >= rowHeight - 0.5 && activeTop <= rowHeight + 0.5 && (
+                  <rect
+                    className="grid-line-h active"
+                    x={0}
+                    y={activeTop - hairline}
+                    width={lineWidth}
+                    height={hairline}
+                  />
+                )}
+                <rect
+                  className="grid-line-v active"
+                  x={0}
+                  y={activeVertTop}
+                  width={hairline}
+                  height={activeVertBottom - activeVertTop}
+                />
+                {visibleWidth > 0 && (
+                  <rect
+                    className="grid-line-v active"
+                    x={visibleWidth - hairline}
+                    y={activeVertTop}
+                    width={hairline}
+                    height={activeVertBottom - activeVertTop}
+                  />
+                )}
+              </>
+            )}
+          </svg>
         </div>
         {/* 常驻竖向滚动条（base_grid.cpp 的 wxScrollBar：全高、rows<=1 时置灰） */}
         <div

@@ -45,6 +45,11 @@
   /* 强调/交互 */
   --blue: #2878b8;
   --blue-soft: #d4e8f8;
+  /* 编辑框选区底色：半透明叠在高亮层之上，选中时不改变下方文字配色（对齐 VSCode） */
+  --editor-selection: rgba(40, 120, 184, 0.2);
+  /* 段级深色底纹（模板 !代码! 的 #1F1F1F）在选区内的替代底色：经上面的半透明选区
+     叠色后恰为 VS Code 选区色 rgb(39,80,119)，避免深底纹上几乎看不出被选中 */
+  --editor-selection-backed: rgb(39, 70, 103);
   --green: #47b54f;
   --red: #e54b4b;
   --hover-bg: #d6e9f7;
@@ -1166,7 +1171,11 @@ button:disabled {
   width: 100%;
   height: 100%;
   margin: 0;
-  padding: 5px 7px;
+  /* 必须保持极小：源码 SubsTextEditCtrl 是 Scintilla（subs_edit_ctrl.cpp），文本区内部
+     没有内边距，可见留白只有 subs_edit_box.cpp 创建时 wxBORDER_SUNKEN 带来的 2px 凹陷
+     边框；这里内层 padding 1px 叠上 1px 边框正好还原。pre 高亮层与 textarea 逐字符
+     叠放，两层 padding 必须完全一致，不要为了观感改大（曾为 5px 7px，明显大于源码） */
+  padding: 1px;
   border: 1px solid var(--border-field);
   border-radius: 1px;
   font:
@@ -1191,11 +1200,12 @@ button:disabled {
   z-index: 1;
 }
 .cue-editor::selection {
-  /* 选中态由 textarea 自绘（不透明底 + 显式文字色），盖住下方高亮层：
-     半透明浅底（55% --blue-soft）叠白底后近乎全白，深色文字被冲淡看不清；
-     Firefox 还会对透明选区文字做对比度回退画成浅色，双保险须显式 color */
-  background: var(--blue-soft);
-  color: var(--text);
+  /* 选区由 textarea 自绘，但只画半透明底色：textarea 自身字形恒透明（color: transparent），
+     下方高亮层的语法配色直接透出，选中不改变文字颜色（对齐 VSCode）；若写不透明底色或
+     显式 color，会把整片选中文本盖成单色（语法高亮"消失"）。透明选区文字在 Chromium/
+     Firefox 均不会触发对比度回退重绘（已用真实浏览器取色验证） */
+  background: var(--editor-selection);
+  color: transparent;
 }
 .cue-editor:focus {
   outline: none;
@@ -1239,10 +1249,46 @@ button:disabled {
   overflow-y: hidden;
 }
 .subtitle-grid-minwidth {
+  position: relative;
   width: 100%;
   height: 100%;
   display: grid;
   grid-template-rows: var(--row-height) minmax(0, 1fr);
+}
+/* 网格线覆盖层：所有网格线（表头下边线、行横线、列竖线、活动边框）由同一个内联 SVG
+   绘制，线宽 = 1/dpr CSS px（正好 1 个设备像素）。
+   不用 border / 渐变：1px CSS 边框在非整数 dpr（125%/150%/175%）下会被 Chrome 画成
+   「1 个实设备像素行 + 1 个半透明行」；渐变硬停止在元素落在非整数设备像素位置时
+   仍会被抗锯齿。SVG 的 shape-rendering="crispEdges" 由浏览器把 1 设备像素宽的线
+   吸附到设备像素网格，与元素是否在整数设备像素位置无关，Chrome/Firefox 一致。
+   分数 CSS height/border-width 不可行：Chrome 会把使用值取整回 1px（dpr=2 时直接不画）。
+   残余：dpr=1.25 且行边界恰落在半设备像素时，紧邻横线有 1 设备 px 极浅行背景抗锯齿带
+   （隐藏本层后依旧存在，来自行背景自身亚像素定位）；线本身恒为纯色 1px。
+   覆盖层不吃指针事件、位于文本之上（base_grid.cpp OnPaint 也是先画文本后画网格线）。 */
+.grid-lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+.grid-line-h {
+  fill: var(--grid-line, #bebebe);
+}
+.grid-line-h.active {
+  fill: var(--grid-active-border, #ff5bef);
+}
+.grid-line-header {
+  fill: var(--grid-header-border);
+}
+.grid-line-v {
+  fill: var(--grid-line, #bebebe);
+}
+.grid-line-v.header {
+  fill: var(--grid-header-cell-border);
+}
+.grid-line-v.active {
+  fill: var(--grid-active-border, #ff5bef);
 }
 .grid-fill {
   flex: 1 1 0% !important;
@@ -1260,20 +1306,20 @@ button:disabled {
   z-index: 2;
   color: var(--grid-header-fg);
   background: var(--grid-header-bg, #a5cfe7);
-  border-bottom: 1px solid var(--grid-header-border);
   font-size: 12px;
   font-weight: 600;
   /* 源码列名为 canvas 自绘文本，不可选中 */
   user-select: none;
 }
+/* 表头下边线与列竖线由 .grid-lines 覆盖层绘制（见 .subtitle-grid-minwidth 处注释） */
 .subtitle-grid-header span {
   display: flex;
   align-items: center;
   flex: 0 0 auto;
-  /* grid_column.cpp Paint：文本画在 x + 4；列宽 = 10 + 内容宽 → 左 4 / 右 6（含 1px 右边框） */
-  /* padding-top 1px：对齐 base_grid.cpp 表头文本的 y + 2（行盒 16 居中于 19 → 1 + 1 = 2） */
-  padding: 1px 5px 0 4px;
-  border-right: 1px solid var(--grid-header-cell-border);
+  /* grid_column.cpp Paint：文本画在 x + 4；列宽 = 10 + 内容宽 → 左 4 / 右 6
+     （右 6 = 5px 内边距 + 原 1px 右边框，右边框改由 SVG 覆盖层绘制，内边距补回） */
+  /* padding-top 1px：对齐 base_grid.cpp 表头文本的 y + 2 */
+  padding: 1px 6px 1px 4px;
   /* 列名不换行（表头行内换行会叠盖数据行）；列宽由 textWidth 按 600 字重实测保证 */
   white-space: nowrap;
 }
@@ -1377,30 +1423,32 @@ button:disabled {
   /* 每行是一个 scroll-snap 吸附点（配合 viewport 的 scroll-snap-type: y mandatory） */
   scroll-snap-align: start;
   color: var(--grid-fg, #000);
-  border-bottom: 1px solid var(--grid-line, #bebebe);
   font-size: var(--grid-font-size, 12px);
   cursor: default;
   user-select: none;
 }
+/* 行横线与列竖线由 .grid-lines 覆盖层绘制（见 .subtitle-grid-minwidth 处注释） */
 .subtitle-row > span {
   min-width: 0;
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  /* grid_column.cpp Paint：文本画在 x + 4；列宽 = 10 + 内容宽 → 左 4 / 右 6（含 1px 右边框） */
-  /* padding-top 1px：对齐 base_grid.cpp paint_text 的 y + 2（行盒 16 居中于 19 → 1 + 1 = 2） */
-  padding: 1px 5px 0 4px;
+  /* grid_column.cpp Paint：文本画在 x + 4；列宽 = 10 + 内容宽 → 左 4 / 右 6
+     （右 6 = 5px 内边距 + 原 1px 右边框，右边框改由 SVG 覆盖层绘制，内边距补回） */
+  /* padding-top 1px：对齐 base_grid.cpp paint_text 的 y + 2（行盒 16 居中于 19 → 1 + 1 = 2）；
+     padding-bottom 1px：单元格占满整行高（绿色行号列背景不留缺口），
+     加 1px 下内边距把文本垂直位置保持原样 */
+  padding: 1px 6px 1px 4px;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  border-right: 1px solid var(--grid-line, var(--surface-sunken));
 }
 .grid-cell-centered {
   /* grid_column.cpp Paint 居中列：left = x + 4 + (width - 6 - 文本宽) / 2
-     → 左 6 / 右 3（+1px 右边框）为该公式在 border-box 下的等价内边距 */
+     → 左 6 / 右 4（+1px 原右边框）为该公式在 border-box 下的等价内边距 */
   justify-content: center;
   padding-left: 6px !important;
-  padding-right: 3px !important;
+  padding-right: 4px !important;
 }
 .grid-cps {
   /* base_grid.cpp 只 SetFont 一次、grid_column.cpp 无 SetFont：CPS 列与其余列同字体 */
@@ -1430,34 +1478,8 @@ button:disabled {
 /* Colour/Subtitle Grid/Active Border：base_grid.cpp OnPaint 末段在整行之上补画一个
    1px 矩形框（DrawRectangle(0, top, w, lineHeight + 1)），其上下边正好压在行的灰色
    网格线上（相邻行共用同一像素）→ 语义是「把该行原有的灰线换成品红」。
-   因此这里必须改「线本身的颜色」，不能用覆盖层：每行的 transform 各自吸附设备像素，
-   覆盖层画的线与上一行画的线可能错开 1px，形成「品红在上、灰色在下」的双线。
-   活动行的下边线 = 本行自己的 border-bottom；上边线 = 上一行的下边线（相邻兄弟）。 */
-.subtitle-row.active {
-  border-bottom-color: var(--grid-active-border, #ff5bef);
-}
-.subtitle-row:has(+ .subtitle-row.active) {
-  border-bottom-color: var(--grid-active-border, #ff5bef);
-}
-/* 左右竖边仍用覆盖层（无相邻行共用，不会错位）：绝对定位的覆盖层在行内容之上，
-   与源码「活动边框最后画」一致；bottom 外扩 1px 让竖边覆盖到下边线那一格 */
-.subtitle-row.active::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: -1px;
-  border-left: 1px solid var(--grid-active-border, #ff5bef);
-  border-right: 1px solid var(--grid-active-border, #ff5bef);
-  pointer-events: none;
-}
-/* 首行贴顶时它的上边线就是表头的下边线，而该像素在视口之外（视口 overflow:hidden，
-   行内覆盖层画不出去）→ 只能由表头把这条线改色。条件（首行 active 且未滚动）在
-   SubtitleGrid.tsx 里判定后加 .active-top */
-.subtitle-grid-header.active-top {
-  border-bottom-color: var(--grid-active-border, #ff5bef);
-}
+   活动边框与灰线同由 .grid-lines 覆盖层绘制，最后渲染覆盖同位置的灰线，
+   因此上下边天然共用同一像素，不会出现双线。 */
 .row-number {
   /* 行号列在源码里就是 columns[0]（GridColumnLineNumber::Centered()=true），
      居中公式与数据行一致 → 由 .grid-cell-centered 提供对齐，此处只覆盖配色 */
@@ -3168,6 +3190,9 @@ button:disabled {
     /* 强调/交互 */
     --blue: #4a9ad4;
     --blue-soft: #1d3a54;
+    --editor-selection: rgba(74, 154, 212, 0.3);
+    /* 深色主题同样以 30% 选区叠色后等于 rgb(39,80,119) 反推 */
+    --editor-selection-backed: rgb(24, 48, 79);
     --hover-bg: #3a4c5c;
     --hover-border: #5a7d99;
     --menu-hover-bg: #3a4c5c;

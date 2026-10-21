@@ -8,7 +8,7 @@
  *
  * 有意偏差：桌面版的 dialog_autosave.cpp 是三栏「自动保存列表」语义（含
  * 时间戳解析、排序、筛选框），本对话框不还原该形态，改为通用文件管理器
- * （用户明确选择，见 未完成计划.md）。
+ * （web 全部落盘内容统一在 VFS，用户明确选择此形态）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 

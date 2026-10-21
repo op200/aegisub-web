@@ -170,7 +170,7 @@ export interface AssToken {
 
 const WHITESPACE_RE = /\s/
 const KARAOKE_VARIABLE_RE = /[A-Za-z_]/
-// 变量名续字符吃数字（有意偏离源码 parser.cpp 的 \$[A-Za-z_]+，见 未完成计划.md：
+// 变量名续字符吃数字（有意偏离源码 parser.cpp 的 \$[A-Za-z_]+：
 // 否则 $syl2 被拆成 $syl + 2，`2` 按普通文本上色）
 const KARAOKE_VARIABLE_CHAR_RE = /[A-Za-z0-9_]/
 const TAG_NAME_LOWER_RE = /[a-z0-9]/
