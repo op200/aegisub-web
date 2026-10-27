@@ -55,6 +55,47 @@ export async function openDemuxer(file: File): Promise<DemuxProbe> {
   }
 }
 
+/** 视频流头信息（probeVideoInfo 结果；对应 FFMS2 建索引时读到的流属性） */
+export interface VideoStreamInfo {
+  /** 编码尺寸（coded；显示尺寸由 <video>.videoWidth 给出） */
+  width: number
+  height: number
+  /** 容器标称帧率（avg_frame_rate → r_frame_rate），无法解析为 0 */
+  fps: number
+  /** ffmpeg color_space 名（'bt709' / 'smpte170m' / 'unknown' …） */
+  colorSpace: string
+  /** ffmpeg color_range 名（'tv' / 'pc' / 'unknown' …） */
+  colorRange: string
+}
+
+/**
+ * 只读容器头（不扫包）取视频流属性：帧率 + 色彩空间。
+ *
+ * 替代原 requestVideoFrameCallback 播放探测（曾造成"载入后播放约一秒再回第一帧"）：
+ * 源码的帧率来自 FFMS2 索引进程读到的流属性，而非播放采样；
+ * 播放采样还会把 UI 推进播放态，与源码"载入即暂停"不符。
+ */
+export async function probeVideoInfo(file: File): Promise<VideoStreamInfo | null> {
+  let probe: DemuxProbe | null = null
+  try {
+    probe = await openDemuxer(file)
+    const stream = probe.videoStream
+    if (!stream) return null
+    return {
+      width: stream.width || 0,
+      height: stream.height || 0,
+      fps: parseFraction(stream.avg_frame_rate) || parseFraction(stream.r_frame_rate),
+      colorSpace: stream.color_space ?? '',
+      colorRange: stream.color_range ?? '',
+    }
+  } catch {
+    // 容器打不开时保持默认（24fps / 未标记色彩空间），不影响视频播放
+    return null
+  } finally {
+    probe?.demuxer.destroy()
+  }
+}
+
 /** 文件容器是否需要（或值得）走解复用解码路径 */
 export function needsDemuxFallback(name: string): boolean {
   return /\.(mkv|m2ts|ts|avi)$/i.test(name)

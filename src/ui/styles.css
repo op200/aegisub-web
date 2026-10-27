@@ -502,6 +502,24 @@ button:disabled {
 .video-zoom-stage > .dummy-video-stage {
   flex: none;
 }
+/* 视频色彩层（YCbCr Matrix 校正后的显示面）：覆盖在 <video>/WebCodecs 画布之上，
+   与视频同尺寸居中；不参与指针事件（交互层是 .subtitle-overlay）。
+   z-index 必须低于 .jassub-canvas：libass 字幕画布由 createAssRenderer 以 appendChild
+   追加到 .video-zoom-stage 末尾，而本层是 React 的最后一个子节点（媒体载入时以
+   appendChild 插入），DOM 顺序会让后者压住字幕 */
+.video-color-stage {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  display: block;
+  z-index: 0;
+}
+/* libass 字幕层（assRenderer.ts 动态创建）：必须压在色彩层之上 */
+.jassub-canvas {
+  z-index: 1;
+}
 /* 系统字体授权提示条（Local Font Access 未授权时显示在视频舞台上缘） */
 .system-fonts-hint {
   position: absolute;
@@ -671,6 +689,78 @@ button:disabled {
   border: 1px solid var(--border);
   background: var(--control);
   font-size: 11px;
+}
+/* video_box.cpp：缩放框是 wxComboBox（可编辑文本 + 下拉箭头 + choices 弹出列表） */
+.video-zoom-combo {
+  position: relative;
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+.video-zoom-arrow {
+  width: 14px;
+  height: 21px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-left: 0;
+  border-radius: 0;
+  background: var(--control);
+  color: var(--text);
+  cursor: default;
+}
+.video-zoom-arrow:hover {
+  background: var(--hover-bg);
+}
+.video-zoom-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 60;
+  min-width: 100%;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 3px;
+  background: var(--control-raised);
+  border: 1px solid var(--border-popup);
+  box-shadow: 2px 3px 8px rgba(0, 0, 0, 0.22);
+  /* 源码下拉列表的细滚动条（原生滚动条过宽） */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.video-zoom-menu::-webkit-scrollbar {
+  width: 6px;
+}
+.video-zoom-menu::-webkit-scrollbar-track {
+  background: transparent;
+}
+.video-zoom-menu::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+}
+/* 下方空间不足：向上弹（wxComboBox 屏幕边缘翻转） */
+.video-zoom-menu.up {
+  top: auto;
+  bottom: 100%;
+}
+.video-zoom-option {
+  display: block;
+  width: 100%;
+  height: 20px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: default;
+}
+.video-zoom-option:hover,
+.video-zoom-option[aria-selected='true'] {
+  background: var(--menu-hover-bg);
+  outline: 1px solid var(--menu-hover-border);
 }
 
 .audio-panel {
@@ -1153,8 +1243,9 @@ button:disabled {
   background: var(--control-sunken);
   border: 1px solid var(--border-field);
   font:
-    12px/1.3 'Segoe UI',
+    12px/1.3 system-ui,
     'Microsoft YaHei UI',
+    Arial,
     sans-serif;
 }
 .cue-editor-wrap {
@@ -1179,8 +1270,9 @@ button:disabled {
   border: 1px solid var(--border-field);
   border-radius: 1px;
   font:
-    13px/1.35 'Segoe UI',
+    13px/1.35 system-ui,
     'Microsoft YaHei UI',
+    Arial,
     sans-serif;
   white-space: pre-wrap;
   word-wrap: break-word;
@@ -1588,6 +1680,7 @@ button:disabled {
   background: rgba(0, 0, 0, 0.28);
 }
 .app-dialog {
+  position: relative;
   max-width: calc(100vw - 30px);
   max-height: calc(100dvh - 30px);
   display: grid;
@@ -2221,9 +2314,64 @@ button:disabled {
   display: flex;
   gap: 6px;
 }
+/* Script Properties（dialog_properties.cpp）：Script / Resolution / Options 三个静态框 */
 .properties-fields {
+  gap: 5px;
   max-height: min(520px, 70vh);
   overflow-y: auto;
+}
+.properties-fields .dialog-fieldset {
+  margin: 0;
+}
+.properties-fields label {
+  display: block;
+  font-size: 11px;
+}
+.properties-fields select {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+}
+.properties-script {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+}
+.properties-script input {
+  width: 100%;
+}
+.properties-resolution {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px;
+}
+.properties-resolution input,
+.properties-resolution button {
+  width: 100%;
+}
+.properties-resolution .properties-ycbcr {
+  grid-column: 2 / 5;
+}
+.properties-times {
+  text-align: center;
+}
+.properties-options {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+}
+.properties-fields .properties-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.properties-checkbox input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
 }
 .dialog-checkbox-row input {
   justify-self: start;
@@ -2637,11 +2785,22 @@ button:disabled {
 /* ===========================================================================
    Preferences 对话框（PreferencesDialog.tsx，对应 preferences.cpp wxTreebook 布局）
    =========================================================================== */
+.preferences-dialog {
+  /* 头部/内容/按钮栏三行，内容区随对话框高度伸缩（缩放手柄在对话框右下角） */
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(720px, 92vw);
+  height: min(600px, 88vh);
+}
+.preferences-dialog > footer {
+  /* 给右下角缩放手柄留位，避免遮挡最后一个按钮 */
+  padding-right: 16px;
+}
 .preferences {
   display: grid;
   grid-template-columns: 172px 1fr;
-  width: min(720px, 92vw);
-  height: min(560px, 84vh);
+  width: 100%;
+  height: 100%;
+  min-height: 0;
   gap: 0;
   overflow: hidden;
 }
@@ -2769,6 +2928,29 @@ button:disabled {
   font-size: 13px;
 }
 
+/* 拖拽调整大小：源码 wxDialog 的 wxRESIZE_BORDER（右下角手柄） */
+.pref-resize-handle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 1;
+}
+.pref-resize-handle::before {
+  content: '';
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  border-left: 7px solid transparent;
+  border-bottom: 7px solid var(--border-strong);
+  opacity: 0.7;
+}
+.pref-resize-handle:hover::before {
+  opacity: 1;
+}
 /* ---- Hotkeys 页 ---- */
 .pref-hotkeys {
   display: flex;
@@ -2784,12 +2966,43 @@ button:disabled {
 .pref-hotkey-search {
   flex: 1;
 }
+.pref-hotkey-header {
+  display: grid;
+  grid-template-columns: 120px minmax(140px, 1.1fr) 1fr 24px;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 3px 3px 0 0;
+  background: var(--surface);
+}
+.pref-hotkey-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-soft);
+  cursor: pointer;
+}
+.pref-hotkey-sort:hover,
+.pref-hotkey-sort.active {
+  color: var(--text);
+}
+.pref-hotkey-sort-arrow {
+  font-size: 9px;
+}
 .pref-hotkey-list {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 3px;
+  border-radius: 0 0 3px 3px;
 }
 .pref-hotkey-context-header {
   display: flex;
@@ -2815,6 +3028,65 @@ button:disabled {
 }
 .pref-hotkey-row.invalid {
   background: var(--error-faint-bg);
+}
+/* 命令列：源码 CommandRenderer 固定预留 20px 图标位 */
+.pref-hotkey-command {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.pref-hotkey-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 16px;
+  flex: 0 0 20px;
+}
+.pref-hotkey-icon img {
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+}
+.pref-hotkey-command input {
+  flex: 1;
+  min-width: 0;
+}
+/* 命令自动补全：输入框 + 自绘下拉（portal 到 body，避免被列表滚动容器裁剪） */
+.pref-hotkey-combo {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+.pref-hotkey-combo input {
+  width: 100%;
+  min-width: 0;
+}
+.pref-hotkey-suggest {
+  position: fixed;
+  z-index: 1000;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 224px;
+  overflow-y: auto;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 0;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.25);
+}
+.pref-hotkey-suggest li {
+  padding: 1px 5px;
+  /* 字号由组件按输入框 computed font-size 写入 ul（源码列表与输入框同字号） */
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+}
+.pref-hotkey-suggest li.active {
+  background: var(--surface-pressed);
 }
 .pref-hotkey-key {
   font-family: var(--mono, monospace);
@@ -3226,4 +3498,143 @@ button:disabled {
   .karaoke-btn img {
     filter: invert(1) hue-rotate(180deg);
   }
+}
+
+/* ===========================================================================
+   汉字K值配对器（dialog_kara_timing_copy.cpp：两行分组显示 + 样式/快捷键/命令三栏）
+   =========================================================================== */
+.kanji-body {
+  width: min(560px, calc(100vw - 40px));
+  padding: 10px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.kanji-body .dialog-fieldset {
+  margin: 0;
+}
+.kanji-display-box {
+  gap: 6px;
+}
+.kanji-display {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 3px;
+  padding: 2px 0;
+  outline: none;
+  user-select: none;
+  font-size: 12px;
+  line-height: 1.35;
+}
+.kanji-display-box .dialog-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.kanji-display-box .dialog-check input {
+  flex: 0 0 auto;
+}
+.kanji-labels {
+  display: grid;
+  grid-template-rows: auto auto;
+  row-gap: 3px;
+  align-content: start;
+  /* 与 pane 的 1px 上边框 + 2px 内边距对齐 */
+  padding: 3px 0;
+}
+.kanji-label {
+  padding: 1px 2px;
+  border: 1px solid transparent;
+  color: var(--muted);
+  white-space: pre;
+}
+.kanji-display.focused .kanji-label {
+  color: var(--text);
+}
+.kanji-pane {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: auto auto;
+  grid-auto-columns: max-content;
+  column-gap: 3px;
+  row-gap: 3px;
+  padding: 2px 0;
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+  /* 两行之间的一条横线（源码 y_line2-2 的分隔线） */
+  background-image: linear-gradient(var(--border-strong), var(--border-strong));
+  background-repeat: no-repeat;
+  background-position: 0 calc(50% - 1px);
+  background-size: 100% 1px;
+  overflow: hidden;
+}
+.kanji-cell {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+  min-height: calc(1.35em + 4px);
+}
+.kanji-tail {
+  /* 分组与未分组部分的 4px 间隔（源码 next_x += 4） */
+  margin-left: 4px;
+}
+.kanji-box {
+  display: inline-block;
+  padding: 1px 2px;
+  border: 1px solid var(--border-strong);
+  background: var(--control);
+  color: var(--text);
+  white-space: pre;
+}
+.kanji-box:empty {
+  /* 空串仍画出与文本同高的短框（源码 DrawBoxedText 的 empty 分支） */
+  min-height: calc(1.35em + 4px);
+}
+.kanji-box + .kanji-box {
+  /* 相邻音节共边框（源码步进 tw+3 与框宽 tw+4 重叠 1px） */
+  margin-left: -1px;
+}
+.kanji-box.selected {
+  background: var(--blue);
+  color: #fff;
+}
+.kanji-bottom {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.kanji-bottom-left {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.kanji-style-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+}
+.kanji-style-grid select {
+  width: 100%;
+  height: 22px;
+}
+.kanji-help p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+  white-space: pre-line;
+}
+.kanji-commands {
+  flex: 0 0 auto;
+  width: 132px;
+  justify-content: center;
+}
+.kanji-commands button {
+  width: 100%;
+  height: 26px;
+  white-space: nowrap;
 }

@@ -13,14 +13,17 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type DragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent,
   type ReactNode,
 } from 'react'
+import { createPortal } from 'react-dom'
 
 import {
   getOption,
   getOptionInt,
-  getOptionString,
   importConfigJson,
   resetOptions,
   serializeConfigJson,
@@ -38,6 +41,7 @@ import {
   setActiveHotkeys,
   type HotkeyMap,
 } from '../aegisubHotkeys'
+import { commandIcon } from '../aegisubIcons'
 import { cssColorToHex, hexToCssColor } from '../color'
 import { COMMANDS, shortcutFromKeyboardEvent, type ShortcutContext } from '../commands'
 import { tPlain } from '../i18n'
@@ -865,6 +869,14 @@ interface HotkeyRow {
   key: string
 }
 
+/** 排序列：Hotkey / Command / Description（preferences.cpp dvc 的 0/1/2 列） */
+type HotkeySortColumn = 0 | 1 | 2
+
+interface HotkeySort {
+  column: HotkeySortColumn
+  ascending: boolean
+}
+
 function flattenHotkeys(map: HotkeyMap): HotkeyRow[] {
   const rows: HotkeyRow[] = []
   for (const context of HOTKEY_CONTEXTS) {
@@ -884,6 +896,29 @@ function commitHotkeys(rows: HotkeyRow[]): HotkeyMap {
     if (!bucket[command].includes(key)) bucket[command].push(key)
   }
   return map
+}
+
+/** 热键表规范化字符串（上下文/命令/按键均排序），用于脏判断 */
+function canonicalHotkeys(map: HotkeyMap): string {
+  const contexts = Object.keys(map).sort() as ShortcutContext[]
+  return JSON.stringify(
+    contexts.map((context) => {
+      const commands = map[context] ?? {}
+      return [
+        context,
+        Object.keys(commands)
+          .sort()
+          .map((command) => [command, [...commands[command]].sort()]),
+      ]
+    }),
+  )
+}
+
+/** 描述列内容 = HotkeyModelCombo::GetValue col 2（命令 StrHelp，无效命令给异常文本） */
+function commandDescription(command: string): string {
+  const cmd = command ? COMMANDS[command] : undefined
+  if (!cmd) return command ? tPlain('Invalid command') : ''
+  return cmd.help ? tPlain(cmd.help) : tPlain(cmd.label)
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,13 +1097,24 @@ function ChoiceControl({
 
 function FontControl({
   prefix,
+  read,
   onCommit,
 }: {
   prefix: string
+  read: (opt: string) => unknown
   onCommit: (opt: string, value: unknown) => void
 }) {
-  const face = getOptionString(`${prefix}Font Face`)
-  const size = getOptionInt(`${prefix}Font Size`)
+  // 与其它控件一致读 pending：此前直接读已提交选项，输入后显示值立即回弹，
+  // 字号/字体在点 Apply 前无法输入（wxSpinCtrl/文本框是本地状态，Apply 才落盘）
+  const face = String(read(`${prefix}Font Face`) ?? '')
+  const size = Number(read(`${prefix}Font Size`))
+  const [draft, setDraft] = useState<string | null>(null)
+  const text = draft ?? String(Number.isFinite(size) ? size : 0)
+  const commitSize = (raw: string) => {
+    setDraft(null)
+    const parsed = Number(raw)
+    if (Number.isFinite(parsed) && Number.isInteger(parsed)) onCommit(`${prefix}Font Size`, parsed)
+  }
   return (
     <span className="pref-font">
       <input
@@ -1082,10 +1128,11 @@ function FontControl({
         title={tPlain('Font Size')}
         min={3}
         max={42}
-        value={size}
-        onChange={(event) => {
-          const parsed = Number(event.target.value)
-          if (Number.isInteger(parsed)) onCommit(`${prefix}Font Size`, parsed)
+        value={text}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={(event) => commitSize(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') commitSize(event.currentTarget.value)
         }}
       />
     </span>
@@ -1107,26 +1154,89 @@ export function PreferencesDialog({ onClose }: PreferencesDialogProps) {
   const [pending, setPending] = useState<Map<string, unknown>>(new Map())
   const [hotkeyRows, setHotkeyRows] = useState<HotkeyRow[] | null>(null)
   const [hotkeyFilter, setHotkeyFilter] = useState('')
+  const [hotkeySort, setHotkeySort] = useState<HotkeySort | null>(null)
   const [capturing, setCapturing] = useState<number | null>(null)
+
+  // 拖拽调整对话框大小（源码 wxDialog 的 wxRESIZE_BORDER；web 版额外持久化尺寸）
+  const [dialogSize, setDialogSize] = useState<{ width: number; height: number } | null>(() => {
+    const width = getOptionInt('Tool/Preferences/Dialog Width')
+    const height = getOptionInt('Tool/Preferences/Dialog Height')
+    return width > 0 && height > 0 ? { width, height } : null
+  })
+  const dialogRef = useRef<HTMLElement>(null)
+  const resizeOrigin = useRef<{
+    pointerX: number
+    pointerY: number
+    width: number
+    height: number
+  } | null>(null)
+
+  const onResizeStart = (event: PointerEvent<HTMLDivElement>) => {
+    const element = dialogRef.current
+    if (!element) return
+    const rect = element.getBoundingClientRect()
+    resizeOrigin.current = {
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      width: rect.width,
+      height: rect.height,
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    event.preventDefault()
+  }
+
+  // 拖拽过程直接改 DOM 尺寸（避免 pointermove 里 setState 触发整页重渲染）
+  const onResizeMove = (event: PointerEvent<HTMLDivElement>) => {
+    const origin = resizeOrigin.current
+    const element = dialogRef.current
+    if (!origin || !element) return
+    const width = Math.max(
+      480,
+      Math.min(window.innerWidth - 30, origin.width + event.clientX - origin.pointerX),
+    )
+    const height = Math.max(
+      320,
+      Math.min(window.innerHeight - 30, origin.height + event.clientY - origin.pointerY),
+    )
+    element.style.width = `${width}px`
+    element.style.height = `${height}px`
+  }
+
+  const onResizeEnd = (event: PointerEvent<HTMLDivElement>) => {
+    if (!resizeOrigin.current) return
+    resizeOrigin.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId))
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    // 拖拽期间只改 DOM，结束时落库并同步 state（否则下次重渲染丢尺寸）
+    const element = dialogRef.current
+    if (!element) return
+    const width = Math.round(element.getBoundingClientRect().width)
+    const height = Math.round(element.getBoundingClientRect().height)
+    setDialogSize({ width, height })
+    setOption('Tool/Preferences/Dialog Width', width)
+    setOption('Tool/Preferences/Dialog Height', height)
+  }
 
   const read = (opt: string): unknown => (pending.has(opt) ? pending.get(opt) : getOption(opt))
   const setPendingValue = (opt: string, value: unknown) =>
     setPending((current) => new Map(current).set(opt, value))
 
-  const hasPending = pending.size > 0 || hotkeyRows !== null
-  const dirtyCount =
-    pending.size +
-    (hotkeyRows
-      ? JSON.stringify(hotkeyRows) === JSON.stringify(flattenHotkeys(getActiveHotkeys()))
-        ? 0
-        : 1
-      : 0)
+  // 脏判断比较实际数据：进入热键草稿态（点“编辑”）或改回原值时 Apply 不应亮起
+  // （源码 AddPendingChange 只在真正 SetValue 时触发）
+  const dirtyOptions = [...pending].filter(
+    ([opt, value]) => JSON.stringify(value) !== JSON.stringify(getOption(opt)),
+  ).length
+  const hotkeysDirty =
+    hotkeyRows !== null &&
+    canonicalHotkeys(commitHotkeys(hotkeyRows)) !== canonicalHotkeys(getActiveHotkeys())
+  const dirtyCount = dirtyOptions + (hotkeysDirty ? 1 : 0)
+  const hasPending = dirtyCount > 0
 
   const apply = () => {
     for (const [opt, value] of pending) setOption(opt, value)
     setPending(new Map())
     if (hotkeyRows) {
-      setActiveHotkeys(commitHotkeys(hotkeyRows))
+      if (hotkeysDirty) setActiveHotkeys(commitHotkeys(hotkeyRows))
       setHotkeyRows(null)
     }
   }
@@ -1177,8 +1287,16 @@ export function PreferencesDialog({ onClose }: PreferencesDialogProps) {
       rows={hotkeyRows ?? flattenHotkeys(getActiveHotkeys())}
       draftActive={hotkeyRows !== null}
       filter={hotkeyFilter}
+      sort={hotkeySort}
       capturing={capturing}
       onFilter={setHotkeyFilter}
+      onSort={(column) =>
+        setHotkeySort((current) =>
+          current?.column === column
+            ? { column, ascending: !current.ascending }
+            : { column, ascending: true },
+        )
+      }
       onEdit={(index) => setCapturing(index)}
       onDelete={(index) =>
         setHotkeyRows((rows) => (rows ? rows.filter((_, i) => i !== index) : rows))
@@ -1223,7 +1341,7 @@ export function PreferencesDialog({ onClose }: PreferencesDialogProps) {
             return (
               <div className="pref-row pref-row-font" key={`${row.kind}-${rowIndex}`}>
                 <span className="pref-label">{tPlain('Font')}</span>
-                <FontControl prefix={row.prefix} onCommit={setPendingValue} />
+                <FontControl prefix={row.prefix} read={read} onCommit={setPendingValue} />
               </div>
             )
           const commit = (value: unknown) => setPendingValue(row.opt, value)
@@ -1289,6 +1407,20 @@ export function PreferencesDialog({ onClose }: PreferencesDialogProps) {
     <Dialog
       title={tPlain('Preferences')}
       onClose={onClose}
+      ref={dialogRef}
+      className="preferences-dialog"
+      style={dialogSize ? { width: dialogSize.width, height: dialogSize.height } : undefined}
+      corner={
+        <div
+          className="pref-resize-handle"
+          title={tPlain('Drag to resize')}
+          aria-label={tPlain('Drag to resize')}
+          onPointerDown={onResizeStart}
+          onPointerMove={onResizeMove}
+          onPointerUp={onResizeEnd}
+          onPointerCancel={onResizeEnd}
+        />
+      }
       footer={
         <>
           <button onClick={restoreDefaults}>{tPlain('Restore Defaults')}</button>
@@ -1339,8 +1471,10 @@ interface HotkeysPageProps {
   rows: HotkeyRow[]
   draftActive: boolean
   filter: string
+  sort: HotkeySort | null
   capturing: number | null
   onFilter: (value: string) => void
+  onSort: (column: HotkeySortColumn) => void
   onEdit: (index: number) => void
   onDelete: (index: number) => void
   onAdd: (context: ShortcutContext) => void
@@ -1348,38 +1482,245 @@ interface HotkeysPageProps {
   onStartDraft: () => void
 }
 
+/**
+ * 命令编辑框的自动补全（源码 CommandRenderer::CreateEditorCtrl 的 wxTextCtrl::AutoComplete）。
+ * 原生 datalist 在 web 会被浏览器画成大圆角，且上下键只高亮不填入；
+ * 这里自绘直角扁平列表，并在上下键预选时即时填充输入框。
+ */
+function CommandAutocomplete({
+  value,
+  disabled,
+  onChange,
+  onEditingChange,
+}: {
+  value: string
+  disabled: boolean
+  onChange: (value: string) => void
+  /** 编辑状态上报：编辑中的行不被搜索过滤刷掉（源码编辑单元格时行保持可见） */
+  onEditingChange: (editing: boolean) => void
+}) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const suggestRef = useRef<HTMLUListElement>(null)
+  const [open, setOpen] = useState(false)
+  const [anchor, setAnchor] = useState<{
+    top: number
+    left: number
+    width: number
+    fontSize: string
+  } | null>(null)
+  // 过滤用实际输入过的文本；预选值不能参与过滤，否则候选会塌缩成一项
+  const [query, setQuery] = useState('')
+  const [highlight, setHighlight] = useState(-1)
+  const [preview, setPreview] = useState<string | null>(null)
+
+  const suggestions = useMemo(() => {
+    const needle = query.trim().toLowerCase()
+    if (!needle) return COMMAND_NAMES
+    return COMMAND_NAMES.filter((name) => name.toLowerCase().includes(needle))
+  }, [query])
+
+  const showList = () => {
+    const input = inputRef.current
+    const rect = input?.getBoundingClientRect()
+    if (!input || !rect) return
+    // 下拉字号与输入框一致（源码 wxTextCtrl::AutoComplete 列表沿用控件字体）
+    setAnchor({
+      top: rect.bottom,
+      left: rect.left,
+      width: rect.width,
+      fontSize: window.getComputedStyle(input).fontSize,
+    })
+    setOpen(true)
+  }
+
+  // 输入框随滚动/窗口变化会移位，直接收起（列表用 portal 以免被滚动容器裁剪）
+  useEffect(() => {
+    if (!open) return
+    const onScroll = (event: Event) => {
+      const target = event.target
+      if (target instanceof Node && suggestRef.current?.contains(target)) return
+      setOpen(false)
+    }
+    const onResize = () => setOpen(false)
+    window.addEventListener('scroll', onScroll, true)
+    window.addEventListener('resize', onResize)
+    return () => {
+      window.removeEventListener('scroll', onScroll, true)
+      window.removeEventListener('resize', onResize)
+    }
+  }, [open])
+
+  const close = () => {
+    setOpen(false)
+    setHighlight(-1)
+  }
+
+  const commit = (next: string) => {
+    setPreview(null)
+    close()
+    if (next !== value) onChange(next)
+  }
+
+  const handleFocus = () => {
+    if (disabled) return
+    onEditingChange(true)
+    setQuery(value)
+    setHighlight(-1)
+    setPreview(null)
+    showList()
+  }
+
+  const handleChange = (event: ChangeEvent<HTMLInputElement>) => {
+    setPreview(null)
+    setHighlight(-1)
+    setQuery(event.target.value)
+    onChange(event.target.value)
+    showList()
+  }
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      if (!suggestions.length) return
+      event.preventDefault()
+      const last = suggestions.length - 1
+      const next =
+        event.key === 'ArrowDown'
+          ? highlight >= last
+            ? 0
+            : highlight + 1
+          : highlight <= 0
+            ? last
+            : highlight - 1
+      setHighlight(next)
+      setPreview(suggestions[next])
+      if (!open) showList()
+      return
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      commit(preview ?? value)
+      return
+    }
+    if (event.key === 'Escape') {
+      if (!open && preview === null) return
+      // 只关下拉，不把 Esc 传给对话框的关闭逻辑
+      event.preventDefault()
+      event.stopPropagation()
+      setPreview(null)
+      close()
+    }
+  }
+
+  return (
+    <span className="pref-hotkey-combo">
+      <input
+        ref={inputRef}
+        disabled={disabled}
+        autoComplete="off"
+        value={preview ?? value}
+        onChange={handleChange}
+        onFocus={handleFocus}
+        onClick={() => {
+          // 已聚焦时再次点击不会触发 focus（如 Enter 收起列表后），需要手动重开
+          if (open) return
+          setQuery(value)
+          setHighlight(-1)
+          setPreview(null)
+          showList()
+        }}
+        onBlur={() => {
+          if (preview !== null) commit(preview)
+          onEditingChange(false)
+        }}
+        onKeyDown={handleKeyDown}
+      />
+      {open &&
+        anchor &&
+        suggestions.length > 0 &&
+        createPortal(
+          <ul
+            ref={suggestRef}
+            className="pref-hotkey-suggest"
+            style={{
+              top: anchor.top,
+              left: anchor.left,
+              width: anchor.width,
+              fontSize: anchor.fontSize,
+            }}
+          >
+            {suggestions.map((name, index) => (
+              <li
+                key={name}
+                className={index === highlight ? 'active' : ''}
+                onMouseDown={(event) => {
+                  event.preventDefault()
+                  commit(name)
+                  inputRef.current?.focus()
+                }}
+                onMouseEnter={() => setHighlight(index)}
+              >
+                {name}
+              </li>
+            ))}
+          </ul>,
+          document.body,
+        )}
+    </span>
+  )
+}
+
 function HotkeysPage(props: HotkeysPageProps) {
   const {
     rows,
     draftActive,
     filter,
+    sort,
     capturing,
     onFilter,
+    onSort,
     onEdit,
     onDelete,
     onAdd,
     onCommandChange,
     onStartDraft,
   } = props
+  // 正在编辑命令的行：搜索过滤跳过该行，避免输入改变匹配文本时行被移除、编辑中断
+  const [editingIndex, setEditingIndex] = useState<number | null>(null)
   const needle = filter.trim().toLowerCase()
-  const filtered = useMemo(
-    () =>
-      rows
-        .map((row, index) => ({ row, index }))
-        .filter(({ row }) => {
-          if (!needle) return true
-          const description = COMMANDS[row.command]?.help ?? COMMANDS[row.command]?.label ?? ''
-          return (
-            row.command.toLowerCase().includes(needle) ||
-            row.key.toLowerCase().includes(needle) ||
-            description.toLowerCase().includes(needle)
-          )
-        }),
-    [rows, needle],
-  )
+  const filtered = useMemo(() => {
+    const list = rows
+      .map((row, index) => ({ row, index }))
+      .filter(({ row, index }) => {
+        if (!needle) return true
+        if (index === editingIndex) return true
+        const description = COMMANDS[row.command]?.help ?? COMMANDS[row.command]?.label ?? ''
+        return (
+          row.command.toLowerCase().includes(needle) ||
+          row.key.toLowerCase().includes(needle) ||
+          description.toLowerCase().includes(needle)
+        )
+      })
+    // 列排序 = wxDataViewCtrl 的 wxCOL_SORTABLE：同一上下文内的行参与排序，
+    // 上下文（父容器）本身也按名称排序
+    if (!sort) return list
+    const keyOf = (row: HotkeyRow) =>
+      sort.column === 0
+        ? row.key
+        : sort.column === 1
+          ? row.command
+          : commandDescription(row.command)
+    const direction = sort.ascending ? 1 : -1
+    return list.sort(
+      (a, b) =>
+        direction * keyOf(a.row).localeCompare(keyOf(b.row), undefined, { sensitivity: 'base' }),
+    )
+  }, [rows, needle, sort, editingIndex])
 
   const present = new Set(rows.map((row) => row.context))
   const contexts = [...HOTKEY_CONTEXTS, ...[...present].filter((c) => !HOTKEY_CONTEXTS.includes(c))]
+  // 源码 HotkeyModelCategory 用 wxGetTranslation(name) 显示与参与排序
+  if (sort)
+    contexts.sort((a, b) => tPlain(a).localeCompare(tPlain(b), undefined, { sensitivity: 'base' }))
 
   return (
     <div className="pref-hotkeys">
@@ -1392,6 +1733,21 @@ function HotkeysPage(props: HotkeysPageProps) {
         />
         {!draftActive && <button onClick={onStartDraft}>{tPlain('Edit')}</button>}
       </div>
+      <div className="pref-hotkey-header">
+        {(['Hotkey', 'Command', 'Description'] as const).map((title, column) => (
+          <button
+            key={title}
+            className={`pref-hotkey-sort${sort?.column === column ? ' active' : ''}`}
+            onClick={() => onSort(column as HotkeySortColumn)}
+          >
+            {tPlain(title)}
+            {sort?.column === column && (
+              <span className="pref-hotkey-sort-arrow">{sort.ascending ? '▲' : '▼'}</span>
+            )}
+          </button>
+        ))}
+        <span />
+      </div>
       <div className="pref-hotkey-list">
         {contexts.map((context) => {
           const contextRows = filtered.filter(({ row }) => row.context === context)
@@ -1399,13 +1755,14 @@ function HotkeysPage(props: HotkeysPageProps) {
           return (
             <div className="pref-hotkey-context" key={context}>
               <div className="pref-hotkey-context-header">
-                <strong>{context}</strong>
+                <strong>{tPlain(context)}</strong>
                 <button disabled={!draftActive} onClick={() => onAdd(context)}>
                   {tPlain('New')}
                 </button>
               </div>
               {contextRows.map(({ row, index }) => {
-                const cmd = row.command ? COMMANDS[row.command] : undefined
+                const description = commandDescription(row.command)
+                const icon = row.command ? commandIcon(row.command) : undefined
                 return (
                   <div
                     className={`pref-hotkey-row${row.command && !COMMANDS[row.command] ? ' invalid' : ''}`}
@@ -1423,19 +1780,17 @@ function HotkeysPage(props: HotkeysPageProps) {
                     >
                       {capturing === index ? tPlain('Press key…') : row.key || tPlain('(none)')}
                     </button>
-                    <input
-                      list="pref-hotkey-commands"
-                      disabled={!draftActive}
-                      value={row.command}
-                      onChange={(event) => onCommandChange(index, event.target.value)}
-                    />
-                    <span
-                      className="pref-hotkey-desc"
-                      title={cmd?.help ? tPlain(cmd.help) : (cmd?.label ?? '')}
-                    >
-                      {cmd?.help
-                        ? tPlain(cmd.help)
-                        : (cmd?.label ?? (row.command ? tPlain('Invalid command') : ''))}
+                    <span className="pref-hotkey-command">
+                      <span className="pref-hotkey-icon">{icon && <img src={icon} alt="" />}</span>
+                      <CommandAutocomplete
+                        value={row.command}
+                        disabled={!draftActive}
+                        onChange={(command) => onCommandChange(index, command)}
+                        onEditingChange={(editing) => setEditingIndex(editing ? index : null)}
+                      />
+                    </span>
+                    <span className="pref-hotkey-desc" title={description}>
+                      {description}
                     </span>
                     <button
                       className="pref-hotkey-delete"
@@ -1452,11 +1807,6 @@ function HotkeysPage(props: HotkeysPageProps) {
           )
         })}
       </div>
-      <datalist id="pref-hotkey-commands">
-        {COMMAND_NAMES.map((name) => (
-          <option key={name} value={name} />
-        ))}
-      </datalist>
     </div>
   )
 }

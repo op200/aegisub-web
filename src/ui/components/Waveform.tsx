@@ -32,6 +32,8 @@ interface WaveformProps {
   autoScroll: boolean
   /** 双击网格行的 ScrollToActiveLine 请求（App 侧 nonce 递增，0=无） */
   scrollToActiveLine: number
+  /** 滚动目标（audio_box.cpp ScrollMode）：range=行范围，start/end=时间点居中 */
+  scrollToActiveLineMode: 'range' | 'start' | 'end'
   view: 'waveform' | 'spectrum'
   /** AudioDisplay::zoom_level（= -HorizontalZoom 滑块值），约 -30..50 */
   zoomLevel?: number
@@ -251,6 +253,7 @@ export function Waveform({
   playing,
   autoScroll,
   scrollToActiveLine,
+  scrollToActiveLineMode,
   view,
   zoomLevel = 0,
   amplitude = 1,
@@ -377,6 +380,16 @@ export function Waveform({
     [durationMs, size.w, msPerPixel, clampedScroll, maxScroll],
   )
 
+  // ScrollTimeToCenter（audio_display.cpp）：把时间点滚到视口中央
+  const scrollTimeToCenter = useCallback(
+    (timeMs: number) => {
+      const clientWidth = Math.max(1, size.w)
+      const pixel = timeMs / msPerPixel
+      setScrollLeft(Math.min(Math.max(0, pixel - clientWidth / 2), maxScroll))
+    },
+    [size.w, msPerPixel, maxScroll],
+  )
+
   // 选中行变化时滚动到可见（Audio/Auto/Scroll，ScrollTimeRangeInView）
   const lastSelKeyRef = useRef('')
   useEffect(() => {
@@ -388,13 +401,16 @@ export function Waveform({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoScroll, selectedCue?.id])
 
-  // 双击网格行的 ScrollToActiveLine（audio_box.cpp，base_grid.cpp 双击调用）：不受
-  // Audio/Auto/Scroll 开关限制且无去重——重复双击当前行也要保证行范围可见
+  // 双击网格行 / audio/go_to* 的 ScrollToActiveLine（audio_box.cpp）：
+  // 不受 Audio/Auto/Scroll 开关限制且无去重——重复请求同一行也要保证滚动
   const lastScrollNonceRef = useRef(0)
   useEffect(() => {
     if (scrollToActiveLine === lastScrollNonceRef.current) return
     lastScrollNonceRef.current = scrollToActiveLine
-    if (selectedCue) scrollRangeInView(selectedCue)
+    if (!selectedCue) return
+    if (scrollToActiveLineMode === 'start') scrollTimeToCenter(selectedCue.startMs)
+    else if (scrollToActiveLineMode === 'end') scrollTimeToCenter(selectedCue.endMs)
+    else scrollRangeInView(selectedCue)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scrollToActiveLine])
 

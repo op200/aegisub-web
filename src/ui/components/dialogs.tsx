@@ -1,5 +1,5 @@
 import { X } from 'lucide-react'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import {
   WX_ID,
@@ -33,7 +33,9 @@ import {
   matrixOptionFromHeader,
   parseYcbcrHeader,
   resampleCommands,
+  ycbcrHeaderToBestPracticeString,
   ycbcrHeaderToEffective,
+  type YcbcrColorspace,
 } from '../../core/resample'
 import { formatEditorTime, formatVideoTime, parseEditorTime } from '../../core/time'
 import { processTiming } from '../../core/timingProcessor'
@@ -68,6 +70,12 @@ interface DialogProps {
   onClose: () => void
   children: React.ReactNode
   footer?: React.ReactNode
+  /** 对话框根节点附加类名（首选项用尺寸/布局定制） */
+  className?: string
+  style?: React.CSSProperties
+  /** 渲染在对话框根节点末尾的角标（首选项右下角的缩放手柄） */
+  corner?: React.ReactNode
+  ref?: React.Ref<HTMLElement>
 }
 
 // 弹窗 ESC 关闭栈：挂载顺序即层级顺序，仅栈顶弹窗响应 ESC（多级弹窗逐层关闭）。
@@ -107,11 +115,27 @@ export function useEscapeClose(onClose: () => void, active = true) {
   }, [active])
 }
 
-export function Dialog({ title, onClose, children, footer }: DialogProps) {
+export function Dialog({
+  title,
+  onClose,
+  children,
+  footer,
+  className,
+  style,
+  corner,
+  ref,
+}: DialogProps) {
   useEscapeClose(onClose)
   return (
     <div className="dialog-backdrop" role="presentation">
-      <section className="app-dialog" role="dialog" aria-modal="true" aria-label={title}>
+      <section
+        ref={ref}
+        className={`app-dialog${className ? ` ${className}` : ''}`}
+        style={style}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
         <header>
           <strong>{title}</strong>
           <button
@@ -125,6 +149,7 @@ export function Dialog({ title, onClose, children, footer }: DialogProps) {
         </header>
         {children}
         {footer && <footer>{footer}</footer>}
+        {corner}
       </section>
     </div>
   )
@@ -760,37 +785,115 @@ export function JumpToDialog({ currentTimeMs, durationMs, onClose, onJump }: Jum
 // ---------------------------------------------------------------------------
 interface ScriptPropertiesDialogProps {
   scriptInfo: Record<string, string>
+  /** 视频显示分辨率 + 真实色彩空间（provider->GetDisplayResolution() / GetRealColorSpace()）；无视频为 null */
+  video: { width: number; height: number; colorspace: YcbcrColorspace } | null
   onClose: () => void
   onApply: (patch: Record<string, string>) => void
 }
 
+/** AddProperty 的 8 组标签（源码文案含冒号，键为脚本信息字段） */
 const PROPERTY_FIELDS = [
-  ['Title', 'Title'],
-  ['Original Script', 'Original Script'],
-  ['Original Translation', 'Original Translation'],
-  ['Original Editing', 'Original Editing'],
-  ['Original Timing', 'Original Timing'],
-  ['Synch Point', 'Synch Point'],
-  ['Script Updated By', 'Script Updated By'],
-  ['Update Details', 'Update Details'],
+  ['Title', 'Title:'],
+  ['Original Script', 'Original script:'],
+  ['Original Translation', 'Translation:'],
+  ['Original Editing', 'Editing:'],
+  ['Original Timing', 'Timing:'],
+  ['Synch Point', 'Synch point:'],
+  ['Script Updated By', 'Updated by:'],
+  ['Update Details', 'Update details:'],
 ] as const
+
+/** agi::ycbcr::valid_header_strings（顺序同源码，不参与翻译） */
+const YCBCR_HEADER_STRINGS = [
+  'None',
+  'TV.601',
+  'PC.601',
+  'TV.709',
+  'PC.709',
+  'TV.FCC',
+  'PC.FCC',
+  'TV.240M',
+  'PC.240M',
+]
+
+/** 源码 wrap_opts 4 条文案 */
+const WRAP_STYLE_OPTIONS = [
+  '0: Smart wrapping, top line is wider',
+  '1: End-of-line word wrapping, only \\N breaks',
+  '2: No word wrapping, both \\n and \\N break',
+  '3: Smart wrapping, bottom line is wider',
+]
 
 export function ScriptPropertiesDialog({
   scriptInfo,
+  video,
   onClose,
   onApply,
 }: ScriptPropertiesDialogProps) {
   const [values, setValues] = useState(() => ({ ...scriptInfo }))
+  const [wrapStyle, setWrapStyle] = useState(() =>
+    String(Number.parseInt(scriptInfo.WrapStyle ?? '0', 10) || 0),
+  )
+  // wxComboBox::SetValue 语义：原值不在 valid_header_strings 里时临时加一项显示
+  const [ycbcrMatrix, setYcbcrMatrix] = useState(() => scriptInfo['YCbCr Matrix'] ?? '')
+  const [ycbcrOptions] = useState(() => {
+    const existing = scriptInfo['YCbCr Matrix'] ?? ''
+    return YCBCR_HEADER_STRINGS.includes(existing)
+      ? [...YCBCR_HEADER_STRINGS]
+      : [existing, ...YCBCR_HEADER_STRINGS]
+  })
+  const [scaleBorder, setScaleBorder] = useState(
+    () => (scriptInfo.ScaledBorderAndShadow ?? '').toLowerCase() === 'yes',
+  )
+
   const setValue = (key: string, value: string) =>
     setValues((current) => ({ ...current, [key]: value }))
+
+  // OnSetFromVideo / OnSetLayoutResFromVideo：写入视频显示分辨率
+  const setResolutionFromVideo = (prefix: 'PlayRes' | 'LayoutRes') => {
+    if (!video) return
+    setValues((current) => ({
+      ...current,
+      [`${prefix}X`]: String(video.width),
+      [`${prefix}Y`]: String(video.height),
+    }))
+  }
+  // OnSetYCbCrMatrixFromVideo：Header(GetRealColorSpace()).to_best_practice_string()
+  const setYCbCrFromVideo = () => {
+    if (!video) return
+    setYcbcrMatrix(
+      ycbcrHeaderToBestPracticeString({ kind: 'colorspace', colorspace: video.colorspace }),
+    )
+  }
+
   const apply = () => {
     const patch: Record<string, string> = {}
-    for (const [key, value] of Object.entries(values))
+    // SetInfoIfDifferent：仅写入与当前脚本信息不同的项（缺失但存在旧值 → 置空）
+    const setIfDifferent = (key: string, value: string) => {
       if ((scriptInfo[key] ?? '') !== value) patch[key] = value
-    for (const [key] of PROPERTY_FIELDS) if (!(key in values) && scriptInfo[key]) patch[key] = ''
+    }
+    for (const [key] of PROPERTY_FIELDS) setIfDifferent(key, values[key] ?? '')
+    setIfDifferent('PlayResX', values.PlayResX ?? '')
+    setIfDifferent('PlayResY', values.PlayResY ?? '')
+    setIfDifferent('LayoutResX', values.LayoutResX ?? '')
+    setIfDifferent('LayoutResY', values.LayoutResY ?? '')
+    setIfDifferent('WrapStyle', wrapStyle)
+    setIfDifferent('ScaledBorderAndShadow', scaleBorder ? 'yes' : 'no')
+    setIfDifferent('YCbCr Matrix', ycbcrMatrix)
     if (Object.keys(patch).length) onApply(patch)
     onClose()
   }
+
+  const renderProperty = (key: string, label: string) => (
+    <Fragment key={key}>
+      <label htmlFor={`properties-${key}`}>{tPlain(label)}</label>
+      <input
+        id={`properties-${key}`}
+        value={values[key] ?? ''}
+        onChange={(event) => setValue(key, event.target.value)}
+      />
+    </Fragment>
+  )
 
   return (
     <Dialog
@@ -800,88 +903,123 @@ export function ScriptPropertiesDialog({
         <>
           <button onClick={apply}>{tPlain('OK')}</button>
           <button onClick={onClose}>{tPlain('Cancel')}</button>
+          <button
+            onClick={() =>
+              window.open('https://aegisub.org/docs/latest/properties/', '_blank', 'noopener')
+            }
+          >
+            {tPlain('Help')}
+          </button>
         </>
       }
     >
       <div className="dialog-fields properties-fields">
-        {PROPERTY_FIELDS.map(([key, label]) => (
-          <label key={key}>
-            {tPlain(label)}
+        <fieldset className="dialog-fieldset">
+          <legend>{tPlain('Script')}</legend>
+          <div className="properties-script">
+            {PROPERTY_FIELDS.map(([key, label]) => renderProperty(key, label))}
+          </div>
+        </fieldset>
+        <fieldset className="dialog-fieldset">
+          <legend>{tPlain('Resolution')}</legend>
+          <div className="properties-resolution">
+            <label htmlFor="properties-PlayResX">{tPlain('Script: ')}</label>
             <input
-              value={values[key] ?? ''}
-              onChange={(event) => setValue(key, event.target.value)}
+              id="properties-PlayResX"
+              type="number"
+              min={1}
+              value={values.PlayResX ?? ''}
+              onChange={(event) => setValue('PlayResX', event.target.value)}
             />
-          </label>
-        ))}
-        <label>
-          {tPlain('PlayResX')}
-          <input
-            type="number"
-            min={1}
-            value={values.PlayResX ?? ''}
-            onChange={(event) => setValue('PlayResX', event.target.value)}
-          />
-        </label>
-        <label>
-          {tPlain('PlayResY')}
-          <input
-            type="number"
-            min={1}
-            value={values.PlayResY ?? ''}
-            onChange={(event) => setValue('PlayResY', event.target.value)}
-          />
-        </label>
-        <label>
-          {tPlain('LayoutResX')}
-          <input
-            type="number"
-            min={0}
-            value={values.LayoutResX ?? ''}
-            onChange={(event) => setValue('LayoutResX', event.target.value)}
-          />
-        </label>
-        <label>
-          {tPlain('LayoutResY')}
-          <input
-            type="number"
-            min={0}
-            value={values.LayoutResY ?? ''}
-            onChange={(event) => setValue('LayoutResY', event.target.value)}
-          />
-        </label>
-        <label>
-          {tPlain('Wrap Style')}
-          <select
-            value={values.WrapStyle ?? '0'}
-            onChange={(event) => setValue('WrapStyle', event.target.value)}
-          >
-            <option value="0">{tPlain('0: Smart wrapping, top line wider')}</option>
-            <option value="1">{tPlain('1: End-of-line word wrapping')}</option>
-            <option value="2">{tPlain('2: No word wrapping')}</option>
-            <option value="3">{tPlain('3: Smart wrapping, bottom line wider')}</option>
-          </select>
-        </label>
-        <label>
-          {tPlain('YCbCr Matrix')}
-          <select
-            value={values['YCbCr Matrix'] ?? 'None'}
-            onChange={(event) => setValue('YCbCr Matrix', event.target.value)}
-          >
-            {['None', 'TV.601', 'PC.601', 'TV.709', 'PC.709', 'TV.2020', 'PC.2020'].map((value) => (
-              <option key={value}>{value}</option>
-            ))}
-          </select>
-        </label>
-        <label className="dialog-checkbox-row">
-          {tPlain('Scaled Border and Shadow')}
-          <input
-            type="checkbox"
-            checked={(values.ScaledBorderAndShadow ?? 'yes').toLowerCase() === 'yes'}
-            onChange={(event) =>
-              setValue('ScaledBorderAndShadow', event.target.checked ? 'yes' : 'no')
-            }
-          />
-        </label>
+            <span className="properties-times" aria-hidden="true">
+              {'\u00D7'}
+            </span>
+            <input
+              id="properties-PlayResY"
+              type="number"
+              min={1}
+              value={values.PlayResY ?? ''}
+              onChange={(event) => setValue('PlayResY', event.target.value)}
+            />
+            <button
+              type="button"
+              disabled={!video}
+              onClick={() => setResolutionFromVideo('PlayRes')}
+            >
+              {tPlain('From video')}
+            </button>
+            <label htmlFor="properties-LayoutResX">{tPlain('Layout: ')}</label>
+            <input
+              id="properties-LayoutResX"
+              type="number"
+              min={0}
+              value={values.LayoutResX ?? ''}
+              onChange={(event) => setValue('LayoutResX', event.target.value)}
+            />
+            <span className="properties-times" aria-hidden="true">
+              {'\u00D7'}
+            </span>
+            <input
+              id="properties-LayoutResY"
+              type="number"
+              min={0}
+              value={values.LayoutResY ?? ''}
+              onChange={(event) => setValue('LayoutResY', event.target.value)}
+            />
+            <button
+              type="button"
+              disabled={!video}
+              onClick={() => setResolutionFromVideo('LayoutRes')}
+            >
+              {tPlain('From video')}
+            </button>
+            <label htmlFor="properties-ycbcr">{tPlain('YCbCr Matrix:')}</label>
+            <select
+              id="properties-ycbcr"
+              className="properties-ycbcr"
+              value={ycbcrMatrix}
+              onChange={(event) => setYcbcrMatrix(event.target.value)}
+            >
+              {ycbcrOptions.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+            <button type="button" disabled={!video} onClick={setYCbCrFromVideo}>
+              {tPlain('From video')}
+            </button>
+          </div>
+        </fieldset>
+        <fieldset className="dialog-fieldset">
+          <legend>{tPlain('Options')}</legend>
+          <div className="properties-options">
+            <label htmlFor="properties-wrapstyle">{tPlain('Wrap Style: ')}</label>
+            <select
+              id="properties-wrapstyle"
+              value={wrapStyle}
+              onChange={(event) => setWrapStyle(event.target.value)}
+            >
+              {WRAP_STYLE_OPTIONS.map((label, index) => (
+                <option key={label} value={String(index)}>
+                  {tPlain(label)}
+                </option>
+              ))}
+            </select>
+            <span aria-hidden="true" />
+            <label className="properties-checkbox">
+              <input
+                type="checkbox"
+                checked={scaleBorder}
+                onChange={(event) => setScaleBorder(event.target.checked)}
+                title={tPlain(
+                  'Scale border and shadow together with script/render resolution. If this is unchecked, relative border and shadow size will depend on renderer.',
+                )}
+              />
+              {tPlain('Scale Border and Shadow')}
+            </label>
+          </div>
+        </fieldset>
       </div>
     </Dialog>
   )
@@ -2046,6 +2184,9 @@ interface VideoDetailsDialogProps {
   /** 检测/配置的帧率（dialog_video_details.cpp FPS %.3f） */
   fps: number | null
   frameCount: number
+  /** 解码尺寸（视频 provider GetWidth/GetHeight；dummy 视频用 dummy 分辨率） */
+  width: number
+  height: number
   onClose: () => void
 }
 
@@ -2054,12 +2195,15 @@ export function VideoDetailsDialog({
   durationMs,
   fps,
   frameCount,
+  width: intrinsicWidth,
+  height: intrinsicHeight,
   onClose,
 }: VideoDetailsDialogProps) {
   const sizeMb = media.file ? (media.file.size / (1024 * 1024)).toFixed(1) : '?'
+  // dialog_video_details.cpp：Resolution = "宽x高 (约分后的宽高比)"
+  const width = media.dummy?.width || intrinsicWidth
+  const height = media.dummy?.height || intrinsicHeight
   const arText = (() => {
-    const width = Number(media.dummy?.width) || 0
-    const height = Number(media.dummy?.height) || 0
     if (!width || !height) return null
     const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a)
     const divisor = gcd(width, height) || 1
@@ -2081,11 +2225,7 @@ export function VideoDetailsDialog({
         <dt>{tPlain('FPS')}</dt>
         <dd>{fps ? fps.toFixed(3) : '?'}</dd>
         <dt>{tPlain('Resolution')}</dt>
-        <dd>
-          {media.dummy
-            ? `${media.dummy.width} x ${media.dummy.height}${arText ? ` (${arText})` : ''}`
-            : '?'}
-        </dd>
+        <dd>{width && height ? `${width}x${height}${arText ? ` (${arText})` : ''}` : '?'}</dd>
         <dt>{tPlain('Length')}</dt>
         <dd>
           {frameCount} frame{frameCount === 1 ? '' : 's'} ({formatEditorTime(durationMs)})

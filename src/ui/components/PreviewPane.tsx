@@ -1,4 +1,4 @@
-import { Video } from 'lucide-react'
+import { ChevronDown, Video } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 
 import {
@@ -28,7 +28,9 @@ import { formatVideoTime } from '../../core/time'
 import type { SubtitleCue, SubtitleDocument, SubtitleStyle } from '../../core/types'
 import type { Framerate } from '../../core/vfr'
 import { ptsToMs } from '../../core/vfr'
+import type { YcbcrAffine, YcbcrColorspace } from '../../core/resample'
 import { detachElementGain, setElementGain } from '../../media/elementGain'
+import { resolveVideoColorTransform, VideoColorStage } from '../../media/videoColor'
 import { WebCodecsVideoSource } from '../../media/webcodecsVideo'
 import type { MediaSource } from '../../platform/types'
 import { aegisubIconUrl, commandIcon } from '../aegisubIcons'
@@ -107,6 +109,8 @@ interface PreviewPaneProps {
   onPlaybackModeChange?: (mode: VideoPlaybackMode | null) => void
   /** 解码通道覆盖：true=强制 WebCodecs，false=强制原生，缺省/null=自动（<video> onError 切换） */
   decoderOverride?: boolean | null
+  /** 视频自身色彩空间（容器标记；未标记为 'Unspecified'）。脚本头 YCbCr Matrix 在其上覆盖 */
+  videoColorspace: YcbcrColorspace
   /** 播放音量增益（源码唯一 audio player 同时供视频出声，AudioPane 音量滑条统一控制） */
   playbackGain: number
   style?: CSSProperties
@@ -1711,7 +1715,30 @@ function VideoSliderControl({
     const ctx = canvas.getContext('2d')
     if (!ctx) return
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0)
-    ctx.clearRect(0, 0, w, h)
+    // 后备尺寸是 CSS 尺寸按 ratio 取整（542 CSS @1.25 = 677.5 → 678），比 w/h 多出零头：
+    // 整幅清除并按后备尺寸铺底，否则零头列/行只被覆盖一半而留下半透明边
+    const backingW = canvas.width / ratio
+    const backingH = canvas.height / ratio
+    ctx.clearRect(0, 0, backingW, backingH)
+
+    // 设备像素栅格对齐：1px 线（对应 wxPen 宽度 1）应覆盖整数个设备像素，
+    // 否则分数 DPR 下会产生半透明虚边。所有直线一律用 fillRect 而非 stroke：
+    // stroke 会对分数 DPR 的长线做抗锯齿——长线在栅格化分块接缝处还会留下一列
+    // 半透明像素（实测 DPR 1.25 时落在画布中点列），表现为「虚边」
+    const widthD = Math.max(1, Math.round(ratio))
+    const lineThick = widthD / ratio
+    const startD = (v: number) => Math.round(v * ratio)
+    /** 线宽方向的边界：奇数线宽中心落在半像素、偶数落在整像素 */
+    const edgeD = (v: number) => startD(v) - Math.floor(widthD / 2)
+    const dev = (v: number) => v / ratio
+    /** 水平 1px 线：设备列区间 [xa, xb) */
+    const lineX = (xa: number, xb: number, y: number) => {
+      ctx.fillRect(dev(startD(xa)), dev(edgeD(y)), dev(startD(xb) - startD(xa)), lineThick)
+    }
+    /** 垂直 1px 线：设备行区间 [ya, yb) */
+    const lineY = (x: number, ya: number, yb: number) => {
+      ctx.fillRect(dev(edgeD(x)), dev(startD(ya)), lineThick, dev(startD(yb) - startD(ya)))
+    }
 
     // 系统色随主题切换（video_slider.cpp 用 wxSYS_COLOUR_* 绘制，对应系统深浅色）
     const { shad, high, face, bord } = SLIDER_PALETTES[theme]
@@ -1724,93 +1751,102 @@ function VideoSliderControl({
 
     // 背景
     ctx.fillStyle = face
-    ctx.fillRect(0, 0, w, h)
+    ctx.fillRect(0, 0, backingW, backingH)
 
-    // 焦点虚线框（OnPaint：HasFocus 时 3DDKSHADOW 点线边框）
+    // 焦点点线框（OnPaint：HasFocus 时 3DDKSHADOW 的 wxPENSTYLE_DOT 边框）。
+    // wx 的 cosmetic 点线是 1 设备像素亮/灭交替的硬边点；Canvas 的 setLineDash 以 CSS px
+    // 计长，分数 DPR 下每个点都只覆盖半个设备像素，会变成半透明的「虚」点，故逐设备像素画点
     if (focused) {
-      ctx.strokeStyle = shad
-      ctx.setLineDash([1, 2])
-      ctx.strokeRect(0.5, 0.5, w - 1, h - 1)
-      ctx.setLineDash([])
+      ctx.fillStyle = shad
+      for (let x = 0; x < canvas.width; x += 2) {
+        ctx.fillRect(dev(x), 0, dev(1), dev(1))
+        ctx.fillRect(dev(x), dev(canvas.height - 1), dev(1), dev(1))
+      }
+      for (let y = 0; y < canvas.height; y += 2) {
+        ctx.fillRect(0, dev(y), dev(1), dev(1))
+        ctx.fillRect(dev(canvas.width - 1), dev(y), dev(1), dev(1))
+      }
     }
 
     // 轨道（凹陷边框）
-    ctx.strokeStyle = shad
-    ctx.lineWidth = 1
-    ctx.beginPath()
-    ctx.moveTo(x1, y1)
-    ctx.lineTo(x2, y1)
-    ctx.moveTo(x1, y1)
-    ctx.lineTo(x1, y2)
-    ctx.stroke()
-    ctx.strokeStyle = high
-    ctx.beginPath()
-    ctx.moveTo(x1, y2)
-    ctx.lineTo(x2, y2)
-    ctx.moveTo(x2, y1)
-    ctx.lineTo(x2, y2)
-    ctx.stroke()
+    ctx.fillStyle = shad
+    lineX(x1, x2, y1)
+    lineY(x1, y1, y2)
+    ctx.fillStyle = high
+    lineX(x1, x2, y2)
+    lineY(x2, y1, y2)
 
     const getXAtValue = (value: number) => (value * (w - 10)) / maxFrame + 5
     const curX = getXAtValue(Math.min(Math.max(0, frame), maxFrame))
 
     // 关键帧刻度（video_slider.cpp L219-227：轨道上方的 3DDKSHADOW 短竖线；Video/Slider/Show Keyframes）
     if (showKeyframes) {
-      ctx.strokeStyle = shad
+      ctx.fillStyle = shad
       for (const keyframe of keyframes) {
         if (keyframe < 0 || keyframe > maxFrame) continue
-        const x = getXAtValue(keyframe)
-        ctx.beginPath()
-        ctx.moveTo(x, 2)
-        ctx.lineTo(x, 8)
-        ctx.stroke()
+        lineY(getXAtValue(keyframe), 2, 8)
       }
     }
 
+    // fillRect 也要落在设备像素栅格上：否则游标白底/底部选区条的左右边界会横跨两列设备像素，
+    // 出现「介于 1~2 像素」的半透明边
+    const snapFill = (v: number) => dev(startD(v))
+    const snapSize = (v: number) => Math.max(1, startD(v)) / ratio
+
     // 填充游标背景
     ctx.fillStyle = face
-    ctx.fillRect(curX - 2, y1 - 1, 4, y2 - y1 + 5)
+    ctx.fillRect(snapFill(curX - 2), snapFill(y1 - 1), snapSize(4), snapSize(y2 - y1 + 5))
+
+    // 斜线（游标箭头边缘）按设备像素台阶绘制：Canvas2D 对对角线做抗锯齿，
+    // 会产生「介于 1~2 像素」的半透明边，wxWidgets 的 1px 画笔则是硬边台阶
+    const aliasLine = (xa: number, ya: number, xb: number, yb: number) => {
+      let x = Math.round(xa * ratio)
+      let y = Math.round(ya * ratio)
+      const endX = Math.round(xb * ratio)
+      const endY = Math.round(yb * ratio)
+      const dx = Math.abs(endX - x)
+      const dy = Math.abs(endY - y)
+      const sx = x < endX ? 1 : -1
+      const sy = y < endY ? 1 : -1
+      let err = dx - dy
+      for (;;) {
+        ctx.fillRect(x / ratio, y / ratio, widthD / ratio, widthD / ratio)
+        if (x === endX && y === endY) break
+        const e2 = 2 * err
+        if (e2 > -dy) {
+          err -= dy
+          x += sx
+        }
+        if (e2 < dx) {
+          err += dx
+          y += sy
+        }
+      }
+    }
 
     // 高光
-    ctx.strokeStyle = high
-    ctx.beginPath()
-    ctx.moveTo(curX, y1 - 2)
-    ctx.lineTo(curX - 4, y1 + 2)
-    ctx.moveTo(curX - 3, y1 + 2)
-    ctx.lineTo(curX - 3, y2 + 5)
-    ctx.stroke()
+    ctx.fillStyle = high
+    aliasLine(curX, y1 - 2, curX - 4, y1 + 2)
+    lineY(curX - 3, y1 + 2, y2 + 5)
 
     // 阴影
-    ctx.strokeStyle = shad
-    ctx.beginPath()
-    ctx.moveTo(curX + 1, y1 - 1)
-    ctx.lineTo(curX + 4, y1 + 2)
-    ctx.moveTo(curX + 3, y1 + 2)
-    ctx.lineTo(curX + 3, y2 + 5)
-    ctx.moveTo(curX - 3, y2 + 4)
-    ctx.lineTo(curX + 3, y2 + 4)
-    ctx.stroke()
+    ctx.fillStyle = shad
+    aliasLine(curX + 1, y1 - 1, curX + 4, y1 + 2)
+    lineY(curX + 3, y1 + 2, y2 + 5)
+    lineX(curX - 3, curX + 3, y2 + 4)
 
     // 轮廓（黑色箭头）
-    ctx.strokeStyle = bord
-    ctx.beginPath()
-    ctx.moveTo(curX, y1 - 3)
-    ctx.lineTo(curX - 4, y1 + 1)
-    ctx.moveTo(curX, y1 - 3)
-    ctx.lineTo(curX + 4, y1 + 1)
-    ctx.moveTo(curX - 4, y1 + 1)
-    ctx.lineTo(curX - 4, y2 + 5)
-    ctx.moveTo(curX + 4, y1 + 1)
-    ctx.lineTo(curX + 4, y2 + 5)
-    ctx.moveTo(curX - 3, y2 + 5)
-    ctx.lineTo(curX + 4, y2 + 5)
-    ctx.moveTo(curX - 3, y2)
-    ctx.lineTo(curX + 4, y2)
-    ctx.stroke()
+    ctx.fillStyle = bord
+    aliasLine(curX, y1 - 3, curX - 4, y1 + 1)
+    aliasLine(curX, y1 - 3, curX + 4, y1 + 1)
+    lineY(curX - 4, y1 + 1, y2 + 5)
+    lineY(curX + 4, y1 + 1, y2 + 5)
+    lineX(curX - 3, curX + 4, y2 + 5)
+    lineX(curX - 3, curX + 4, y2)
 
     // 底部选区条（HasFocus 时亮色，否则 2/5 暗色；video_slider.cpp L257-260）
     ctx.fillStyle = focused ? sel : `rgb(${(123 * 2) / 5},${(251 * 2) / 5},${(232 * 2) / 5})`
-    ctx.fillRect(curX - 3, y2 + 1, 7, 4)
+    ctx.fillRect(snapFill(curX - 3), snapFill(y2 + 1), snapSize(7), snapSize(4))
     // canvasSize 仅为尺寸变化时触发重绘（effect 内直接读 clientWidth/Height）
     // oxlint-disable-next-line react/exhaustive-effect-dependencies
   }, [frame, keyframes, maxFrame, showKeyframes, focused, canvasSize, theme])
@@ -1982,6 +2018,7 @@ export function PreviewPane({
   onKeyframesChange,
   onPlaybackModeChange,
   decoderOverride,
+  videoColorspace,
   playbackGain,
   style: panelStyle,
 }: PreviewPaneProps) {
@@ -2004,6 +2041,15 @@ export function PreviewPane({
   }
   const wcCanvasRef = useRef<HTMLCanvasElement>(null)
   const wcSourceRef = useRef<WebCodecsVideoSource | null>(null)
+  // 视频色彩层：把 <video>/WebCodecs 画布按 YCbCr Matrix 校正后重绘（见 media/videoColor.ts）
+  const colorCanvasRef = useRef<HTMLCanvasElement>(null)
+  const colorStageRef = useRef<VideoColorStage | null>(null)
+  // video/tool/vclip/* 命令：待激活矢量裁剪工具时记录目标子模式（工具激活 effect 消费）
+  const pendingVclipModeRef = useRef<string | null>(null)
+  // video/tool/perspective/* 命令：由透视子工具 effect 消费（定义在 perspSubToolClick 之后）
+  const handledPerspActionRef = useRef(0)
+  // 截图文件序号（video.cpp save_snapshot 的 session_shot_count：每次保存递增）
+  const frameSaveSeqRef = useRef(0)
   const onKeyframesChangeRef = useRef(onKeyframesChange)
   // 当前接线的视频元素（wcActive 切换/媒体更换会替换元素，替换时拆掉旧节点路由）
   const gainVideoRef = useRef<HTMLMediaElement | null>(null)
@@ -2149,8 +2195,7 @@ export function PreviewPane({
   // ---- 3D 透视工具状态（visual_tool_perspective.cpp）----
   const [persp, setPersp] = useState<PerspState | null>(null)
   const perspRef = useRef<PerspState | null>(null)
-  // 真实帧率探测：每个媒体只探测一次（requestVideoFrameCallback 采样 mediaTime 间隔中位数）
-  const fpsProbedRef = useRef<string | null>(null)
+  // 真实帧率来自容器头/逐帧时间码表（App 探测后经 onDetectedFps 上报），此处只保存回调
   const onDetectedFpsRef = useRef(onDetectedFps)
   // ref 与渲染值同步（事件处理器读取）
   useEffect(() => {
@@ -2173,73 +2218,6 @@ export function PreviewPane({
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- videoRef 挂载随 media.url/wcActive 条件渲染
   }, [media?.url, wcActive, playbackGain])
 
-  /** 短暂静音播放采样帧间隔后暂停并回到原位置，得到容器真实 fps。
-   *  外部 seek（auto seek/滑块）或暂停会立即让位：不回跳位置、尽快暂停，
-   *  避免探测播放与用户操作抢夺播放头（表现为"auto seek 后视频自己播放"）。 */
-  const probeVideoFps = useCallback((video: HTMLVideoElement, mediaKey: string) => {
-    const callbackHost = video as HTMLVideoElement & {
-      requestVideoFrameCallback?: (
-        callback: (now: number, metadata: { mediaTime: number }) => void,
-      ) => number
-    }
-    if (!callbackHost.requestVideoFrameCallback) return
-    if (fpsProbedRef.current === mediaKey) return
-    fpsProbedRef.current = mediaKey
-    if (!Number.isFinite(video.duration) || video.duration <= 0) return
-
-    const times: number[] = []
-    const startPos = video.currentTime
-    const wasMuted = video.muted
-    let finished = false
-    let externallySeeked = false
-    video.muted = true
-
-    const reportFps = () => {
-      // 中位数吸收 seek 跨越产生的离群 delta；只保留 <0.5s 的正常帧间隔
-      const deltas = times
-        .slice(1)
-        .map((time, index) => time - times[index])
-        .filter((delta) => delta > 0 && delta < 0.5)
-        .sort((a, b) => a - b)
-      if (deltas.length < 5) return
-      const median = deltas[Math.floor(deltas.length / 2)]
-      const fps = median > 0.0005 ? Math.round((1 / median) * 1000) / 1000 : 0
-      if (fps >= 5 && fps <= 240) onDetectedFpsRef.current(fps)
-    }
-    const finish = (restore: boolean) => {
-      if (finished) return
-      finished = true
-      video.removeEventListener('seeking', onSeeking)
-      video.removeEventListener('pause', onPause)
-      window.clearTimeout(timeoutId)
-      video.pause()
-      video.muted = wasMuted
-      // 外部已 seek（auto seek/滑块）时不回跳：用户的寻址位置优先
-      if (restore && !externallySeeked) video.currentTime = startPos
-    }
-    const onSeeking = () => {
-      externallySeeked = true
-    }
-    const onPause = () => finish(false)
-    const timeoutId = window.setTimeout(() => finish(!externallySeeked), 3000)
-    video.addEventListener('seeking', onSeeking)
-    video.addEventListener('pause', onPause)
-    const step = (_now: number, metadata: { mediaTime: number }) => {
-      if (finished) return
-      times.push(metadata.mediaTime)
-      if (times.length < 12) {
-        callbackHost.requestVideoFrameCallback!(step)
-        return
-      }
-      finish(!externallySeeked)
-      reportFps()
-    }
-    callbackHost.requestVideoFrameCallback(step)
-    void video.play().catch(() => {
-      // 自动播放被拒绝时跳过探测（保持默认 24fps）
-      finish(false)
-    })
-  }, [])
   const windowZoomRef = useRef(windowZoom)
   const onWindowZoomChangeRef = useRef(onWindowZoomChange)
   const dragRef = useRef<{
@@ -3498,7 +3476,103 @@ export function PreviewPane({
     }
   }, [wcActive, media, onDurationChange, onIntrinsicSizeChange, onTimeChange])
 
-  // 原生 <video> 搁浅告警：8 秒既无 metadata 也无 error（个别容器/驱动组合会静默卡住）
+  // ---- 视频色彩层（YCbCr Matrix）----
+  // 源码 video_controller.cpp：COMMIT_SCRIPTINFO 后若脚本头矩阵变化，provider->SetColorSpace
+  // 立即按新矩阵重新出图。Web 端在 RGB 域做等效校正并把画面改由自己的 canvas 呈现
+  // （绕过 Chrome 对 <video> 的直通色彩管理；见 media/videoColor.ts）。
+  const videoHeaderMatrix = document.scriptInfo['YCbCr Matrix'] ?? ''
+  const colorTransformKey = `${videoColorspace.matrix}|${videoColorspace.range}|${videoHeaderMatrix}|${intrinsicWidth}x${intrinsicHeight}`
+  const colorTransformRef = useRef<YcbcrAffine | null>(null)
+  const colorRedrawRef = useRef<() => void>(() => undefined)
+  // 首次成功上传帧前隐藏色彩层，让底层 <video> 直接可见（避免黑屏/空帧）
+  const [colorReady, setColorReady] = useState(false)
+  const colorReadyRef = useRef(false)
+  const colorSourceChanged = `${media?.url ?? ''}|${wcActive}`
+  useEffect(() => {
+    colorReadyRef.current = false
+    setColorReady(false)
+  }, [colorSourceChanged])
+
+  useEffect(() => {
+    const canvas = colorCanvasRef.current
+    // 色彩层创建失败（无 WebGL）时 colorStageRef 为 null，画面直接由 <video> 承担。
+    // 画布按媒体 key 重建（新元素 → 新 WebGL 上下文），通道切换复用同一画布与上下文
+    colorStageRef.current = canvas ? VideoColorStage.create(canvas) : null
+    return () => {
+      colorStageRef.current?.destroy()
+      colorStageRef.current = null
+    }
+  }, [media?.url])
+
+  useEffect(() => {
+    const stage = colorStageRef.current
+    if (!stage) return
+    colorTransformRef.current = resolveVideoColorTransform(
+      videoColorspace,
+      videoHeaderMatrix,
+      intrinsicWidth,
+      intrinsicHeight,
+    )
+    stage.setTransform(colorTransformRef.current)
+    // 暂停时没有新帧，矩阵变化必须主动重绘一次（源码 SetColorSpace 立即生效）
+    colorRedrawRef.current()
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- 只由 colorTransformKey 决定
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- 只由 colorTransformKey 决定
+  }, [colorTransformKey])
+
+  useEffect(() => {
+    const stage = colorStageRef.current
+    if (!stage) return
+    const video = wcActive ? null : videoRef.current
+    const source = video ?? wcCanvasRef.current
+    if (!source) return
+    stage.setSource(source)
+    stage.measure(intrinsicWidth, intrinsicHeight)
+    stage.setTransform(colorTransformRef.current)
+    let cancelled = false
+    let raf = 0
+    let handles: number[] = []
+    const draw = () => {
+      if (cancelled) return
+      if (stage.draw() && !colorReadyRef.current) {
+        colorReadyRef.current = true
+        setColorReady(true)
+      }
+    }
+    colorRedrawRef.current = draw
+    draw()
+    if (video && typeof video.requestVideoFrameCallback === 'function') {
+      // 新帧呈现即重绘（含暂停下 seek）：比 rAF 轮询精准且空闲时零开销
+      const onFrame = () => {
+        draw()
+        if (!cancelled) handles.push(video.requestVideoFrameCallback(onFrame))
+      }
+      handles.push(video.requestVideoFrameCallback(onFrame))
+      const onSeeked = () => draw()
+      video.addEventListener('seeked', onSeeked)
+      video.addEventListener('loadeddata', onSeeked)
+      return () => {
+        cancelled = true
+        colorRedrawRef.current = () => undefined
+        for (const handle of handles) video.cancelVideoFrameCallback(handle)
+        handles = []
+        video.removeEventListener('seeked', onSeeked)
+        video.removeEventListener('loadeddata', onSeeked)
+      }
+    }
+    const loop = () => {
+      draw()
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => {
+      cancelled = true
+      colorRedrawRef.current = () => undefined
+      cancelAnimationFrame(raf)
+    }
+  }, [colorSourceChanged, wcActive, intrinsicWidth, intrinsicHeight])
+
+
   useEffect(() => {
     if (!media?.url || media.dummy || media.syntheticAudio || wcActive) return
     const timer = window.setTimeout(() => {
@@ -3514,6 +3588,10 @@ export function PreviewPane({
 
   // 缩放框：外部 windowZoom 变化直接反映到显示值；用户输入存草稿
   const [zoomDraft, setZoomDraft] = useState<string | null>(null)
+  // 下拉列表开关（video_box.cpp wxComboBox 的 choices 弹出）；空间不足时向上弹
+  const [zoomMenuOpen, setZoomMenuOpen] = useState(false)
+  const [zoomMenuUp, setZoomMenuUp] = useState(false)
+  const zoomComboRef = useRef<HTMLDivElement>(null)
   const zoomText = zoomDraft ?? `${Math.round(windowZoom * 1000) / 10}%`
 
   const commitZoom = (text = zoomText) => {
@@ -3522,6 +3600,26 @@ export function PreviewPane({
     if (!Number.isFinite(value)) return
     onWindowZoomChange(Math.max(0.125, Math.min(3, value / 100)))
   }
+
+  const toggleZoomMenu = () => {
+    if (zoomMenuOpen) {
+      setZoomMenuOpen(false)
+      return
+    }
+    // 列表最高 260px；下方放不下时向上弹（wxComboBox 的屏幕边缘翻转）
+    const rect = zoomComboRef.current?.getBoundingClientRect()
+    setZoomMenuUp(rect ? window.innerHeight - rect.bottom < 264 : false)
+    setZoomMenuOpen(true)
+  }
+
+  useEffect(() => {
+    if (!zoomMenuOpen) return
+    const close = (event: PointerEvent) => {
+      if (!(event.target as HTMLElement).closest('.video-zoom-combo')) setZoomMenuOpen(false)
+    }
+    window.addEventListener('pointerdown', close)
+    return () => window.removeEventListener('pointerdown', close)
+  }, [zoomMenuOpen])
 
   const seek = (value: number) => {
     const clamped = Math.max(0, Math.min(durationMs || value, value))
@@ -3559,6 +3657,39 @@ export function PreviewPane({
     const video = videoRef.current
     const wcSource = wcSourceRef.current
     const frame = 1000 / 24
+    // video_context 命令（video_display.cpp）：命令层/热键经 mediaAction 送到预览区，
+    // 与右键菜单的本地路径共用同一实现
+    if (mediaAction.type.startsWith('video/frame/')) {
+      const kind = mediaAction.type.endsWith('/raw')
+        ? 'raw'
+        : mediaAction.type.endsWith('/subs')
+          ? 'subs'
+          : 'full'
+      if (mediaAction.type.startsWith('video/frame/save')) saveFrame(kind)
+      else if (mediaAction.type.startsWith('video/frame/copy')) void copyFrame(kind)
+      return
+    }
+    if (mediaAction.type === 'video/copy_coordinates') {
+      copyCoordinates()
+      return
+    }
+    // 透视子工具命令：必须在通用 video/tool/ 分支之前拦下（否则会把它当成视觉工具 id），
+    // 实际动作由 perspSubToolClick 之后的专用 effect 执行
+    if (mediaAction.type.startsWith('video/tool/perspective/')) return
+    // 矢量裁剪子工具（visual_tool_vector_clip.cpp）：命令 = 激活工具 + 选择子模式，
+    // 必须排在通用 video/tool/ 分支之前（否则会被当成视觉工具 id 直接 SetTool）
+    if (mediaAction.type.startsWith('video/tool/vclip/')) {
+      const mode = mediaAction.type
+      if (vclipActiveRef.current)
+        setVclip((current) =>
+          current ? { ...current, mode, dragStart: null, boxStart: null } : current,
+        )
+      else {
+        pendingVclipModeRef.current = mode
+        setVisualTool('video/tool/vector_clip')
+      }
+      return
+    }
     if (mediaAction.type.startsWith('video/tool/')) {
       // 外部命令流切换视觉工具
       // oxlint-disable-next-line react/set-state-in-effect
@@ -3646,7 +3777,10 @@ export function PreviewPane({
         break
     }
     // windowZoom/onWindowZoomChange 经 ref 读取且不入依赖：mediaAction 从不清除，
-    // 依赖它们会让过期 action（如 reset-pan）在每次窗口缩放变化时重放，锁死缩放
+    // 依赖它们会让过期 action（如 reset-pan）在每次窗口缩放变化时重放，锁死缩放；
+    // saveFrame/copyFrame/copyCoordinates 每轮重建，同理不入依赖
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [durationMs, media, mediaAction, onTimeChange, requestVideoSeek])
 
   const hitTest = (x: number, y: number): HitBox | null => {
@@ -3689,7 +3823,10 @@ export function PreviewPane({
     const fresh: VClipState = {
       inverse,
       spline,
-      mode: spline.curves.length ? 'video/tool/vclip/drag' : 'video/tool/vclip/line',
+      // 命令指定了子模式时优先（visual_tool_vector_clip.cpp SetSubTool），否则按样条状态
+      mode:
+        pendingVclipModeRef.current ??
+        (spline.curves.length ? 'video/tool/vclip/drag' : 'video/tool/vclip/line'),
       selected: new Set(),
       active: null,
       dragStart: null,
@@ -3697,6 +3834,7 @@ export function PreviewPane({
       boxStart: null,
       mouse: null,
     }
+    pendingVclipModeRef.current = null
     if (!vclipActiveRef.current) {
       vclipActiveRef.current = true
       setVclip(fresh)
@@ -3760,18 +3898,24 @@ export function PreviewPane({
     setPersp({ ...state })
   }
 
-  /** 子工具按钮：orgmode 一律触发 cycle（center→nofax→keep），其余异或切换 */
+  /** 子工具按钮：orgmode 按钮一律触发 cycle（center→nofax→keep），其余异或切换 */
   const perspSubToolClick = (id: string) => {
     const settings = perspRef.current?.settings ?? perspReadSettings()
-    if (id === 'video/tool/perspective/orgmode/center') {
-      // video/tool/perspective/orgmode/cycle
+    if (id.startsWith('video/tool/perspective/orgmode/')) {
       const mode = perspOrgModeBits(settings)
-      const nextMode =
+      const cycleMode =
         mode === PERSP_ORGMODE_CENTER
           ? PERSP_ORGMODE_NOFAX
           : mode === PERSP_ORGMODE_NOFAX
             ? PERSP_ORGMODE_KEEP
             : PERSP_ORGMODE_CENTER
+      // center（按钮语义）/ cycle = 循环；nofax / keep 直接设模式
+      const nextMode =
+        id === 'video/tool/perspective/orgmode/nofax'
+          ? PERSP_ORGMODE_NOFAX
+          : id === 'video/tool/perspective/orgmode/keep'
+            ? PERSP_ORGMODE_KEEP
+            : cycleMode
       perspSetSubTool((settings & ~PERSP_ORGMODE) | nextMode)
       return
     }
@@ -3783,6 +3927,21 @@ export function PreviewPane({
           : PERSP_GRID
     perspSetSubTool(settings ^ bit)
   }
+
+  // video/tool/perspective/* 命令入口（声明顺序在主 mediaAction effect 之后，故单列 effect；
+  // 主 effect 对这批 id 提前 return）。命令 = SetTool(Perspective) + SetSubTool(对应位)
+  const perspSubToolClickRef = useRef(perspSubToolClick)
+  useEffect(() => {
+    perspSubToolClickRef.current = perspSubToolClick
+  })
+  useEffect(() => {
+    if (!mediaAction.sequence || handledPerspActionRef.current === mediaAction.sequence) return
+    if (!mediaAction.type.startsWith('video/tool/perspective/')) return
+    handledPerspActionRef.current = mediaAction.sequence
+    // oxlint-disable-next-line react/set-state-in-effect
+    setVisualTool('video/tool/perspective')
+    perspSubToolClickRef.current(mediaAction.type)
+  }, [mediaAction])
 
   // 子工具条渲染值：工具未激活时回退读 OPT（与源码构造时 settings 读取一致）
   const perspSettings = persp?.settings ?? perspReadSettings()
@@ -4561,62 +4720,52 @@ export function PreviewPane({
 
   // ---- video_context 命令（video_display.cpp 右键菜单）----
 
-  /** 合成当前帧画布：full=视频+字幕 / raw=仅视频 / subs=仅字幕（透明背景） */
+  /** 合成当前帧画布（对齐源码 get_image：按视频分辨率输出；raw=无字幕 / subs=仅字幕透明底） */
   const buildFrameCanvas = (kind: 'full' | 'raw' | 'subs'): HTMLCanvasElement | null => {
-    const stage = stageRef.current
-    const overlay = canvasRef.current
-    if (!stage || !overlay) return null
-    const ratio = window.devicePixelRatio || 1
-    const cssWidth = Math.max(1, stage.clientWidth)
-    const cssHeight = Math.max(1, stage.clientHeight)
-
-    if (kind === 'subs' && !media?.dummy) {
-      // 真实视频：overlay 画布本身就是透明背景 + 字幕
-      const canvas = window.document.createElement('canvas')
-      canvas.width = overlay.width
-      canvas.height = overlay.height
-      canvas.getContext('2d')?.drawImage(overlay, 0, 0)
-      return canvas
-    }
-
+    const width = Math.max(1, Math.round(viewportIntrinsicWidth))
+    const height = Math.max(1, Math.round(viewportIntrinsicHeight))
     const canvas = window.document.createElement('canvas')
-    canvas.width = Math.round(cssWidth * ratio)
-    canvas.height = Math.round(cssHeight * ratio)
+    canvas.width = width
+    canvas.height = height
     const ctx = canvas.getContext('2d')
     if (!ctx) return null
-    ctx.setTransform(ratio, 0, 0, ratio, 0, 0)
 
-    if (media?.dummy) {
-      const rect = mediaRect()
-      if (kind === 'full') {
-        // dummy 的 overlay 已含背景与字幕
-        ctx.drawImage(overlay, 0, 0, cssWidth, cssHeight)
-      } else {
+    // 背景层：full/raw 需要视频帧；dummy 按 dummy 分辨率重绘背景（不包含交互层）
+    if (kind !== 'subs') {
+      if (media?.dummy) {
         ctx.fillStyle = '#000'
-        ctx.fillRect(0, 0, cssWidth, cssHeight)
-        const { width: vw, height: vh, color, pattern } = media.dummy
-        const s = Math.min(rect.width / vw, rect.height / vh)
-        drawDummyBackground(
-          ctx,
-          rect.left + (rect.width - vw * s) / 2,
-          rect.top + (rect.height - vh * s) / 2,
-          vw * s,
-          vh * s,
-          color,
-          pattern,
-          s,
-        )
+        ctx.fillRect(0, 0, width, height)
+        drawDummyBackground(ctx, 0, 0, width, height, media.dummy.color, media.dummy.pattern, 1)
+      } else if (videoRef.current) {
+        // 色彩层是实际显示面（已含 YCbCr Matrix 校正）→ 优先取它，否则退回原始帧
+        const source =
+          colorReady && colorCanvasRef.current ? colorCanvasRef.current : videoRef.current
+        ctx.drawImage(source, 0, 0, width, height)
+      } else if (wcActive && wcCanvasRef.current) {
+        // WebCodecs 通道没有 <video> 元素：帧画面在回退画布上（同样优先取色彩层）
+        const source =
+          colorReady && colorCanvasRef.current ? colorCanvasRef.current : wcCanvasRef.current
+        ctx.drawImage(source, 0, 0, width, height)
       }
+    }
+    if (kind === 'raw') return canvas
+
+    // 字幕层：libass 接管时叠 JASSUB canvas（透明底），否则用内置 drawCue 在视频坐标系重画
+    const assActive =
+      !!assRenderer && !assError && getOptionString('Subtitle/Provider') !== 'canvas' && hasVideo
+    if (assActive) {
+      assRenderer?.drawInto(ctx, 0, 0, width, height)
       return canvas
     }
-
-    // 真实视频：按显示框实际位置与尺寸绘制（含平移与内容缩放）
-    const video = videoRef.current
-    if (video) {
-      const rect = mediaRect()
-      ctx.drawImage(video, rect.left, rect.top, rect.width, rect.height)
+    const playResY = Number(document.scriptInfo.PlayResY) || 1080
+    const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
+    const active = document.cues.filter(
+      (cue) => !cue.comment && cue.startMs <= currentTimeMs && cue.endMs >= currentTimeMs,
+    )
+    for (const cue of active) {
+      const style = document.styles.find((item) => item.name === cue.style) ?? document.styles[0]
+      if (style) drawCue(ctx, width, height, cue.text, style, playResX, playResY)
     }
-    if (kind === 'full') ctx.drawImage(overlay, 0, 0, cssWidth, cssHeight)
     return canvas
   }
 
@@ -4627,9 +4776,13 @@ export function PreviewPane({
       if (!blob) return
       const url = URL.createObjectURL(blob)
       const anchor = window.document.createElement('a')
-      const stamp = Math.round(currentRef.current)
+      // video.cpp save_snapshot：<视频名去掉扩展名 | dummy>_<三位序号>_<当前帧>.png
+      const stem = media?.dummy
+        ? 'dummy'
+        : (media?.name.split('/').pop() ?? 'video').replace(/\.[^.]*$/, '') || 'video'
+      frameSaveSeqRef.current += 1
       anchor.href = url
-      anchor.download = `frame-${stamp}${kind === 'raw' ? '-raw' : kind === 'subs' ? '-subs' : ''}.png`
+      anchor.download = `${stem}_${String(frameSaveSeqRef.current).padStart(3, '0')}_${currentFrame}.png`
       anchor.click()
       URL.revokeObjectURL(url)
     }, 'image/png')
@@ -4942,7 +5095,6 @@ export function PreviewPane({
                     }
                     if (host.paused) requestVideoSeek(currentRef.current)
                   })
-                  probeVideoFps(event.currentTarget, media.url)
                 }}
                 onPlay={() => setPlaying(true)}
                 onPause={() => setPlaying(false)}
@@ -4997,6 +5149,19 @@ export function PreviewPane({
                 <Video size={28} aria-hidden="true" />
                 <span>{tPlain('Open media')}</span>
               </button>
+            )}
+            {media?.url && (
+              // 视频色彩层：显示面（opacity 0 直到首帧上传成功，此前露出底层 <video>）
+              <canvas
+                key={`color-${media.url}`}
+                ref={colorCanvasRef}
+                className="video-color-stage"
+                style={{
+                  width: `${mediaCssSize(intrinsicWidth)}px`,
+                  height: `${mediaCssSize(intrinsicHeight)}px`,
+                  opacity: colorReady ? 1 : 0,
+                }}
+              />
             )}
           </div>
           <canvas
@@ -5116,25 +5281,61 @@ export function PreviewPane({
           aria-label={tPlain('Time of this frame relative to start and end of current subs')}
           title={tPlain('Time of this frame relative to start and end of current subs')}
         />
-        <input
-          className="video-zoom"
-          list="video-zoom-options"
-          value={zoomText}
-          onChange={(event) => {
-            setZoomDraft(event.target.value)
-          }}
-          onBlur={() => commitZoom()}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') commitZoom(event.currentTarget.value)
-            if (event.key === 'Escape') setZoomDraft(null)
-          }}
-          aria-label={tPlain('Video zoom')}
-        />
-        <datalist id="video-zoom-options">
-          {Array.from({ length: 24 }, (_, i) => (
-            <option key={i} value={`${(i + 1) * 12.5}%`} />
-          ))}
-        </datalist>
+        <div className="video-zoom-combo" ref={zoomComboRef}>
+          <input
+            className="video-zoom"
+            value={zoomText}
+            onChange={(event) => {
+              setZoomDraft(event.target.value)
+            }}
+            onBlur={() => commitZoom()}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') commitZoom(event.currentTarget.value)
+              if (event.key === 'Escape') {
+                setZoomDraft(null)
+                setZoomMenuOpen(false)
+              }
+            }}
+            aria-label={tPlain('Video zoom')}
+          />
+          {/* video_box.cpp：wxComboBox 下拉箭头，choices = 12.5%..300%（1..24 × 12.5%） */}
+          <button
+            className="video-zoom-arrow"
+            aria-label={tPlain('Zoom levels')}
+            aria-haspopup="listbox"
+            aria-expanded={zoomMenuOpen}
+            onClick={toggleZoomMenu}
+          >
+            <ChevronDown size={12} />
+          </button>
+          {zoomMenuOpen && (
+            <div
+              className={`video-zoom-menu${zoomMenuUp ? ' up' : ''}`}
+              role="listbox"
+              aria-label={tPlain('Zoom levels')}
+            >
+              {Array.from({ length: 24 }, (_, index) => {
+                const value = (index + 1) * 0.125
+                return (
+                  <button
+                    className="video-zoom-option"
+                    role="option"
+                    aria-selected={Math.abs(windowZoom - value) < 0.0005}
+                    key={value}
+                    onClick={() => {
+                      setZoomDraft(null)
+                      setZoomMenuOpen(false)
+                      // video_display.cpp SetWindowZoomFromBox：(sel+1)*.125（无百分比换算误差）
+                      onWindowZoomChange(value)
+                    }}
+                  >
+                    {`${(index + 1) * 12.5}%`}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
       </div>
 
       {contextMenu && (

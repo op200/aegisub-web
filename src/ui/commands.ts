@@ -142,6 +142,35 @@ export const COMMANDS: Record<string, CommandInfo> = {
     label: 'Translation Assistant...',
     help: 'Open translation assistant',
   },
+  // 对话框内指令（tool.cpp 注册，无菜单项；快捷键页需要它们不是“无效命令”）
+  'tool/styling_assistant/commit': {
+    label: 'Accept changes',
+    help: 'Commit changes and move to the next line',
+  },
+  'tool/styling_assistant/preview': {
+    label: 'Preview changes',
+    help: 'Commit changes and stay on the current line',
+  },
+  'tool/translation_assistant/commit': {
+    label: 'Accept changes',
+    help: 'Commit changes and move to the next line',
+  },
+  'tool/translation_assistant/preview': {
+    label: 'Preview changes',
+    help: 'Commit changes and stay on the current line',
+  },
+  'tool/translation_assistant/next': {
+    label: 'Next Line',
+    help: 'Move to the next line without committing changes',
+  },
+  'tool/translation_assistant/prev': {
+    label: 'Previous Line',
+    help: 'Move to the previous line without committing changes',
+  },
+  'tool/translation_assistant/insert_original': {
+    label: 'Insert Original',
+    help: 'Insert the untranslated text',
+  },
   'tool/resampleres': {
     label: 'Resample Resolution...',
     help: 'Resample subtitles to maintain their current appearance at a different script resolution',
@@ -679,6 +708,10 @@ export const COMMANDS: Record<string, CommandInfo> = {
     help: 'Play the audio for the current line',
     shortcuts: { Audio: ['R'] },
   },
+  'audio/play/current': {
+    label: 'Play current audio selection',
+    help: 'Play the current audio selection, ignoring changes made while playing',
+  },
   'audio/play/selection/before': {
     label: 'Play 500 ms before selection',
     help: 'Play 500 ms before selection',
@@ -727,6 +760,18 @@ export const COMMANDS: Record<string, CommandInfo> = {
   'audio/go_to': {
     label: 'Go to selection',
     help: 'Scroll the audio display to center on the current audio selection',
+  },
+  'audio/go_to/start': {
+    label: 'Go to selection start',
+    help: 'Scroll the audio display to center on the start of current audio selection',
+  },
+  'audio/go_to/end': {
+    label: 'Go to selection end',
+    help: 'Scroll the audio display to center on the end of current audio selection',
+  },
+  'audio/commit/next': {
+    label: 'Commit and move to next line',
+    help: 'Commit any pending audio timing changes and move to the next line',
   },
   'audio/opt/autocommit': {
     label: 'Automatically commit all changes',

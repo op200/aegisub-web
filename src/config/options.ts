@@ -312,7 +312,9 @@ export const DEFAULT_CONFIG = {
   },
   Timing: { 'Default Duration': 3000 },
   Tool: {
-    Preferences: { Page: 0 },
+    'Kanji Timer': { Interpolation: true },
+    // Web 版偏离上游：首选项对话框可拖拽，尺寸持久化（0 = 未设置，使用 CSS 默认尺寸）
+    Preferences: { Page: 0, 'Dialog Width': 0, 'Dialog Height': 0 },
     'Style Editor': {
       Last: { Height: -1, Width: -1, X: -1, Y: -1 },
       Maximized: false,

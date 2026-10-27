@@ -143,7 +143,15 @@ function hex2(value: number): string {
 // YCbCr（libaegisub/ycbcr.h + ycbcr_conv.h）
 // ---------------------------------------------------------------------------
 
-export type YcbcrMatrix = 'Unspecified' | 'BT709' | 'FCC' | 'BT470BG' | 'SMPTE170M' | 'SMPTE240M'
+export type YcbcrMatrix =
+  | 'Unspecified'
+  | 'BT709'
+  | 'FCC'
+  | 'BT470BG'
+  | 'SMPTE170M'
+  | 'SMPTE240M'
+  | 'BT2020_NCL'
+  | 'BT2020_CL'
 export type YcbcrRange = 'Unspecified' | 'MPEG' | 'JPEG'
 
 export interface YcbcrColorspace {
@@ -274,6 +282,9 @@ const MATRIX_COEFFICIENTS: Partial<Record<YcbcrMatrix, [number, number, number]>
   BT470BG: [0.299, 0.587, 0.114],
   SMPTE170M: [0.299, 0.587, 0.114],
   SMPTE240M: [0.212, 0.701, 0.087],
+  // 2020 常量亮度变体按非恒定亮度近似（视频重绘用；字幕色转换不走这两种）
+  BT2020_NCL: [0.2627, 0.678, 0.0593],
+  BT2020_CL: [0.2627, 0.678, 0.0593],
 }
 
 type Matrix3x3 = [number, number, number, number, number, number, number, number, number]
@@ -321,8 +332,15 @@ function clampByte(v: number): number {
   return i > 255 ? 255 : i < 0 ? 0 : i
 }
 
-/** ycbcr_converter(src, dst)：rgb → src YCbCr → dst YCbCr → rgb（rgb_to_rgb） */
-export function createYcbcrConverter(src: YcbcrColorspace, dst: YcbcrColorspace): YcbcrConverter {
+/** rgb_to_rgb 的仿射形式：rgbOut = matrix · rgbIn + offset（0-255 域，未裁剪）。
+ *  视频重绘（media/videoColor.ts）需要未经截断的线性系数做 GLSL 变换 */
+export interface YcbcrAffine {
+  matrix: Matrix3x3
+  offset: [number, number, number]
+}
+
+/** ycbcr_converter(src, dst) 的仿射系数：rgb → src YCbCr → dst YCbCr → rgb */
+export function ycbcrAffine(src: YcbcrColorspace, dst: YcbcrColorspace): YcbcrAffine {
   const coeffSrc = MATRIX_COEFFICIENTS[src.matrix]
   const coeffDst = MATRIX_COEFFICIENTS[dst.matrix]
   if (!coeffSrc || !coeffDst) throw new Error('Unsupported colorspace conversion')
@@ -369,18 +387,39 @@ export function createYcbcrConverter(src: YcbcrColorspace, dst: YcbcrColorspace)
     shiftFrom = [-16, -128, -128]
   }
 
+  // 复合：fromYcbcr · toYcbcr 及 fromYcbcr · (shiftTo + shiftFrom)
+  const rows: Matrix3x3 = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 3; col++) {
+      rows[row * 3 + col] =
+        fromYcbcr[row * 3] * toYcbcr[col] +
+        fromYcbcr[row * 3 + 1] * toYcbcr[3 + col] +
+        fromYcbcr[row * 3 + 2] * toYcbcr[6 + col]
+    }
+  }
+  const shift: [number, number, number] = [
+    shiftTo[0] + shiftFrom[0],
+    shiftTo[1] + shiftFrom[1],
+    shiftTo[2] + shiftFrom[2],
+  ]
+  const offset: [number, number, number] = [
+    fromYcbcr[0] * shift[0] + fromYcbcr[1] * shift[1] + fromYcbcr[2] * shift[2],
+    fromYcbcr[3] * shift[0] + fromYcbcr[4] * shift[1] + fromYcbcr[5] * shift[2],
+    fromYcbcr[6] * shift[0] + fromYcbcr[7] * shift[1] + fromYcbcr[8] * shift[2],
+  ]
+  return { matrix: rows, offset }
+}
+
+/** ycbcr_converter(src, dst)：rgb → src YCbCr → dst YCbCr → rgb（rgb_to_rgb） */
+export function createYcbcrConverter(src: YcbcrColorspace, dst: YcbcrColorspace): YcbcrConverter {
+  const { matrix, offset } = ycbcrAffine(src, dst)
   return {
     rgbToRgb(color) {
-      const ycc = prod(toYcbcr, [color.r, color.g, color.b])
-      const rgb = prod(fromYcbcr, [
-        ycc[0] + shiftTo[0] + shiftFrom[0],
-        ycc[1] + shiftTo[1] + shiftFrom[1],
-        ycc[2] + shiftTo[2] + shiftFrom[2],
-      ])
+      const rgb = prod(matrix, [color.r, color.g, color.b])
       return {
-        r: clampByte(rgb[0] + 0.5),
-        g: clampByte(rgb[1] + 0.5),
-        b: clampByte(rgb[2] + 0.5),
+        r: clampByte(rgb[0] + offset[0] + 0.5),
+        g: clampByte(rgb[1] + offset[1] + 0.5),
+        b: clampByte(rgb[2] + offset[2] + 0.5),
         a: color.a,
       }
     },

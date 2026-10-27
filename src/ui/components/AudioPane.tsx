@@ -37,8 +37,10 @@ interface AudioPaneProps {
   onSeek: (timeMs: number) => void
   onVideoSeek: (timeMs: number) => void
   mediaAction: { sequence: number; type: string }
-  /** 双击网格行的 ScrollToActiveLine 请求（App nonce，Waveform 无条件滚到活动行） */
+  /** 双击网格行 / audio/go_to* 的 ScrollToActiveLine 请求（App nonce，Waveform 无条件滚动） */
   scrollToActiveLine: number
+  /** 滚动目标：range=活动行范围，start/end=把起点/终点居中（audio_box.cpp ScrollMode） */
+  scrollToActiveLineMode: 'range' | 'start' | 'end'
   onDurationChange: (durationMs: number) => void
   onPatchCue: (
     id: string,
@@ -477,6 +479,7 @@ export function AudioPane(props: AudioPaneProps) {
           playing={props.playing}
           autoScroll={options.autoScroll}
           scrollToActiveLine={props.scrollToActiveLine}
+          scrollToActiveLineMode={props.scrollToActiveLineMode}
           view={view}
           zoomLevel={zoomLevel}
           amplitude={amplitude}

@@ -39,6 +39,8 @@ export interface AssRenderer {
    * dummy = dummy 宽高），同时把 canvas 对齐到宿主内媒体元素的位置与尺寸。
    */
   render(timeMs: number, storageWidth: number, storageHeight: number): void
+  /** 把当前 libass canvas 合成到目标上下文（截图用：字幕层为透明底） */
+  drawInto(context: CanvasRenderingContext2D, dx: number, dy: number, dw: number, dh: number): void
   destroy(): void
 }
 
@@ -417,6 +419,9 @@ export async function createAssRenderer(
         height: storageHeight,
         mediaTime: timeMs / 1000,
       })
+    },
+    drawInto(context, dx, dy, dw, dh) {
+      context.drawImage(canvas, dx, dy, dw, dh)
     },
     destroy() {
       for (const timer of redrawTimers) clearTimeout(timer)

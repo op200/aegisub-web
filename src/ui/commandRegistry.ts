@@ -98,6 +98,8 @@ export interface CommandApi {
   openSyntheticAudio(kind: SyntheticAudioKind): void
   setVideoTime(value: number): void
   setAudioTime(value: number): void
+  /** audio/go_to*：滚动音频显示到活动行范围/起点/终点（audio_box.cpp ScrollToActiveLine） */
+  scrollAudioToSelection(mode: 'range' | 'start' | 'end'): void
   setStatus(message: string): void
   sendVideoAction(type: string): void
   sendAudioAction(type: string): void
@@ -154,6 +156,20 @@ export const editCursorState: { selectionStart: number; selectionEnd: number } =
   selectionStart: 0,
   selectionEnd: 0,
 }
+
+/**
+ * 字幕编辑框命令桥（command/edit.cpp 的 edit/clear、edit/revert、edit/font、
+ * edit/style/* 等）：这些命令作用于编辑框的本地草稿与光标，由 EditPanel 每轮渲染
+ * 注册当前实现；未挂载或无活动行时为空，命令按 no-op 处理。
+ */
+export const editBoxActions: {
+  clear?: () => void
+  clearText?: () => void
+  revert?: () => void
+  insertOriginal?: () => void
+  font?: () => void
+  toggleStyle?: (key: 'b' | 'i' | 'u' | 's') => void
+} = {}
 
 function cueData(cue: SubtitleCue): Omit<SubtitleCue, 'id'> {
   const clone = structuredClone(cue) as Omit<SubtitleCue, 'id'> & { id?: string }
@@ -277,6 +293,44 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   'edit/color/secondary': { run: (_, api) => api.openStyleManager() },
   'edit/color/outline': { run: (_, api) => api.openStyleManager() },
   'edit/color/shadow': { run: (_, api) => api.openStyleManager() },
+  // command/edit.cpp 的编辑框本地命令（Clear/Revert/Font/样式切换）：实现在 EditPanel，
+  // 经 editBoxActions 桥接，热键与右键菜单均可触发
+  'edit/clear': {
+    run: () => editBoxActions.clear?.(),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'edit/clear/text': {
+    run: () => editBoxActions.clearText?.(),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'edit/revert': {
+    run: () => editBoxActions.revert?.(),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'edit/insert_original': {
+    run: () => editBoxActions.insertOriginal?.(),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'edit/font': {
+    run: () => editBoxActions.font?.(),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'edit/style/bold': {
+    run: () => editBoxActions.toggleStyle?.('b'),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'edit/style/italic': {
+    run: () => editBoxActions.toggleStyle?.('i'),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'edit/style/underline': {
+    run: () => editBoxActions.toggleStyle?.('u'),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'edit/style/strikeout': {
+    run: () => editBoxActions.toggleStyle?.('s'),
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
 
   // ---- 行插入/编辑 ----
   'subtitle/insert/before': {
@@ -543,6 +597,25 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
         )
     },
   },
+  'time/lead/both': {
+    // time.cpp time_add_lead_both：AddLeadIn + AddLeadOut
+    run: (ctx, api) => {
+      if (ctx.activeCue)
+        void api.apply(
+          [
+            {
+              type: 'updateCue',
+              id: ctx.activeCue.id,
+              patch: {
+                startMs: Math.max(0, ctx.activeCue.startMs - getOptionInt('Audio/Lead/IN')),
+                endMs: ctx.activeCue.endMs + getOptionInt('Audio/Lead/OUT'),
+              },
+            },
+          ],
+          'timing',
+        )
+    },
+  },
   'time/start/decrease': {
     run: (ctx, api) => {
       if (ctx.activeCue)
@@ -551,7 +624,8 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
             {
               type: 'updateCue',
               id: ctx.activeCue.id,
-              patch: { startMs: Math.max(0, ctx.activeCue.startMs - 100) },
+              // AudioTimingControllerDialogue::ModifyStart：delta*10（10 ms/步）
+              patch: { startMs: Math.max(0, ctx.activeCue.startMs - 10) },
             },
           ],
           'timing',
@@ -567,7 +641,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
             {
               type: 'updateCue',
               id: ctx.activeCue.id,
-              patch: { startMs: Math.min(ctx.activeCue.endMs, ctx.activeCue.startMs + 100) },
+              patch: { startMs: Math.min(ctx.activeCue.endMs, ctx.activeCue.startMs + 10) },
             },
           ],
           'timing',
@@ -583,7 +657,25 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
             {
               type: 'updateCue',
               id: ctx.activeCue.id,
-              patch: { endMs: ctx.activeCue.endMs + 100 },
+              // AudioTimingControllerDialogue::ModifyLength：delta*10（10 ms/步）
+              patch: { endMs: ctx.activeCue.endMs + 10 },
+            },
+          ],
+          'timing',
+        )
+    },
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'time/length/increase/shift': {
+    // time.cpp time_length_increase_shift：对话定时器的 ModifyLength 忽略 shift 标志
+    run: (ctx, api) => {
+      if (ctx.activeCue)
+        void api.apply(
+          [
+            {
+              type: 'updateCue',
+              id: ctx.activeCue.id,
+              patch: { endMs: ctx.activeCue.endMs + 10 },
             },
           ],
           'timing',
@@ -599,7 +691,23 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
             {
               type: 'updateCue',
               id: ctx.activeCue.id,
-              patch: { endMs: Math.max(ctx.activeCue.startMs, ctx.activeCue.endMs - 100) },
+              patch: { endMs: Math.max(ctx.activeCue.startMs, ctx.activeCue.endMs - 10) },
+            },
+          ],
+          'timing',
+        )
+    },
+    enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'time/length/decrease/shift': {
+    run: (ctx, api) => {
+      if (ctx.activeCue)
+        void api.apply(
+          [
+            {
+              type: 'updateCue',
+              id: ctx.activeCue.id,
+              patch: { endMs: Math.max(ctx.activeCue.startMs, ctx.activeCue.endMs - 10) },
             },
           ],
           'timing',
@@ -832,6 +940,68 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     run: (_, api) => api.sendVideoAction('reset-pan'),
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
+  // video_display.cpp 右键菜单：截图/复制由 PreviewPane 合成当前帧（含 WebCodecs 通道）
+  'video/frame/save': {
+    run: (_, api) => api.sendVideoAction('video/frame/save'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/frame/save/raw': {
+    run: (_, api) => api.sendVideoAction('video/frame/save/raw'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/frame/save/subs': {
+    run: (_, api) => api.sendVideoAction('video/frame/save/subs'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/frame/copy': {
+    run: (_, api) => api.sendVideoAction('video/frame/copy'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/frame/copy/raw': {
+    run: (_, api) => api.sendVideoAction('video/frame/copy/raw'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/frame/copy/subs': {
+    run: (_, api) => api.sendVideoAction('video/frame/copy/subs'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/copy_coordinates': {
+    run: (_, api) => api.sendVideoAction('video/copy_coordinates'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  // visual_tool_vector_clip.cpp：子工具命令 = 激活矢量裁剪工具 + 选择子模式
+  'video/tool/vclip/drag': {
+    run: (_, api) => api.sendVideoAction('video/tool/vclip/drag'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/vclip/line': {
+    run: (_, api) => api.sendVideoAction('video/tool/vclip/line'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/vclip/bicubic': {
+    run: (_, api) => api.sendVideoAction('video/tool/vclip/bicubic'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/vclip/convert': {
+    run: (_, api) => api.sendVideoAction('video/tool/vclip/convert'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/vclip/insert': {
+    run: (_, api) => api.sendVideoAction('video/tool/vclip/insert'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/vclip/remove': {
+    run: (_, api) => api.sendVideoAction('video/tool/vclip/remove'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/vclip/freehand': {
+    run: (_, api) => api.sendVideoAction('video/tool/vclip/freehand'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/vclip/freehand_smooth': {
+    run: (_, api) => api.sendVideoAction('video/tool/vclip/freehand_smooth'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
   'video/tool/cross': { run: (_, api) => api.sendVideoAction('video/tool/cross') },
   'video/tool/drag': { run: (_, api) => api.sendVideoAction('video/tool/drag') },
   'video/tool/rotate/z': { run: (_, api) => api.sendVideoAction('video/tool/rotate/z') },
@@ -840,6 +1010,35 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   'video/tool/scale': { run: (_, api) => api.sendVideoAction('video/tool/scale') },
   'video/tool/clip': { run: (_, api) => api.sendVideoAction('video/tool/clip') },
   'video/tool/vector_clip': { run: (_, api) => api.sendVideoAction('video/tool/vector_clip') },
+  // visual_tool_perspective.cpp：子工具命令 = 激活透视工具 + 切换对应位（orgmode 设置模式/循环）
+  'video/tool/perspective/plane': {
+    run: (_, api) => api.sendVideoAction('video/tool/perspective/plane'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/perspective/lock_outer': {
+    run: (_, api) => api.sendVideoAction('video/tool/perspective/lock_outer'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/perspective/grid': {
+    run: (_, api) => api.sendVideoAction('video/tool/perspective/grid'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/perspective/orgmode/center': {
+    run: (_, api) => api.sendVideoAction('video/tool/perspective/orgmode/center'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/perspective/orgmode/nofax': {
+    run: (_, api) => api.sendVideoAction('video/tool/perspective/orgmode/nofax'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/perspective/orgmode/keep': {
+    run: (_, api) => api.sendVideoAction('video/tool/perspective/orgmode/keep'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
+  'video/tool/perspective/orgmode/cycle': {
+    run: (_, api) => api.sendVideoAction('video/tool/perspective/orgmode/cycle'),
+    enabled: (ctx) => Boolean(ctx.videoMedia),
+  },
 
   // ---- 音频 ----
   'audio/open': { run: (_, api) => void api.openAudio() },
@@ -865,7 +1064,8 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     run: (ctx, api) => {
       if (!ctx.activeCue) return
       api.setStatus('Line committed')
-      if (ctx.audioOptions.autoNext) api.moveSelection(1)
+      // AudioTimingController::Next(LINE) → grid/line/next/create
+      if (ctx.audioOptions.autoNext) api.moveSelectionOrCreate()
     },
   },
   'audio/commit/default': {
@@ -875,6 +1075,15 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   'audio/commit/stay': {
     run: (_, api) => api.setStatus('Line committed'),
     enabled: (ctx) => Boolean(ctx.activeCue),
+  },
+  'audio/commit/next': {
+    // audio.cpp audio_commit_next：Commit + Next(LINE)（到末尾时新建行）
+    run: (ctx, api) => {
+      if (!ctx.activeCue) return
+      api.setStatus('Line committed')
+      api.moveSelectionOrCreate()
+    },
+    enabled: (ctx) => Boolean(ctx.audioMedia),
   },
   'audio/save/clip': {
     // audio.cpp：把选中行的时间段导出为 wav
@@ -916,6 +1125,16 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
       if (ctx.activeCue) {
         api.setAudioTime(ctx.activeCue.startMs)
         api.sendAudioAction('play-line')
+      }
+    },
+    enabled: (ctx) => Boolean(ctx.audioMedia),
+  },
+  'audio/play/current': {
+    // audio.cpp audio_play_current_selection：PlayRange(GetPrimaryPlaybackRange())
+    run: (ctx, api) => {
+      if (ctx.activeCue) {
+        api.setAudioTime(ctx.activeCue.startMs)
+        api.sendAudioAction('play-selection')
       }
     },
     enabled: (ctx) => Boolean(ctx.audioMedia),
@@ -977,8 +1196,19 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     enabled: (ctx) => Boolean(ctx.audioMedia && ctx.audioPlaying),
   },
   'audio/go_to': {
+    // audio_box.cpp ScrollToActiveLine(Range)：滚动音频显示居中活动行范围
     run: (ctx, api) => {
-      if (ctx.activeCue) api.setAudioTime(ctx.activeCue.startMs)
+      if (ctx.activeCue) api.scrollAudioToSelection('range')
+    },
+  },
+  'audio/go_to/start': {
+    run: (ctx, api) => {
+      if (ctx.activeCue) api.scrollAudioToSelection('start')
+    },
+  },
+  'audio/go_to/end': {
+    run: (ctx, api) => {
+      if (ctx.activeCue) api.scrollAudioToSelection('end')
     },
   },
   'audio/opt/spectrum': {

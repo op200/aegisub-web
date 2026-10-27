@@ -1,4 +1,12 @@
-import { memo, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react'
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent,
+} from 'react'
 
 import {
   getOptionBool,
@@ -30,7 +38,7 @@ import {
   type AssSyntaxType,
 } from '../assHighlight'
 import { assColorToHex } from '../color'
-import { editCursorState } from '../commandRegistry'
+import { editBoxActions, editCursorState } from '../commandRegistry'
 import { COMMANDS, commandTooltip } from '../commands'
 import { tPlain } from '../i18n'
 import { LUA_BLOCK_BACKGROUND, LUA_BLOCK_CARET } from '../luaHighlight'
@@ -127,6 +135,21 @@ function offsetInBackedSegment(segments: AssHighlightSegment[], offset: number):
   }
   // 光标在文本末尾（最后一段的尾边缘）：按最后一段判定
   return segments.length > 0 && segments[segments.length - 1].background !== undefined
+}
+
+/** 最后一行文字（不含其下方空白）的底边，坐标系 = pre 内边距盒（含 padding）。pre 与
+ *  textarea 同字体/同宽/同滚动，故等价于 textarea 的文字底边；空文本无行盒返回 -Infinity */
+function lastTextLineBottom(pre: HTMLPreElement): number {
+  const range = document.createRange()
+  range.selectNodeContents(pre)
+  const preRect = pre.getBoundingClientRect()
+  let bottom = -Infinity
+  for (const rect of range.getClientRects()) {
+    // 空 span / 换行字符会产生零宽零高或零宽满高的伪行盒，跳过它们
+    if (rect.width > 0 && rect.height > 0)
+      bottom = Math.max(bottom, rect.bottom - preRect.top - pre.clientTop + pre.scrollTop)
+  }
+  return bottom
 }
 
 /** 选区覆盖色（CSS 变量）：与 textarea 的半透明选区叠色后恰为 VS Code 选区色 (39,80,119) */
@@ -1182,6 +1205,34 @@ export function EditPanel({
     editor.setSelectionRange(start, end, pos === start && start !== end ? 'backward' : 'forward')
     reportTextSelection(editor, onTextSelection)
   }, [historyNonce, textSelection, onTextSelection])
+  // edit/clear、edit/revert、edit/font、edit/style/* 等编辑框本地命令的实现注册（command/edit.cpp）：
+  // 每轮渲染刷新，保证命令层取到当前草稿与光标；无活动行时清空（命令按 no-op 处理）。
+  // 回调里引用的 commitText/toggleOverrideTag 等定义在本函数后段，effect 在渲染结束后才执行
+  useLayoutEffect(() => {
+    if (!cue || !draft) {
+      editBoxActions.clear = undefined
+      editBoxActions.clearText = undefined
+      editBoxActions.revert = undefined
+      editBoxActions.insertOriginal = undefined
+      editBoxActions.font = undefined
+      editBoxActions.toggleStyle = undefined
+      return
+    }
+    editBoxActions.clear = () => commitText('', 'clear line')
+    editBoxActions.clearText = () => commitText(stripPlainText(draft.text), 'clear line')
+    editBoxActions.revert = () => commitText(originalText, 'revert line')
+    editBoxActions.insertOriginal = () => {
+      const editor = editorRef.current
+      const start = editor?.selectionStart ?? draft.text.length
+      const end = editor?.selectionEnd ?? start
+      commitText(
+        `${draft.text.slice(0, start)}${originalText}${draft.text.slice(end)}`,
+        'insert original',
+      )
+    }
+    editBoxActions.font = openFontPicker
+    editBoxActions.toggleStyle = toggleOverrideTag
+  })
   /** 编辑框的提交合并槽（subs_edit_box.cpp 的 commit_id + last_commit_type / last_time_commit_type）：
    *  只有描述未变（时间修改按字段细分）才回传上次提交（amend），否则开新撤销点；行 id 参与 key
    *  以复现 OnActiveLineChanged 切行重置 commit_id 的行为 */
@@ -1308,9 +1359,10 @@ export function EditPanel({
   }
   /** command/edit.cpp toggle_override_tag：光标处读取当前状态后真实切换；
    *  有选区时首尾各写一个标签（state?0:1 … state?1:0），无选区只写光标处一个 */
-  const toggleOverrideTag = (key: StyleToggleKey) => {
+  // 函数声明（提升）：editBoxActions 注册 effect 位于提前 return 之前，需要能引用它们
+  function toggleOverrideTag(key: StyleToggleKey) {
     const editor = editorRef.current
-    if (!editor) return
+    if (!editor || !draft) return
     const { tag, field, label } = STYLE_TOGGLES[key]
     const selStart = editor.selectionStart
     const selEnd = editor.selectionEnd
@@ -1345,7 +1397,8 @@ export function EditPanel({
       highlightRef.current.scrollLeft = editorRef.current.scrollLeft
     }
   }
-  const commitText = (text: string, label: string) => {
+  function commitText(text: string, label: string) {
+    if (!cue) return
     setDraft((old) => (old ? { ...old, text } : old))
     // subs_edit_box.cpp:CommitText 传 amend=true → 同描述的连续文本提交合并
     onCommit({ text }, label, commitAmend(`${cue.id}:${label}`, true))
@@ -1385,7 +1438,8 @@ export function EditPanel({
     )
   }
   // edit/font（command/edit.cpp）：与光标处有效字体逐项比较，仅写有差异的标签
-  const openFontPicker = () => {
+  function openFontPicker() {
+    if (!draft) return
     const editor = editorRef.current
     const selStart = editor ? editor.selectionStart : draft.text.length
     const font = effectiveFontAt(draft.text, normalizePos(draft.text, selStart))
@@ -1466,6 +1520,29 @@ export function EditPanel({
   const trackCursor = (element: HTMLTextAreaElement) => {
     reportTextSelection(element, onTextSelection)
     applyCaretColor(element)
+  }
+  // 源码 SubsTextEditCtrl（Scintilla）在文字下方空白处按下时把插入点钳到文档末尾；
+  // 浏览器 textarea 会把点击横坐标映射到最后一行 → 光标落进最后一行中间。这里拦下
+  // 无修饰键的主键按下（带修饰键的点击保持原生行为）
+  const onEditorMouseDown = (event: MouseEvent<HTMLTextAreaElement>) => {
+    if (event.button !== 0 || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey)
+      return
+    const editor = event.currentTarget
+    const pre = highlightRef.current
+    if (!pre) return
+    // 滚动条与边框不属于文字区：在滚动条上按下不能触发末尾定位
+    const rect = editor.getBoundingClientRect()
+    if (
+      event.clientX >= rect.left + editor.clientLeft + editor.clientWidth ||
+      event.clientY >= rect.top + editor.clientTop + editor.clientHeight
+    )
+      return
+    const contentY = event.clientY - rect.top - editor.clientTop + editor.scrollTop
+    if (contentY < lastTextLineBottom(pre)) return
+    event.preventDefault()
+    editor.focus()
+    editor.setSelectionRange(editor.value.length, editor.value.length)
+    trackCursor(editor)
   }
   const pasteIntoEditor = async () => {
     const editor = editorRef.current
@@ -1601,6 +1678,7 @@ export function EditPanel({
           spellCheck={false}
           style={editorStyle}
           onFocus={() => setEditingField('text')}
+          onMouseDown={onEditorMouseDown}
           onBlur={(event) => {
             if (editingField === 'text') setEditingField(null)
             // 失焦后浏览器不再画选区，底纹段的选中色要还原

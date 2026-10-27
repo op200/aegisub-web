@@ -86,6 +86,14 @@ export function parseDialogueBlocks(text: string): DialogueBlock[] {
   return blocks
 }
 
+/** AssDialogue::GetStrippedText：仅保留 plain 块（override/comment/drawing 全部剔除） */
+export function strippedText(text: string): string {
+  return parseDialogueBlocks(text)
+    .filter((block) => block.type === 'plain')
+    .map((block) => block.text)
+    .join('')
+}
+
 /** agi::unicode::is_whitespace：全部字符为 Unicode 空白（空串同样为 true） */
 export function isUnicodeWhitespace(text: string): boolean {
   return /^\s*$/u.test(text)

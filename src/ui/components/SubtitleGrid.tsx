@@ -121,15 +121,23 @@ function gridFontSize(): number {
   return Math.round((getOptionInt('Subtitle/Grid/Font Size') * 4) / 3)
 }
 
-/** 网格字体（Subtitle/Grid/Font Face + Font Size；9pt → 12px） */
-function gridFont(): string {
+/** 网格字体族（源码 base_grid.cpp UpdateStyle 的 `font = *wxNORMAL_FONT`：Face 为空时
+ * 用系统 UI 字体（system-ui，中文 Windows 下即微软雅黑 UI），不用硬编码的 Segoe UI） */
+function gridFontFamily(): string {
   const face = getOptionString('Subtitle/Grid/Font Face')
-  return `${gridFontSize()}px ${face ? `"${face}", ` : ''}'Segoe UI', 'Microsoft YaHei UI', sans-serif`
+  return face
+    ? `"${face}", system-ui, 'Microsoft YaHei UI', sans-serif`
+    : `system-ui, 'Microsoft YaHei UI', sans-serif`
 }
 
-/** 表头字体（.subtitle-grid-header：12px/600，继承全局字体栈，不随 Font Size 选项） */
+/** 网格字体（Subtitle/Grid/Font Face + Font Size；9pt → 12px） */
+function gridFont(): string {
+  return `${gridFontSize()}px ${gridFontFamily()}`
+}
+
+/** 表头字体（.subtitle-grid-header：12px/600，跟随系统 UI 字体，不随 Font Size 选项） */
 function headerFont(): string {
-  return `600 12px 'Segoe UI', 'Microsoft YaHei UI', Arial, sans-serif`
+  return `600 12px ${gridFontFamily()}`
 }
 
 let measureCtx: CanvasRenderingContext2D | null = null
@@ -165,7 +173,7 @@ function textWidth(text: string, font: string): number {
 /**
  * 网格字符高度（源码 base_grid.cpp UpdateStyle：dc.GetCharHeight()）。
  * Chromium 的 line-height:normal 行盒高 == fontBoundingBoxAscent + fontBoundingBoxDescent
- * （12px Segoe UI 实测 13 + 3 = 16，与 wxMSW GetCharHeight 一致）；度量不可用时退回字号。
+ * （12px 系统 UI 字体实测 12 + 3 = 15）；度量不可用时退回字号。
  */
 function gridCharHeight(): number {
   if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d')
@@ -967,7 +975,10 @@ export function SubtitleGrid({
   return (
     <section className="grid-panel" aria-label={tPlain('Subtitle lines')}>
       <div className="subtitle-grid-scroll" ref={scrollHostRef}>
-        <div className="subtitle-grid-minwidth" style={{ minWidth: fixedWidth }}>
+        <div
+          className="subtitle-grid-minwidth"
+          style={{ minWidth: fixedWidth, fontFamily: gridFontFamily() }}
+        >
           {/* 源码 base_grid.cpp 无任何 SetToolTip：网格文本单元格与表头的 hover 提示已移除；
               列 description 仅用于表头右键「列显隐」菜单项文案 */}
           <div

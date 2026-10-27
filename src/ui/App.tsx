@@ -39,6 +39,7 @@ import { hasStyleOverride } from '../core/assTags'
 import { CoreClient } from '../core/client'
 import { createDocument } from '../core/defaults'
 import { exportSubtitle } from '../core/format'
+import type { YcbcrColorspace } from '../core/resample'
 import {
   compileMatcher,
   findNext as findNextMatch,
@@ -57,7 +58,8 @@ import {
   serializeTimecodes,
   serializeTimecodesKeepOffset,
 } from '../core/vfr'
-import { extractVideoKeyframes } from '../media/demux'
+import { extractVideoKeyframes, probeVideoInfo } from '../media/demux'
+import { parseContainerColorspace } from '../media/videoColor'
 import { BrowserHostAdapter, MEDIA_FILE_TYPES, SUBTITLE_FILE_TYPES } from '../platform/browserHost'
 import { createNativeHostAdapter } from '../platform/nativeHost'
 import type { AppFileHandle, HostAdapter, MediaSource } from '../platform/types'
@@ -125,6 +127,7 @@ import {
 } from './components/dialogs'
 import { EditPanel } from './components/EditPanel'
 import { FileManagerDialog } from './components/FileManagerDialog'
+import { KanjiTimerDialog } from './components/KanjiTimerDialog'
 import { LogPanel } from './components/LogPanel'
 import { MenuBar } from './components/MenuBar'
 import { PreferencesDialog } from './components/PreferencesDialog'
@@ -273,6 +276,12 @@ export function App() {
   const [videoMedia, setVideoMedia] = useState<MediaSource | null>(null)
   const [audioMedia, setAudioMedia] = useState<MediaSource | null>(null)
   const [videoDurationMs, setVideoDurationMs] = useState(0)
+  // 视频自身色彩空间（容器标记；对应 FFMS2 解码帧的 ColorSpace/ColorRange）。
+  // 未标记为 Unspecified，由 ycbcr.cpp 的 guess_colorspace 按分辨率补全
+  const [videoColorspace, setVideoColorspace] = useState<YcbcrColorspace>({
+    matrix: 'Unspecified',
+    range: 'Unspecified',
+  })
   // Video/Default Zoom：预设 0..23 → 缩放 (n+1)/8（7 → 100%）
   const [videoWindowZoom, setVideoWindowZoom] = useState(
     () => (getOptionInt('Video/Default Zoom') + 1) / 8,
@@ -327,7 +336,10 @@ export function App() {
   const [videoAction, setVideoAction] = useState({ sequence: 0, type: '' })
   const [audioAction, setAudioAction] = useState({ sequence: 0, type: '' })
   // 双击网格行的音频 ScrollToActiveLine 请求（audio_box.cpp，nonce 递增触发 Waveform 滚动）
-  const [audioScrollRequest, setAudioScrollRequest] = useState(0)
+  const [audioScrollRequest, setAudioScrollRequest] = useState<{
+    seq: number
+    mode: 'range' | 'start' | 'end'
+  }>({ seq: 0, mode: 'range' })
   // 状态栏消息（CreateStatusBar(2) 右字段 = field 1）。Aegisub 所有临时消息都走
   // FrameMain::StatusTimeout(text, ms=10000)：显示后由 ID_APP_TIMER_STATUSCLEAR 定时器
   // 清空（OnStatusClear → SetStatusText("", 1)）；左字段（field 0）源码从不写入
@@ -1329,6 +1341,7 @@ export function App() {
     setVideoDurationMs(0)
     setDetectedFps(null) // 新视频重新探测帧率
     setVideoFrameTimes(null) // 新视频重新扫描逐帧时间码表
+    setVideoColorspace({ matrix: 'Unspecified', range: 'Unspecified' })
     // 关键帧后台扫描（project.cpp：视频 provider 建索引提供 keyframes——是文件属性，
     // 与解码路径无关；原生 <video> 拿不到 chunk 类型，必须独立解复用扫描）。
     // ffindex 索引缓存对应物：同 crc32_大小_修改时间 的文件命中 IndexedDB 缓存免扫描
@@ -1348,6 +1361,13 @@ export function App() {
         setVideoOffsetNotice({ offsetMs, frameDurationMs: 1000 / fps })
     }
     if (scanFile) {
+      // 视频流头信息（容器标称帧率 + 色彩空间）：源码的帧率/矩阵来自 FFMS2 索引读到的流属性。
+      // 不在此播放采样——否则载入时会"自动播放约一秒再回第一帧"
+      void probeVideoInfo(scanFile).then((info) => {
+        if (keyframeScanIdRef.current !== scanId || !info) return
+        if (info.fps >= 5 && info.fps <= 240) setDetectedFps(info.fps)
+        setVideoColorspace(parseContainerColorspace(info.colorSpace, info.colorRange))
+      })
       const scan: NonNullable<typeof videoScanRef.current> = {
         id: scanId,
         promise: null as unknown as Promise<void>,
@@ -1421,6 +1441,7 @@ export function App() {
     keyframeScanIdRef.current += 1 // 作废后台扫描
     setVideoKeyframeTimes([])
     setVideoFrameTimes(null)
+    setVideoColorspace({ matrix: 'Unspecified', range: 'Unspecified' })
     // project.cpp DoCloseVideo：无外部文件时回退为空关键帧/未加载 timecodes
     if (!keyframesFromFile) setKeyframes([])
     if (!timecodesFromFile) {
@@ -2070,6 +2091,8 @@ export function App() {
     },
     setVideoTime: setVideoTimeMs,
     setAudioTime: setAudioTimeMs,
+    scrollAudioToSelection: (mode) =>
+      setAudioScrollRequest((current) => ({ seq: current.seq + 1, mode })),
     setStatus,
     sendVideoAction,
     sendAudioAction,
@@ -2361,6 +2384,7 @@ export function App() {
               onDetectedFps={setDetectedFps}
               onPlaybackModeChange={setVideoPlaybackMode}
               decoderOverride={videoDecoderOverride}
+              videoColorspace={videoColorspace}
               playbackGain={playbackGain}
               onKeyframesChange={(list) => {
                 // WebCodecs 读流上报的也是时间（ms）；统一走派生换算，文件关键帧优先。
@@ -2414,7 +2438,8 @@ export function App() {
                 onSeek={setAudioTimeMs}
                 onVideoSeek={setVideoTimeMs}
                 mediaAction={audioAction}
-                scrollToActiveLine={audioScrollRequest}
+                scrollToActiveLine={audioScrollRequest.seq}
+                scrollToActiveLineMode={audioScrollRequest.mode}
                 onDurationChange={setAudioDurationMs}
                 onCommand={executeCommand}
                 onPlaybackGainChange={setPlaybackGain}
@@ -2518,7 +2543,7 @@ export function App() {
             // base_grid.cpp 双击：audioBox->ScrollToActiveLine()（无条件，不受
             // Audio/Auto/Scroll 开关限制）+ videoController->JumpToTime(dlg->Start)
             // （START 帧语义）
-            setAudioScrollRequest((n) => n + 1)
+            setAudioScrollRequest((current) => ({ seq: current.seq + 1, mode: 'range' }))
             seekVideoToLineStart(cue.startMs)
           }}
           // alt+方向键仅移活动行：锚点行随活动行更新（OnActiveLineChanged → extendRow）
@@ -2789,6 +2814,8 @@ export function App() {
           durationMs={videoDurationMs}
           fps={frameRate.isLoaded() ? frameRate.fps() : null}
           frameCount={frameCount}
+          width={videoIntrinsicSize.width}
+          height={videoIntrinsicSize.height}
           onClose={() => setDialog(null)}
         />
       )}
@@ -2801,6 +2828,15 @@ export function App() {
       {dialog === 'properties' && core && (
         <ScriptPropertiesDialog
           scriptInfo={core.document.scriptInfo}
+          video={
+            videoMedia && !videoMedia.dummy
+              ? {
+                  width: videoIntrinsicSize.width,
+                  height: videoIntrinsicSize.height,
+                  colorspace: videoColorspace,
+                }
+              : null
+          }
           onClose={() => setDialog(null)}
           onApply={(patch) =>
             void apply([{ type: 'updateScriptInfo', patch }], tPlain('property changes'))
@@ -2908,13 +2944,12 @@ export function App() {
           onApply={(commands, label) => void apply(commands, label)}
         />
       )}
-      {dialog === 'kanji-timer' && (
-        <ToolInfoDialog
-          title={tPlain('Kanji Timer')}
-          message={tPlain(
-            'Kanji timing requires paired source and destination karaoke lines. Select the lines in Aegisub desktop for the complete matcher workflow.',
-          )}
+      {dialog === 'kanji-timer' && core && (
+        <KanjiTimerDialog
+          cues={core.document.cues}
+          styles={core.document.styles.map((style) => style.name)}
           onClose={() => setDialog(null)}
+          onApply={(commands, label) => void apply(commands, label)}
         />
       )}
       {dialog === 'spellcheck' && (
