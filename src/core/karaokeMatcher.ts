@@ -5,8 +5,8 @@
  * 逐字符操作与 ICU character BreakIterator 一致（Intl.Segmenter grapheme）。
  */
 
-import type { KaraokeSyllable } from './karaoke'
 import { kanaToRomaji, romajiToKana } from './kanaTable'
+import type { KaraokeSyllable } from './karaoke'
 
 const collator = new Intl.Collator(undefined, { sensitivity: 'base' })
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })

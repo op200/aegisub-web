@@ -212,7 +212,11 @@ export class VideoColorStage {
         transform.offset[2] / 255,
       )
     } else {
-      context.uniformMatrix3fv(this.matrixLocation, false, new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]))
+      context.uniformMatrix3fv(
+        this.matrixLocation,
+        false,
+        new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]),
+      )
       context.uniform3f(this.offsetLocation, 0, 0, 0)
     }
   }
@@ -235,7 +239,14 @@ export class VideoColorStage {
     context.viewport(0, 0, this.canvas.width, this.canvas.height)
     context.bindTexture(context.TEXTURE_2D, this.texture)
     try {
-      context.texImage2D(context.TEXTURE_2D, 0, context.RGBA, context.RGBA, context.UNSIGNED_BYTE, source)
+      context.texImage2D(
+        context.TEXTURE_2D,
+        0,
+        context.RGBA,
+        context.RGBA,
+        context.UNSIGNED_BYTE,
+        source,
+      )
     } catch {
       // 源尚未有可上传帧：保留上一帧
       return false

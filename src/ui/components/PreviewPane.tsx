@@ -23,12 +23,12 @@ import {
   setVectorClip,
 } from '../../core/assVisual'
 import { exportAss } from '../../core/format'
+import type { YcbcrAffine, YcbcrColorspace } from '../../core/resample'
 import { Spline, scaleSpline, vec, type SplineCurve, type Vec2 } from '../../core/spline'
 import { formatVideoTime } from '../../core/time'
 import type { SubtitleCue, SubtitleDocument, SubtitleStyle } from '../../core/types'
 import type { Framerate } from '../../core/vfr'
 import { ptsToMs } from '../../core/vfr'
-import type { YcbcrAffine, YcbcrColorspace } from '../../core/resample'
 import { detachElementGain, setElementGain } from '../../media/elementGain'
 import { resolveVideoColorTransform, VideoColorStage } from '../../media/videoColor'
 import { WebCodecsVideoSource } from '../../media/webcodecsVideo'
@@ -3571,7 +3571,6 @@ export function PreviewPane({
       cancelAnimationFrame(raf)
     }
   }, [colorSourceChanged, wcActive, intrinsicWidth, intrinsicHeight])
-
 
   useEffect(() => {
     if (!media?.url || media.dummy || media.syntheticAudio || wcActive) return
