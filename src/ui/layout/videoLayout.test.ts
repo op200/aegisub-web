@@ -1,6 +1,26 @@
 import { describe, expect, it } from 'vitest'
 
-import { calculateAttachedVideoLayout } from './videoLayout'
+import { calculateAttachedVideoLayout, fitWindowZoomToVideo } from './videoLayout'
+
+describe('window zoom on video open', () => {
+  // frame_main.cpp FrameMain::OnVideoOpen
+  it('halves the zoom when the video is wider than two thirds of the window', () => {
+    expect(fitWindowZoomToVideo({ width: 1920, height: 1080 }, 1, 1920, 1080)).toBe(0.5)
+  })
+
+  it('quarters the zoom when the video is wider than the window', () => {
+    expect(fitWindowZoomToVideo({ width: 3840, height: 2160 }, 1, 1920, 1080)).toBe(0.25)
+  })
+
+  it('keeps the zoom when the video fits', () => {
+    expect(fitWindowZoomToVideo({ width: 1280, height: 720 }, 1, 1920, 1080)).toBe(1)
+  })
+
+  it('applies the reduction to the current zoom and clamps at 12.5 percent', () => {
+    expect(fitWindowZoomToVideo({ width: 3840, height: 2160 }, 0.5, 1920, 1080)).toBe(0.25)
+    expect(fitWindowZoomToVideo({ width: 3840, height: 2160 }, 0.25, 1280, 720)).toBe(0.125)
+  })
+})
 
 describe('attached video layout', () => {
   it('uses source size at 100 percent', () => {

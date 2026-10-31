@@ -250,6 +250,10 @@ button:disabled {
   margin: 3px 4px 3px 24px;
   background: var(--border-faint);
 }
+/* 子菜单锚定在所属行（不设 relative 会锚到 .menu-popup，永远弹出在菜单顶部） */
+.menu-submenu {
+  position: relative;
+}
 .menu-popup-sub {
   position: absolute;
   top: -4px;
@@ -901,12 +905,8 @@ button:disabled {
   padding: 0;
   overflow: hidden;
   background: var(--surface);
-  border: 1px solid var(--border-field);
-  border-top-color: var(--bevel-light);
-  border-left-color: var(--bevel-light);
-  box-shadow:
-    inset -1px -1px var(--bevel-dark),
-    inset 1px 1px var(--bevel-light-2);
+  /* 不要模仿源码：SubsEditBox 的 wxRAISED_BORDER 会画出复古 3D 凸起边框
+     （左/上白边，右/下灰边 + 内阴影）。本项目不还原这种复古 UI，编辑框面板不加边框 */
 }
 .empty-edit {
   align-items: center;
@@ -1842,15 +1842,18 @@ button:disabled {
   max-width: 560px;
   max-height: 60vh;
   overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  gap: 4px;
   padding: 12px;
 }
 .lua-config-control {
   display: flex;
   flex-direction: column;
   font-size: 12px;
+}
+.lua-config-cell-label {
+  align-self: center;
+  justify-self: start;
 }
 .lua-config-control input[type='text'],
 .lua-config-control input[type='number'],
@@ -1865,6 +1868,7 @@ button:disabled {
 }
 .lua-config-label {
   color: var(--muted);
+  white-space: pre-line;
 }
 .lua-config-check {
   display: flex;
@@ -1880,6 +1884,23 @@ button:disabled {
 }
 .lua-progress progress {
   width: 100%;
+}
+.lua-progress-task {
+  text-align: center;
+}
+.lua-progress-log {
+  width: 600px;
+  max-width: 70vw;
+  height: 240px;
+  max-height: 40vh;
+  margin: 0;
+  padding: 4px;
+  overflow: auto;
+  border: 1px solid var(--border-button);
+  background: var(--surface);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
 }
 /* Export Subtitles：过滤器列表（dialog_export.cpp 的 wxCheckListBox + 按钮组） */
 .export-filter-list {

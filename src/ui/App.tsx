@@ -27,6 +27,7 @@ import {
   type AutomationHost,
   type AutomationMacroInfo,
   type DialogResponseLike,
+  type LuaTextExtentsStyle,
 } from '../automation/luaEngine'
 import {
   getOptionBool,
@@ -137,7 +138,7 @@ import { StyleManagerDialog } from './components/StyleManagerDialog'
 import { gridRowHeight, SubtitleGrid } from './components/SubtitleGrid'
 import { Toolbar } from './components/Toolbar'
 import { initLocale, tFmt, tPlain, tPlural, useLocaleVersion } from './i18n'
-import { calculateAttachedVideoLayout } from './layout/videoLayout'
+import { calculateAttachedVideoLayout, fitWindowZoomToVideo } from './layout/videoLayout'
 import { installGlobalLogHandlers, logError, logInfo, getLogEntries, subscribeLogs } from './log'
 import { useSystemTheme } from './theme'
 
@@ -238,6 +239,16 @@ function selectedOrActive(
 }
 
 /**
+ * 对白 id → 对白序数。Lua 接口只接受 0-based 行号，逐次 findIndex 在
+ * 「全选 + 大文件」时是 O(n²)；一次建 Map 后查询为 O(1)。
+ */
+function makeCueIndex(document: CoreState['document']): (id: string) => number {
+  const index = new Map<string, number>()
+  document.cues.forEach((cue, ordinal) => index.set(cue.id, ordinal))
+  return (id) => index.get(id) ?? -1
+}
+
+/**
  * 设备像素比跟踪（video_display.cpp 的 GetContentScaleFactor）：
  * 监听 (resolution: Xdppx)，DPR 变化（跨显示器拖动/浏览器缩放）时更新。
  */
@@ -259,6 +270,77 @@ const AUDIO_TOGGLE_OPTIONS: Record<string, string> = {
   autoScroll: 'Audio/Auto/Scroll',
   globalHotkeys: 'Audio/Medusa Timing Hotkeys',
   verticalLink: 'Audio/Link',
+}
+
+// ---------------------------------------------------------------------------
+// aegisub.text_extents：auto4_base.cpp CalculateTextExtents 的 canvas 近似
+// 桌面以 wxDC 度量后按字体高度归一到字号（并除以 64 的缩放因子），这里用
+// measureText 同法归一：高度取字号、外距取 0（TrueType 的 tmExternalLeading
+// 通常为 0），再应用 scale_x/scale_y 百分比；有字间距时逐字符量取（不走 kerning）。
+// ---------------------------------------------------------------------------
+let extentsContext: CanvasRenderingContext2D | null = null
+/** 当前 canvas 字体串（重复赋值会触发字体解析，命中缓存时跳过） */
+let extentsFont = ''
+/** 字体串 → 'Hg' 度量缓存（ascent/descent/scaling 只与字体有关） */
+const extentsFontMetrics = new Map<string, { ascent: number; descent: number; scaling: number }>()
+/** 字体 + 间距 + 缩放 + 文本 → 宽度缓存（脚本常重复量取同一文本/空串） */
+const extentsWidthCache = new Map<string, number>()
+const EXTENTS_CACHE_LIMIT = 4096
+const EXTENTS_CACHE_MAX_TEXT = 64
+
+function applyExtentsFont(context: CanvasRenderingContext2D, font: string): void {
+  if (extentsFont !== font) {
+    context.font = font
+    extentsFont = font
+  }
+}
+
+function measureLuaTextExtents(
+  style: LuaTextExtentsStyle,
+  text: string,
+): { width: number; height: number; descent: number; externalLead: number } | null {
+  if (!extentsContext) extentsContext = document.createElement('canvas').getContext('2d')
+  if (!extentsContext) return null
+  const context = extentsContext
+  const fontsize = Math.max(1, style.fontsize)
+  const family = style.fontname || 'Arial'
+  const font = `${style.italic ? 'italic ' : ''}${style.bold ? 'bold ' : ''}${fontsize}px "${family}"`
+  let metrics = extentsFontMetrics.get(font)
+  if (!metrics) {
+    applyExtentsFont(context, font)
+    const fontMetrics = context.measureText('Hg')
+    const ascent =
+      fontMetrics.fontBoundingBoxAscent || fontMetrics.actualBoundingBoxAscent || fontsize
+    const descent = fontMetrics.fontBoundingBoxDescent || fontMetrics.actualBoundingBoxDescent || 0
+    // 桌面 scaling = fontsize / GetTextExtent 的字高（源码用于弥补字体 OS/2 表缺失）
+    metrics = { ascent, descent, scaling: fontsize / (ascent + descent || fontsize) }
+    if (extentsFontMetrics.size >= EXTENTS_CACHE_LIMIT) extentsFontMetrics.clear()
+    extentsFontMetrics.set(font, metrics)
+  }
+  const scaleX = style.scale_x / 100
+  const scaleY = style.scale_y / 100
+  const height = fontsize * scaleY
+  const resultDescent = metrics.descent * metrics.scaling * scaleY
+  // 空串只需字体度量（scaling/descent），宽度恒为 0
+  if (text.length === 0) return { width: 0, height, descent: resultDescent, externalLead: 0 }
+
+  const widthKey = `${font}|${style.spacing}|${scaleX}|${text}`
+  let width = extentsWidthCache.get(widthKey)
+  if (width === undefined) {
+    applyExtentsFont(context, font)
+    if (style.spacing !== 0) {
+      width = 0
+      for (const char of text) width += context.measureText(char).width + style.spacing
+    } else {
+      width = context.measureText(text).width
+    }
+    width *= metrics.scaling * scaleX
+    if (text.length <= EXTENTS_CACHE_MAX_TEXT) {
+      if (extentsWidthCache.size >= EXTENTS_CACHE_LIMIT) extentsWidthCache.clear()
+      extentsWidthCache.set(widthKey, width)
+    }
+  }
+  return { width, height, descent: resultDescent, externalLead: 0 }
 }
 
 export function App() {
@@ -316,10 +398,20 @@ export function App() {
   } | null>(null)
   // 稳定标识 + 值不变时返回原对象，避免 PreviewPane 的媒体 effect 依赖抖动造成重渲染循环。
   // 注意：源码 FitClientSizeToVideo 只按 video×windowZoom 定住显示框（SetMin/MaxClientSize），
-  // 从不因窗口放不下而降档缩放；放不下时由窗口裁剪，与原版一致
+  // 从不因窗口放不下而降档缩放；放不下时由窗口裁剪，与原版一致。
+  // 这里只在视频**载入时**结算一次 FrameMain::OnVideoOpen 的减档（pendingZoomFitRef）。
+  const pendingZoomFitRef = useRef(false)
   const setIntrinsicSizeStable = useCallback((width: number, height: number) => {
     setVideoIntrinsicSize((prev) =>
       prev.width === width && prev.height === height ? prev : { width, height },
+    )
+    // frame_main.cpp FrameMain::OnVideoOpen：参数是 provider 的像素尺寸与主窗口尺寸
+    // （wx GetSize 为逻辑像素，Web 对应 CSS 像素的 window.innerWidth/Height）。
+    // 同一视频在原生/WebCodecs 通道间切换会重复上报尺寸，只在本轮打开后结算第一次
+    if (!pendingZoomFitRef.current) return
+    pendingZoomFitRef.current = false
+    setVideoWindowZoom((zoom) =>
+      fitWindowZoomToVideo({ width, height }, zoom, window.innerWidth, window.innerHeight),
     )
   }, [])
   // 本地字体授权次数：递增触发 PreviewPane 重建 jassub 实例（libass 用新权限重新匹配字体）
@@ -489,7 +581,14 @@ export function App() {
     title: string
     task: string
     value: number
+    /** aegisub.log / debug.out 累积输出（DialogProgress 的只读日志框） */
+    log: string
+    /** 任务已结束：窗口保持显示日志，按钮切换为 Close */
+    finished: boolean
+    /** 已请求取消：按钮禁用并显示 Cancelling...（dialog_progress.cpp OnCancel） */
+    cancelling: boolean
   } | null>(null)
+  const luaProgressCloseRef = useRef<(() => void) | null>(null)
   const luaCancelledRef = useRef(false)
   // 导出过滤器的 Configure 结果（键 `${stateId}:${name}`；spec + 最后一次回读值）。
   // 对应桌面的 automation_settings 持久化（本版本不落盘，仅会话内缓存）
@@ -743,6 +842,32 @@ export function App() {
   // keyframes 文件优先（project.cpp：文件加载 > 视频自带）
   const activeKeyframes = keyframesFromFile ? keyframes : videoKeyframes
 
+  /**
+   * aegisub.video_size（auto4_lua.cpp video_size）：仅在已加载视频时返回
+   * 宽、高、宽高比数值与 video_controller.h 的 AspectRatio 枚举。
+   */
+  const luaVideoSize = () => {
+    if (!videoMedia) return null
+    const width = videoIntrinsicSize.width
+    const height = videoIntrinsicSize.height
+    const aspectValue = aspectOverride ?? width / Math.max(1, height)
+    // AspectRatio：Default=0 Fullscreen=1 Widescreen=2 Cinematic=3 Custom=4
+    let aspectType = 0
+    if (aspectOverride !== null) {
+      if (aspectOverride === 4 / 3) aspectType = 1
+      else if (aspectOverride === 16 / 9) aspectType = 2
+      else if (aspectOverride === 2.35) aspectType = 3
+      else aspectType = 4
+    }
+    return { width, height, aspectValue, aspectType }
+  }
+
+  /** aegisub.frame_from_ms / ms_from_frame：Timecodes 未加载时桌面返回 nil */
+  const luaFrameFromMs = (ms: number) =>
+    frameRate.isLoaded() ? frameRate.frameAtTime(ms, 'start') : null
+  const luaMsFromFrame = (frame: number) =>
+    frameRate.isLoaded() ? frameRate.timeAtFrame(frame, 'start') : null
+
   /** 从 autoload 目录重新加载全部 Automation 脚本（启动恢复 + 文件管理器改动后刷新） */
   const reloadAllAutomationScripts = useCallback(async () => {
     const stored = await loadAutomationScripts()
@@ -858,14 +983,18 @@ export function App() {
     if (!macros.some(({ macro }) => macro.hasValidate || macro.hasIsActive)) return
 
     const rows = documentToLuaRows(core.document)
-    const cueIndex = (cueId: string) => core.document.cues.findIndex((cue) => cue.id === cueId)
+    const cueIndex = makeCueIndex(core.document)
     const selectedIndexes = selectedOrActive(core.document, selectedSet, activeId)
       .map((cueId) => cueIndex(cueId))
       .filter((index) => index >= 0)
     const activeIndex = activeId ? cueIndex(activeId) : -1
     const menuHost: AutomationHost = {
       log: (message) => logInfo('automation', message),
+      textExtents: (style, text) => measureLuaTextExtents(style, text),
       setStatusText: (text) => setStatus(text),
+      videoSize: () => luaVideoSize(),
+      frameFromMs: (ms) => luaFrameFromMs(ms),
+      msFromFrame: (frame) => luaMsFromFrame(frame),
     }
 
     const next: Record<string, { enabled: boolean; checked: boolean }> = {}
@@ -910,21 +1039,71 @@ export function App() {
     setMacroMenuState(next)
   }
 
+  /**
+   * DialogProgress::Run 的任务结束收尾：取消或没有日志时直接收起；否则窗口保持打开、
+   * 按钮变为 Close、进度拉满，等待用户读完日志后关闭（运行期错误也走这条路径）。
+   */
+  const finishLuaProgress = async (log: string[]): Promise<void> => {
+    if (luaCancelledRef.current || log.length === 0) {
+      setLuaProgress(null)
+      return
+    }
+    setLuaProgress((current) =>
+      current
+        ? { ...current, log: log.join(''), value: 100, finished: true, cancelling: false }
+        : current,
+    )
+    await new Promise<void>((resolve) => {
+      luaProgressCloseRef.current = resolve
+    })
+    luaProgressCloseRef.current = null
+    setLuaProgress(null)
+  }
+
   /** 宏/过滤器运行的宿主（aegisub.* 的 UI 出口：配置对话框、进度、取消、日志） */
-  const makeAutomationHost = (): AutomationHost => ({
-    showDialog: (spec) =>
-      new Promise<DialogResponseLike>((resolve) => setLuaDialog({ spec, resolve })),
-    setProgress: (value) =>
-      setLuaProgress((current) => (current ? { ...current, value } : current)),
-    setTask: (task) => setLuaProgress((current) => (current ? { ...current, task } : current)),
-    setTitle: (title) =>
-      setLuaProgress((current) =>
-        current ? { ...current, title } : { title, task: '', value: 0 },
-      ),
-    isCancelled: () => luaCancelledRef.current,
-    log: (message) => logInfo('automation', message),
-    setStatusText: (text) => setStatus(text),
-  })
+  const makeAutomationHost = (): AutomationHost => {
+    // 脚本常按行调用 progress.set（数千次），逐次入队 React 更新会淹没调度器；
+    // 仅在进度变化 ≥0.5% 或距上次刷新 ≥50ms 时提交（首尾值始终提交）
+    let lastProgressValue = -1
+    let lastProgressAt = 0
+    return {
+      showDialog: (spec) =>
+        new Promise<DialogResponseLike>((resolve) => setLuaDialog({ spec, resolve })),
+      setProgress: (value) => {
+        const now = performance.now()
+        if (
+          value > 0 &&
+          value < 100 &&
+          Math.abs(value - lastProgressValue) < 0.5 &&
+          now - lastProgressAt < 50
+        )
+          return
+        lastProgressValue = value
+        lastProgressAt = now
+        setLuaProgress((current) => (current ? { ...current, value } : current))
+      },
+      setTask: (task) => setLuaProgress((current) => (current ? { ...current, task } : current)),
+      setTitle: (title) =>
+        setLuaProgress((current) =>
+          current
+            ? { ...current, title }
+            : { title, task: '', value: 0, log: '', finished: false, cancelling: false },
+        ),
+      isCancelled: () => luaCancelledRef.current,
+      log: (message) => {
+        logInfo('automation', message)
+        // ps->Log：追加到进度窗口的日志框（DialogProgress 的 pending_log）
+        setLuaProgress((current) =>
+          current ? { ...current, log: current.log + message } : current,
+        )
+      },
+      textExtents: (style, text) => measureLuaTextExtents(style, text),
+      setStatusText: (text) => setStatus(text),
+      videoSize: () => luaVideoSize(),
+      frameFromMs: (ms) => luaFrameFromMs(ms),
+      msFromFrame: (frame) => luaMsFromFrame(frame),
+    }
+  }
 
   /**
    * 宏命令入口：按撤销点顺序整表重放（auto4_lua.cpp ProcessingComplete →
@@ -939,14 +1118,21 @@ export function App() {
       return
     }
     const rows = documentToLuaRows(core.document)
-    const cueIndex = (cueId: string) => core.document.cues.findIndex((cue) => cue.id === cueId)
+    const cueIndex = makeCueIndex(core.document)
     const selectedIndexes = selectedOrActive(core.document, selectedSet, activeId)
       .map((cueId) => cueIndex(cueId))
       .filter((index) => index >= 0)
     const activeIndex = activeId ? cueIndex(activeId) : -1
 
     luaCancelledRef.current = false
-    setLuaProgress({ title: macro.name, task: '', value: 0 })
+    setLuaProgress({
+      title: macro.name,
+      task: '',
+      value: 0,
+      log: '',
+      finished: false,
+      cancelling: false,
+    })
     const luaHost = makeAutomationHost()
 
     try {
@@ -959,11 +1145,13 @@ export function App() {
         luaHost,
       )
       if (!result.ok) {
+        const cancelled = result.error === 'cancelled'
         setStatus(
-          result.error === 'cancelled'
-            ? tPlain('Cancelled')
-            : `Automation error: ${result.error ?? 'unknown error'}`,
+          cancelled ? tPlain('Cancelled') : `Automation error: ${result.error ?? 'unknown error'}`,
         )
+        // 运行期错误已由引擎写入 result.log（含 "Lua reported a runtime error" 块）；
+        // DialogProgress 捕获抛出的异常后还会追加异常消息，随后保持窗口显示日志
+        await finishLuaProgress(cancelled ? [] : [...result.log, 'Script threw an error'])
         return
       }
       let next: CoreState | null = core
@@ -986,10 +1174,12 @@ export function App() {
           setActiveId(cues[result.active].id)
       }
       setStatus(`Automation: ${macro.name}`)
+      // 有 aegisub.log / debug.out 输出时保持日志窗口（DialogProgress::Run 完成分支）
+      await finishLuaProgress(result.log)
     } catch (error) {
       setStatus(`Automation error: ${error instanceof Error ? error.message : 'unknown error'}`)
-    } finally {
       setLuaProgress(null)
+    } finally {
       setLuaDialog(null)
     }
   }
@@ -1337,6 +1527,8 @@ export function App() {
       if (previousAudio && previousAudio !== previousVideo) URL.revokeObjectURL(previousAudio.url)
     }
     setVideoMedia(source)
+    // FrameMain::OnVideoOpen 的减档等真实尺寸上报后结算（见 setIntrinsicSizeStable）
+    pendingZoomFitRef.current = true
     setVideoTimeMs(0)
     setVideoDurationMs(0)
     setDetectedFps(null) // 新视频重新探测帧率
@@ -1436,6 +1628,7 @@ export function App() {
   const closeVideo = () => {
     if (videoMedia && videoMedia !== audioMedia) URL.revokeObjectURL(videoMedia.url)
     setVideoMedia(null)
+    pendingZoomFitRef.current = false
     setVideoDurationMs(0)
     setVideoTimeMs(0)
     keyframeScanIdRef.current += 1 // 作废后台扫描
@@ -1784,13 +1977,15 @@ export function App() {
       luaHost,
     )
     if (!result.ok) {
+      const cancelled = result.error === 'cancelled'
       setStatus(
-        result.error === 'cancelled'
-          ? tPlain('Cancelled')
-          : `Export filter error: ${result.error ?? 'unknown error'}`,
+        cancelled ? tPlain('Cancelled') : `Export filter error: ${result.error ?? 'unknown error'}`,
       )
+      await finishLuaProgress(cancelled ? [] : [...result.log, 'Script threw an error'])
       return null
     }
+    // 过滤器同样经 DialogProgress 显示日志（aegisub.log / debug.out）
+    await finishLuaProgress(result.log)
     return result.payload ? applyLuaPayload(doc, result.payload) : doc
   }
 
@@ -1802,7 +1997,14 @@ export function App() {
       const liveRows = documentToLuaRows(core.document)
       for (const filter of options.filters) {
         luaCancelledRef.current = false
-        setLuaProgress({ title: filter.displayName, task: '', value: 0 })
+        setLuaProgress({
+          title: filter.displayName,
+          task: '',
+          value: 0,
+          log: '',
+          finished: false,
+          cancelling: false,
+        })
         // 过滤器链必须串行：后一个过滤器处理前一个的输出（AssExporter::Export 顺序执行）
         // oxlint-disable-next-line no-await-in-loop
         const next = await runExportFilter(filter, doc, liveRows)
@@ -2066,6 +2268,8 @@ export function App() {
     openDummyVideo: (options) => {
       if (videoMedia && videoMedia !== audioMedia) URL.revokeObjectURL(videoMedia.url)
       setVideoMedia({ name: 'Dummy Video', url: '', kind: 'video', dummy: options })
+      // dummy provider 同样经 FrameMain::OnVideoOpen 减档（尺寸由面板 effect 上报）
+      pendingZoomFitRef.current = true
       setVideoDurationMs(options.lengthMs)
       setVideoTimeMs(0)
       keyframeScanIdRef.current += 1 // 作废旧视频扫描；dummy 无关键帧
@@ -2225,6 +2429,11 @@ export function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return
       const target = event.target as HTMLElement
+      // 模态对话框独占键盘（wx：模态窗口期间主窗口快捷键表不参与分发）。
+      // 注意不能只看 target：在对话框里拖选文本后焦点可能落回 body，
+      // 因此按 DOM 里是否存在打开的对话框判断。放行后浏览器原生 Ctrl+C 才能复制选区，
+      // 否则会被 Default 上下文的 edit/line/copy 命中并 preventDefault
+      if (document.querySelector('.app-dialog')) return
       // 编辑守卫只拦文本输入类（源码 wxTextCtrl 全消费）；range/checkbox/radio 在
       // wxSLIDER/wxCHKBUTTON 语义下仅消费自身导航键、其余键向上传播（wx 事件 Skip）
       const editing = target.matches(
@@ -2982,15 +3191,21 @@ export function App() {
           title={luaProgress.title}
           task={luaProgress.task}
           value={luaProgress.value}
+          log={luaProgress.log}
+          finished={luaProgress.finished}
+          cancelling={luaProgress.cancelling}
           onCancel={() => {
             luaCancelledRef.current = true
+            setLuaProgress((current) => (current ? { ...current, cancelling: true } : current))
           }}
+          onClose={() => luaProgressCloseRef.current?.()}
         />
       )}
       {luaDialog && (
         <LuaConfigDialog
           spec={luaDialog.spec}
           initialValues={luaDialog.initialValues}
+          title={luaProgress?.title}
           onSubmit={(response) => {
             const pending = luaDialog
             setLuaDialog(null)

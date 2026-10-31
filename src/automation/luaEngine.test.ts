@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { makeDialogueRow, makeInfoRow, makeStyleRow, type LuaRow } from './luaAssFile'
-import { defaultDialogValues, dialogConfigTable } from './luaDialog'
+import { defaultDialogValues, dialogConfigTable, type DialogSpec } from './luaDialog'
 import {
   closeAutomationState,
   configureAutomationFilter,
@@ -136,6 +136,26 @@ describe('Lua Automation 运行时（fengari）', () => {
     closeAutomationState(loaded.stateId)
   })
 
+  it('LuaJIT 兼容：string.format 整数格式符接受浮点（向零截断）', async () => {
+    const loaded = await loadAutomationScript(
+      `
+      aegisub.register_macro("FloatFormat", "", function()
+        local util = require 'aegisub.util'
+        assert(string.format('%d', 1.5) == '1')
+        assert(string.format('%d', -1.5) == '-1')
+        assert(string.format('%02X', 63.7) == '3F')
+        assert(string.format('%s:%d', 'x', 2.9) == 'x:2')
+        -- 官方 util.interpolate_color 依赖该行为（LuaJIT 下不报错）
+        assert(util.interpolate_color(0.5, '&HF13739&', '&HCE6BF9&') == '&HDF5199&')
+      end)`,
+      'float-format.lua',
+    )
+    expect(loaded.loaded, loaded.error).toBe(true)
+    const result = await runAutomationMacro(loaded.stateId, 'FloatFormat', baseRows(), [0], 0)
+    expect(result.ok, result.error).toBe(true)
+    closeAutomationState(loaded.stateId)
+  })
+
   it('validate / isactive 返回动态帮助与勾选态', async () => {
     const loaded = await loadAutomationScript(
       `
@@ -262,6 +282,111 @@ describe('Lua Automation 运行时（fengari）', () => {
     expect(ordered.map((filter) => filter.displayName)).toEqual(['High', 'High (1)', 'Low'])
     expect(ordered.map((filter) => filter.hasConfig)).toEqual([false, true, false])
     expect(ordered.every((filter) => filter.stateId === loaded.stateId)).toBe(true)
+    closeAutomationState(loaded.stateId)
+  })
+
+  it('aegisub.dialog.display：默认按钮、网格字段与颜色回读', async () => {
+    const loaded = await loadAutomationScript(
+      `
+      aegisub.register_macro("Dialog", "", function(subs, sel, active)
+        local button, values = aegisub.dialog.display({
+          {class = "label", label = "Hi&&there", x = 0, y = 0, width = 2},
+          {class = "edit", name = "text", text = "abc", x = 0, y = 1},
+          {class = "intedit", name = "count", value = 20, min = 0, max = 100, x = 1, y = 1},
+          {class = "floatedit", name = "ratio", value = 1.5, x = 0, y = 2},
+          {class = "dropdown", name = "choice", items = {"a", "b", "c"}, value = "b", x = 1, y = 2},
+          {class = "checkbox", name = "flag", value = true, label = "&Flag", x = 0, y = 3},
+          {class = "color", name = "tint", value = "&H0011ff00", x = 1, y = 3},
+          {class = "coloralpha", name = "fade", value = "#aabbccdd", x = 0, y = 4},
+          {class = "alpha", name = "opacity", value = "#12", x = 1, y = 4, width = 0}
+        })
+        aegisub.log("RESULT|%s|%s|%s|%s|%s|%s|%s|%s|%s",
+          tostring(button), tostring(values.text), tostring(values.count), tostring(values.ratio),
+          tostring(values.choice), tostring(values.flag), tostring(values.tint),
+          tostring(values.fade), tostring(values.opacity))
+        return sel, active
+      end)
+      `,
+      'dialog.lua',
+    )
+    expect(loaded.loaded, loaded.error).toBe(true)
+
+    const seenSpecs: DialogSpec[] = []
+    const result = await runAutomationMacro(loaded.stateId, 'Dialog', baseRows(), [0], 0, {
+      showDialog: async (spec) => {
+        seenSpecs.push(spec)
+        return {
+          // 与 UI 状态一致：每个控件一项（label 的值被忽略）
+          button: 0,
+          values: [null, 'xyz', 30, 2.5, 'c', false, '#00FF11', '#AABBCCDD', '#12'],
+        }
+      },
+    })
+    expect(result.ok, result.error).toBe(true)
+    expect(seenSpecs).toHaveLength(1)
+    const spec = seenSpecs[0]
+    expect(spec.useButtons).toBe(true)
+    // 未给 buttons 表 → wxID_OK/wxID_CANCEL 空标签（docs：返回按钮原始文本，空串即真值）
+    expect(spec.buttons.map((button) => button.label)).toEqual(['', ''])
+    expect(spec.controls.map((control) => control.kind)).toEqual([
+      'label',
+      'edit',
+      'intedit',
+      'floatedit',
+      'dropdown',
+      'checkbox',
+      'color',
+      'coloralpha',
+      'edit',
+    ])
+    // width/height ≤ 0 → 1；颜色按 agi::Color 解析并规范化为 #RRGGBB[AA]
+    expect(spec.controls[0].width).toBe(2)
+    expect(spec.controls[8]).toMatchObject({ kind: 'edit', width: 1, text: '#12' })
+    expect(spec.controls[6]).toMatchObject({ kind: 'color', value: '#00FF11' })
+    // #RRGGBBAA 不被源码 color_grammar 接受 → 解析失败落回全 0
+    expect(spec.controls[7]).toMatchObject({ kind: 'coloralpha', value: '#00000000' })
+    expect(result.log.join('\n')).toContain('RESULT||xyz|30|2.5|c|false|#00FF11|#AABBCCDD|#12')
+
+    // 关闭对话框（button = -1）→ false；控件值仍按回读类型返回
+    const closed = await runAutomationMacro(loaded.stateId, 'Dialog', baseRows(), [0], 0, {
+      showDialog: async () => ({
+        button: -1,
+        values: [null, 'xyz', 30, 2.5, 'c', false, '#00FF11', '#AABBCCDD', '#12'],
+      }),
+    })
+    expect(closed.ok, closed.error).toBe(true)
+    expect(closed.log.join('\n')).toContain('RESULT|false|xyz|30|2.5|c|false|#00FF11|#AABBCCDD|#12')
+    closeAutomationState(loaded.stateId)
+  })
+
+  it('progress.set / is_cancelled：宿主状态实时回读，cancel 放弃全部提交', async () => {
+    const loaded = await loadAutomationScript(
+      `
+      script_name = "Progress"
+      aegisub.register_macro("Loop", "Loop", function(subs, sel, active)
+        for i = 1, #subs do
+          aegisub.progress.set(i / #subs * 100)
+          if aegisub.progress.is_cancelled() then aegisub.cancel() end
+        end
+        return sel, active
+      end)
+      `,
+      'progress.lua',
+    )
+    expect(loaded.loaded, loaded.error).toBe(true)
+    const progress: number[] = []
+    let cancelled = false
+    const result = await runAutomationMacro(loaded.stateId, 'Loop', baseRows(), [0], 0, {
+      setProgress: (value) => {
+        progress.push(value)
+        if (progress.length >= 2) cancelled = true
+      },
+      isCancelled: () => cancelled,
+    })
+    expect(progress.length).toBeGreaterThan(0)
+    expect(result.ok).toBe(false)
+    expect(result.error).toBe('cancelled')
+    expect(result.commits).toEqual([])
     closeAutomationState(loaded.stateId)
   })
 })

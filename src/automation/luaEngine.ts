@@ -15,7 +15,8 @@
  * Web 环境的有意偏差：无 aegisub.* 原生模块与 MoonScript（脚本引擎列表只列 Lua *.lua）；
  * aegisub.dialog.open/save 恒返回 nil；text_extents 由宿主 host.textExtents 提供；
  * 无 AssDialogue* 指针，active/selected 用对白行序数表达；__raise_warning 仅在注册期收集；
- * 颜色控件用 <input type=color>（不支持 alpha），LuaConfigDialog 顺序布局而非绝对定位；
+ * 颜色控件用 <input type=color>（不支持编辑 alpha，alpha 分量保留）；LuaConfigDialog 用
+ * CSS grid 复刻 wxGridBagSizer 的 (x,y,width,height) 布局；
  * 单一脚本管理器（无全局/本地之分），Automation Manager 无 Rescan Autoload Dir / Help 按钮，
  * Show Info 为内嵌面板而非 wxMessageBox。
  */
@@ -40,7 +41,6 @@ import {
   type LuaCommitPayload,
   type LuaDialogueRow,
   type LuaRow,
-  type LuaStyleRow,
   type StyleRowFields,
 } from './luaAssFile'
 import {
@@ -51,6 +51,7 @@ import {
   type DialogSpec,
   type DialogValue,
 } from './luaDialog'
+import { installLuaModuleSearch, installLuaModules } from './luaModules'
 
 type FengariModule = typeof import('fengari')
 let fengariModules: FengariModule | null = null
@@ -104,6 +105,20 @@ export interface LoadedAutomationScript {
   error?: string
 }
 
+/**
+ * aegisub.text_extents 所需的样式字段（CalculateTextExtents 只用到字体/间距/缩放）。
+ * 单独抽取可避免每次调用都走 LuaToAssEntry 读取完整 25 字段样式表。
+ */
+export interface LuaTextExtentsStyle {
+  fontname: string
+  fontsize: number
+  bold: boolean
+  italic: boolean
+  spacing: number
+  scale_x: number
+  scale_y: number
+}
+
 /** 宿主环境回调（视频/音频/配置等由 UI 层提供） */
 export interface AutomationHost {
   /** aegisub.dialog.display：渲染配置对话框并回读 */
@@ -120,7 +135,7 @@ export interface AutomationHost {
   keyframes?(): number[] | null
   decodePath?(path: string): string
   textExtents?(
-    style: LuaStyleRow,
+    style: LuaTextExtentsStyle,
     text: string,
   ): { width: number; height: number; descent: number; externalLead: number } | null
   getAudioSelection?(): { start: number; end: number } | null
@@ -272,8 +287,38 @@ function argCheck(L: any, condition: boolean, narg: number, message: string): vo
   if (!condition) argError(L, narg, message)
 }
 
+/** 字段名等静态字符串的 UTF-8 编码缓存（fengari 的 to_luastring 每次调用都重新编码） */
+const luaKeyCache = new Map<string, Uint8Array>()
+/** 短值字符串的编码缓存（样式名/角色/特效等重复率很高；有大小上限） */
+const luaValueCache = new Map<string, Uint8Array>()
+const LUA_VALUE_CACHE_LIMIT = 2048
+const LUA_VALUE_CACHE_MAX_LENGTH = 48
+
+function luaKey(name: string): Uint8Array {
+  const cached = luaKeyCache.get(name)
+  if (cached) return cached
+  const bytes = to_luastring(name) as Uint8Array
+  luaKeyCache.set(name, bytes)
+  return bytes
+}
+
 function pushString(L: any, value: string): void {
   lua.lua_pushstring(L, to_luastring(value))
+}
+
+/** 行字段值压栈：短串走缓存，长串直接编码（避免缓存被对白文本撑爆） */
+function pushValueString(L: any, value: string): void {
+  if (value.length > LUA_VALUE_CACHE_MAX_LENGTH) {
+    pushString(L, value)
+    return
+  }
+  let bytes = luaValueCache.get(value)
+  if (!bytes) {
+    if (luaValueCache.size >= LUA_VALUE_CACHE_LIMIT) luaValueCache.clear()
+    bytes = to_luastring(value) as Uint8Array
+    luaValueCache.set(value, bytes)
+  }
+  lua.lua_pushstring(L, bytes)
 }
 
 function pushBool(L: any, value: boolean): void {
@@ -361,11 +406,94 @@ function luaForEach(L: any, index: number, cb: () => void): void {
 }
 
 // ---------------------------------------------------------------------------
+// string.format：LuaJIT（Lua 5.2 语义）整数格式符兼容
+// ---------------------------------------------------------------------------
+
+/**
+ * 桌面版 Aegisub 用 LuaJIT，官方 aegisub.util（ass_color / interpolate_color）
+ * 与现成脚本常把插值出的浮点分量传给 %d/%x；Lua 5.3 则要求精确整数表示，
+ * 会报 "bad argument #2 to 'sformat' (number has no integer representation)"。
+ * 在调用原生 format 前仅对整数转换符的参数向零截断（对齐 lua_tointeger）。
+ *
+ * 用 JS 实现而非 Lua 包装：解析格式串与栈操作都在 JS 侧完成，避免 fengari
+ * 上每次调用都执行一串 Lua 字符串匹配（基准中约占格式调用的绝大部分耗时）。
+ */
+let rawStringFormatKey: Uint8Array | null = null
+const formatSpecCache = new Map<string, number[]>()
+const FORMAT_SPEC_CACHE_LIMIT = 512
+
+/** 返回从 1 开始的整数格式符参数序号（d/i/o/u/x/X/c） */
+function integerFormatPositions(fmt: string): number[] {
+  const cached = formatSpecCache.get(fmt)
+  if (cached) return cached
+  const positions: number[] = []
+  let argument = 0
+  for (let i = 0; i < fmt.length; i++) {
+    if (fmt[i] !== '%') continue
+    i++
+    if (i >= fmt.length) break
+    if (fmt[i] === '%') continue
+    while (i < fmt.length && '-+ #0'.includes(fmt[i])) i++
+    while (i < fmt.length && fmt[i] >= '0' && fmt[i] <= '9') i++
+    if (fmt[i] === '.') {
+      i++
+      while (i < fmt.length && fmt[i] >= '0' && fmt[i] <= '9') i++
+    }
+    argument++
+    const conversion = fmt[i]
+    if (
+      conversion === 'd' ||
+      conversion === 'i' ||
+      conversion === 'o' ||
+      conversion === 'u' ||
+      conversion === 'x' ||
+      conversion === 'X' ||
+      conversion === 'c'
+    )
+      positions.push(argument)
+  }
+  if (formatSpecCache.size >= FORMAT_SPEC_CACHE_LIMIT) formatSpecCache.clear()
+  formatSpecCache.set(fmt, positions)
+  return positions
+}
+
+function luaStringFormatCompat(L2: any): number {
+  const nargs = lua.lua_gettop(L2)
+  if (nargs > 0 && lua.lua_type(L2, 1) === lua.LUA_TSTRING) {
+    const positions = integerFormatPositions(to_jsstring(lua.lua_tostring(L2, 1)))
+    for (const position of positions) {
+      const index = position + 1
+      if (index > nargs || lua.lua_type(L2, index) !== lua.LUA_TNUMBER) continue
+      const value = lua.lua_tonumber(L2, index)
+      if (Number.isInteger(value)) continue
+      lua.lua_pushinteger(L2, value >= 0 ? Math.floor(value) : Math.ceil(value))
+      lua.lua_replace(L2, index)
+    }
+  }
+  if (!rawStringFormatKey) return 0
+  lua.lua_getfield(L2, lua.LUA_REGISTRYINDEX, rawStringFormatKey)
+  lua.lua_insert(L2, 1)
+  lua.lua_call(L2, nargs, lua.LUA_MULTRET)
+  return lua.lua_gettop(L2)
+}
+
+/** 保存原生 string.format 到 registry，并把全局替换为兼容实现 */
+function installLuaJitStringFormat(L: any): void {
+  rawStringFormatKey = to_luastring('__aegisub_raw_string_format')
+  lua.lua_getglobal(L, to_luastring('string'))
+  lua.lua_getfield(L, -1, to_luastring('format'))
+  lua.lua_setfield(L, lua.LUA_REGISTRYINDEX, rawStringFormatKey)
+  lua.lua_pushcfunction(L, luaStringFormatCompat)
+  lua.lua_setfield(L, -2, to_luastring('format'))
+  lua.lua_pop(L, 1)
+}
+
+// ---------------------------------------------------------------------------
 // AssEntry 表 → LuaRow（LuaToAssEntry 逐字语义）
 // ---------------------------------------------------------------------------
 
 function fieldString(L: any, tableIdx: number, name: string, lineClass: string): string {
-  lua.lua_getfield(L, tableIdx, to_luastring(name))
+  lua.lua_getfield(L, tableIdx, luaKey(name))
   if (!lua.lua_isstring(L, -1)) {
     lua.lua_pop(L, 1)
     return raiseError(
@@ -379,7 +507,7 @@ function fieldString(L: any, tableIdx: number, name: string, lineClass: string):
 }
 
 function fieldNumber(L: any, tableIdx: number, name: string, lineClass: string): number {
-  lua.lua_getfield(L, tableIdx, to_luastring(name))
+  lua.lua_getfield(L, tableIdx, luaKey(name))
   if (!lua.lua_isnumber(L, -1)) {
     lua.lua_pop(L, 1)
     return raiseError(
@@ -393,7 +521,7 @@ function fieldNumber(L: any, tableIdx: number, name: string, lineClass: string):
 }
 
 function fieldInt(L: any, tableIdx: number, name: string, lineClass: string): number {
-  lua.lua_getfield(L, tableIdx, to_luastring(name))
+  lua.lua_getfield(L, tableIdx, luaKey(name))
   if (!lua.lua_isnumber(L, -1)) {
     lua.lua_pop(L, 1)
     return raiseError(
@@ -407,7 +535,7 @@ function fieldInt(L: any, tableIdx: number, name: string, lineClass: string): nu
 }
 
 function fieldBool(L: any, tableIdx: number, name: string, lineClass: string): boolean {
-  lua.lua_getfield(L, tableIdx, to_luastring(name))
+  lua.lua_getfield(L, tableIdx, luaKey(name))
   if (!lua.lua_isboolean(L, -1)) {
     lua.lua_pop(L, 1)
     return raiseError(
@@ -423,7 +551,7 @@ function fieldBool(L: any, tableIdx: number, name: string, lineClass: string): b
 /** 读表的 extra 字段（lua_for_each：仅字符串键；值经 get_string_or_default） */
 function readExtra(L: any, tableIdx: number): Record<string, string> {
   const extra: Record<string, string> = {}
-  lua.lua_getfield(L, tableIdx, to_luastring('extra'))
+  lua.lua_getfield(L, tableIdx, luaKey('extra'))
   const type = lua.lua_type(L, -1)
   if (type === lua.LUA_TTABLE) {
     luaForEach(L, -1, () => {
@@ -450,7 +578,7 @@ function luaToRow(L: any, tableIdx: number): LuaRow {
   if (lua.lua_type(L, tableIdx) !== lua.LUA_TTABLE)
     return raiseError(L, "Can't convert a non-table value to AssEntry") as unknown as LuaRow
 
-  lua.lua_getfield(L, tableIdx, to_luastring('class'))
+  lua.lua_getfield(L, tableIdx, luaKey('class'))
   if (!lua.lua_isstring(L, -1)) {
     lua.lua_pop(L, 1)
     return raiseError(
@@ -520,73 +648,148 @@ function luaToRow(L: any, tableIdx: number): LuaRow {
 // AssEntry → Lua 表（AssEntryToLua）
 // ---------------------------------------------------------------------------
 
+/**
+ * 行字段名池：字段名 TString 只编码/哈希一次，pushRowTable 通过整数下标取回，
+ * 避免每次构造行表都为每个字段名重新生成 TString 并重算哈希。
+ */
+const ROW_KEY_NAMES = [
+  'section',
+  'raw',
+  'key',
+  'value',
+  'class',
+  'name',
+  'fontname',
+  'fontsize',
+  'color1',
+  'color2',
+  'color3',
+  'color4',
+  'bold',
+  'italic',
+  'underline',
+  'strikeout',
+  'scale_x',
+  'scale_y',
+  'spacing',
+  'angle',
+  'borderstyle',
+  'outline',
+  'shadow',
+  'align',
+  'margin_l',
+  'margin_r',
+  'margin_t',
+  'margin_b',
+  'encoding',
+  'relative_to',
+  'comment',
+  'layer',
+  'start_time',
+  'end_time',
+  'style',
+  'actor',
+  'effect',
+  'text',
+  'extra',
+] as const
+const ROW_KEY_IDS = new Map<string, number>(ROW_KEY_NAMES.map((name, index) => [name, index + 1]))
+
+function installRowKeyPool(L: any): void {
+  lua.lua_newtable(L)
+  for (let index = 0; index < ROW_KEY_NAMES.length; index++) {
+    lua.lua_pushstring(L, luaKey(ROW_KEY_NAMES[index]))
+    lua.lua_rawseti(L, -2, index + 1)
+  }
+  lua.lua_setfield(L, lua.LUA_REGISTRYINDEX, luaKey('__aegisub_row_keys'))
+}
+
+/** t[name] = push 的结果；表为内部新建（无元表），用 rawset 省去元方法检查。
+ * fengari 的 lua_rawset 从 [-2] 取键、[-1] 取值，故先压键再压值。 */
 function setField(L: any, name: string, push: () => void): void {
+  lua.lua_pushstring(L, luaKey(name))
   push()
-  lua.lua_setfield(L, -2, to_luastring(name))
+  lua.lua_rawset(L, -3)
 }
 
 function pushRowTable(L: any, row: LuaRow): void {
+  lua.lua_getfield(L, lua.LUA_REGISTRYINDEX, luaKey('__aegisub_row_keys'))
+  const pool = lua.lua_gettop(L)
   lua.lua_newtable(L)
+  const table = lua.lua_gettop(L)
+  /** 字段名优先从字段池按整数下标取回（零编码、零哈希） */
+  const put = (name: string, push: () => void) => {
+    lua.lua_rawgeti(L, pool, ROW_KEY_IDS.get(name)!)
+    push()
+    lua.lua_rawset(L, table)
+  }
   if (row.class === 'info') {
-    setField(L, 'section', () => pushString(L, row.section))
-    setField(L, 'raw', () => pushString(L, row.raw))
-    setField(L, 'key', () => pushString(L, row.key))
-    setField(L, 'value', () => pushString(L, row.value))
-    setField(L, 'class', () => pushString(L, 'info'))
+    put('section', () => pushValueString(L, row.section))
+    put('raw', () => pushValueString(L, row.raw))
+    put('key', () => pushValueString(L, row.key))
+    put('value', () => pushValueString(L, row.value))
+    put('class', () => pushValueString(L, 'info'))
+    lua.lua_remove(L, pool)
     return
   }
   if (row.class === 'style') {
-    setField(L, 'section', () => pushString(L, row.section))
-    setField(L, 'raw', () => pushString(L, row.raw))
-    setField(L, 'name', () => pushString(L, row.name))
-    setField(L, 'fontname', () => pushString(L, row.fontname))
-    setField(L, 'fontsize', () => pushNumber(L, row.fontsize))
-    setField(L, 'color1', () => pushString(L, row.color1))
-    setField(L, 'color2', () => pushString(L, row.color2))
-    setField(L, 'color3', () => pushString(L, row.color3))
-    setField(L, 'color4', () => pushString(L, row.color4))
-    setField(L, 'bold', () => pushBool(L, row.bold))
-    setField(L, 'italic', () => pushBool(L, row.italic))
-    setField(L, 'underline', () => pushBool(L, row.underline))
-    setField(L, 'strikeout', () => pushBool(L, row.strikeout))
-    setField(L, 'scale_x', () => pushNumber(L, row.scale_x))
-    setField(L, 'scale_y', () => pushNumber(L, row.scale_y))
-    setField(L, 'spacing', () => pushNumber(L, row.spacing))
-    setField(L, 'angle', () => pushNumber(L, row.angle))
-    setField(L, 'borderstyle', () => pushInt(L, row.borderstyle))
-    setField(L, 'outline', () => pushNumber(L, row.outline))
-    setField(L, 'shadow', () => pushNumber(L, row.shadow))
-    setField(L, 'align', () => pushInt(L, row.align))
-    setField(L, 'margin_l', () => pushInt(L, row.margin_l))
-    setField(L, 'margin_r', () => pushInt(L, row.margin_r))
-    setField(L, 'margin_t', () => pushInt(L, row.margin_t))
-    setField(L, 'margin_b', () => pushInt(L, row.margin_b))
-    setField(L, 'encoding', () => pushInt(L, row.encoding))
-    setField(L, 'relative_to', () => pushInt(L, row.relative_to))
-    setField(L, 'class', () => pushString(L, 'style'))
+    put('section', () => pushValueString(L, row.section))
+    put('raw', () => pushValueString(L, row.raw))
+    put('name', () => pushValueString(L, row.name))
+    put('fontname', () => pushValueString(L, row.fontname))
+    put('fontsize', () => pushNumber(L, row.fontsize))
+    put('color1', () => pushValueString(L, row.color1))
+    put('color2', () => pushValueString(L, row.color2))
+    put('color3', () => pushValueString(L, row.color3))
+    put('color4', () => pushValueString(L, row.color4))
+    put('bold', () => pushBool(L, row.bold))
+    put('italic', () => pushBool(L, row.italic))
+    put('underline', () => pushBool(L, row.underline))
+    put('strikeout', () => pushBool(L, row.strikeout))
+    put('scale_x', () => pushNumber(L, row.scale_x))
+    put('scale_y', () => pushNumber(L, row.scale_y))
+    put('spacing', () => pushNumber(L, row.spacing))
+    put('angle', () => pushNumber(L, row.angle))
+    put('borderstyle', () => pushInt(L, row.borderstyle))
+    put('outline', () => pushNumber(L, row.outline))
+    put('shadow', () => pushNumber(L, row.shadow))
+    put('align', () => pushInt(L, row.align))
+    put('margin_l', () => pushInt(L, row.margin_l))
+    put('margin_r', () => pushInt(L, row.margin_r))
+    put('margin_t', () => pushInt(L, row.margin_t))
+    put('margin_b', () => pushInt(L, row.margin_b))
+    put('encoding', () => pushInt(L, row.encoding))
+    put('relative_to', () => pushInt(L, row.relative_to))
+    put('class', () => pushValueString(L, 'style'))
+    lua.lua_remove(L, pool)
     return
   }
-  setField(L, 'section', () => pushString(L, row.section))
-  setField(L, 'raw', () => pushString(L, row.raw))
-  setField(L, 'comment', () => pushBool(L, row.comment))
-  setField(L, 'layer', () => pushInt(L, row.layer))
-  setField(L, 'start_time', () => pushInt(L, row.start_time))
-  setField(L, 'end_time', () => pushInt(L, row.end_time))
-  setField(L, 'style', () => pushString(L, row.style))
-  setField(L, 'actor', () => pushString(L, row.actor))
-  setField(L, 'effect', () => pushString(L, row.effect))
-  setField(L, 'margin_l', () => pushInt(L, row.margin_l))
-  setField(L, 'margin_r', () => pushInt(L, row.margin_r))
-  setField(L, 'margin_t', () => pushInt(L, row.margin_t))
-  setField(L, 'margin_b', () => pushInt(L, row.margin_b))
-  setField(L, 'text', () => pushString(L, row.text))
+  put('section', () => pushValueString(L, row.section))
+  put('raw', () => pushValueString(L, row.raw))
+  put('comment', () => pushBool(L, row.comment))
+  put('layer', () => pushInt(L, row.layer))
+  put('start_time', () => pushInt(L, row.start_time))
+  put('end_time', () => pushInt(L, row.end_time))
+  put('style', () => pushValueString(L, row.style))
+  put('actor', () => pushValueString(L, row.actor))
+  put('effect', () => pushValueString(L, row.effect))
+  put('margin_l', () => pushInt(L, row.margin_l))
+  put('margin_r', () => pushInt(L, row.margin_r))
+  put('margin_t', () => pushInt(L, row.margin_t))
+  put('margin_b', () => pushInt(L, row.margin_b))
+  put('text', () => pushValueString(L, row.text))
   lua.lua_newtable(L)
+  const extra = lua.lua_gettop(L)
   for (const [key, value] of Object.entries(row.extra)) {
-    pushString(L, value)
-    lua.lua_setfield(L, -2, to_luastring(key))
+    const id = ROW_KEY_IDS.get(key)
+    if (id === undefined) lua.lua_pushstring(L, luaKey(key))
+    else lua.lua_rawgeti(L, pool, id)
+    pushValueString(L, value)
+    lua.lua_rawset(L, extra)
   }
-  lua.lua_setfield(L, -2, to_luastring('extra'))
-  setField(L, 'class', () => pushString(L, 'dialogue'))
+  lua.lua_setfield(L, table, luaKey('extra'))
+  put('class', () => pushValueString(L, 'dialogue'))
+  lua.lua_remove(L, pool)
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +856,10 @@ interface RunContext {
   hostCancelled: boolean
   /** 无进度对话框（validate/isactive/过滤器） */
   silent: boolean
+  /** 运行宏的协程（仅它可安全让出 UI；脚本自建协程/主线程不参与） */
+  co: any | null
+  /** 上次向宿主让出 UI 的时刻（progress.set 与 is_cancelled 共用节流） */
+  lastUiYieldAt: number
 }
 
 const CANCEL_MARKER = {}
@@ -667,7 +874,7 @@ function traceLevel(): number {
 }
 
 function currentContext(L: any): RunContext | null {
-  lua.lua_getfield(L, lua.LUA_REGISTRYINDEX, to_luastring('project_context'))
+  lua.lua_getfield(L, lua.LUA_REGISTRYINDEX, luaKey('project_context'))
   const context =
     lua.lua_type(L, -1) === lua.LUA_TLIGHTUSERDATA
       ? (lua.lua_touserdata(L, -1) as RunContext)
@@ -678,7 +885,7 @@ function currentContext(L: any): RunContext | null {
 
 function setContext(L: any, context: RunContext | null): void {
   lua.lua_pushlightuserdata(L, context)
-  lua.lua_setfield(L, lua.LUA_REGISTRYINDEX, to_luastring('project_context'))
+  lua.lua_setfield(L, lua.LUA_REGISTRYINDEX, luaKey('project_context'))
 }
 
 function makeLog(context: RunContext, message: string): void {
@@ -962,6 +1169,38 @@ function yieldToHost(L: any, task: YieldTask): number {
   return lua.lua_yield(L, 1)
 }
 
+/** UI 协作让出的最小间隔：只在这段时间之后才中断 Lua 让浏览器渲染/处理输入 */
+const UI_YIELD_INTERVAL_MS = 50
+
+/** 让出一个宏任务（MessageChannel 无 setTimeout 的最小 4ms 钳制） */
+let uiYieldChannel: MessageChannel | null = null
+const uiYieldResolvers: Array<() => void> = []
+
+function nextMacrotask(): Promise<void> {
+  if (!uiYieldChannel) {
+    uiYieldChannel = new MessageChannel()
+    uiYieldChannel.port1.onmessage = () => uiYieldResolvers.shift()?.()
+  }
+  return new Promise<void>((resolve) => {
+    uiYieldResolvers.push(resolve)
+    uiYieldChannel!.port2.postMessage(0)
+  })
+}
+
+/**
+ * 只能在宏协程自己的可 yield 调用边界让出：脚本自建协程（L2 与 context.co 不同）
+ * 与 table.sort/gsub 回调等 C 调用内部（nny > 0）必须原样返回，否则会干扰脚本
+ * 自己的 coroutine.resume 或直接触发 "attempt to yield across a JS-call boundary"。
+ * 宿主侧（setProgress/is_cancelled）只在有进度窗口时让出，validate/isactive 跳过。
+ */
+function canYieldToUi(L2: any, current: RunContext): boolean {
+  if (current.silent || !current.co || current.co !== L2 || !lua.lua_isyieldable(L2)) return false
+  const now = performance.now()
+  if (now - current.lastUiYieldAt < UI_YIELD_INTERVAL_MS) return false
+  current.lastUiYieldAt = now
+  return true
+}
+
 /** 宿主取消时抛出（协程被宿主循环直接放弃，不进入 Lua 错误通道） */
 function throwCancelled(): never {
   throw new AutomationCancelled('cancelled')
@@ -972,7 +1211,12 @@ function makeProgressSink(L: any): void {
     const current = currentContext(L2)
     if (!current) return 0
     current.host.setProgress?.(lua.lua_tonumber(L2, 1))
-    return 0
+    // 让出一次宏任务：否则整段脚本占满主线程，React 无法画出进度，Cancel 点击也不生效
+    if (!canYieldToUi(L2, current)) return 0
+    return yieldToHost(L2, async () => {
+      await nextMacrotask()
+      return 0
+    })
   }
   const setTask = (L2: any): number => {
     const current = currentContext(L2)
@@ -988,7 +1232,17 @@ function makeProgressSink(L: any): void {
   }
   const getCancelled = (L2: any): number => {
     const current = currentContext(L2)
-    pushBool(L2, !!current && (current.hostCancelled || (current.host.isCancelled?.() ?? false)))
+    const cancelled = () =>
+      !!current && (current.hostCancelled || (current.host.isCancelled?.() ?? false))
+    if (current && canYieldToUi(L2, current)) {
+      // 让出期间用户可能点了 Cancel，恢复后必须重新读取宿主状态
+      return yieldToHost(L2, async (co) => {
+        await nextMacrotask()
+        pushBool(co, cancelled())
+        return 1
+      })
+    }
+    pushBool(L2, cancelled())
     return 1
   }
   const debugOut = (L2: any): number => {
@@ -1136,6 +1390,7 @@ if not loadstring then loadstring = load end
 if not string.gfind then string.gfind = string.gmatch end
 if not math.mod then math.mod = math.fmod end
 if not math.log10 then math.log10 = function(x) return math.log(x, 10) end end
+
 `
 
 function stem(filename: string): string {
@@ -1277,9 +1532,17 @@ export async function loadAutomationScript(
       const message = to_jsstring(lua.lua_tostring(L, -1))
       return fail(message || 'Failed to initialise Lua runtime')
     }
+    installLuaJitStringFormat(L)
+    installRowKeyPool(L)
 
     // include 内容预载：同步 C 函数无法 await，须在执行脚本本体前完成
     const includeDirs = await refreshIncludeCache(scriptDir)
+
+    // 模块系统：aegisub.* 等内置模块走 preload；其余从 include 目录同步加载
+    // （对齐 script_reader.cpp Install / module_loader）
+    const runtime = { lua, lauxlib, to_luastring, to_jsstring }
+    installLuaModules(L, runtime)
+    installLuaModuleSearch(L, runtime, includeDirs, includeCache)
 
     const state: ScriptState = {
       id: nextStateId++,
@@ -1348,17 +1611,26 @@ export async function loadAutomationScript(
     const textExtents = (L2: any): number => {
       argCheck(L2, lua.lua_type(L2, 1) === lua.LUA_TTABLE, 1, '')
       argCheck(L2, lua.lua_isstring(L2, 2), 2, '')
-      lua.lua_getfield(L2, 1, to_luastring('class'))
-      const actualClass = lua.lua_isstring(L2, -1)
-        ? to_jsstring(lua.lua_tostring(L2, -1)).toLowerCase()
-        : ''
+      lua.lua_getfield(L2, 1, luaKey('class'))
+      const actualClass =
+        lua.lua_type(L2, -1) === lua.LUA_TSTRING
+          ? to_jsstring(lua.lua_tostring(L2, -1)).toLowerCase()
+          : ''
       lua.lua_pop(L2, 1)
       if (actualClass !== 'style') return raiseError(L2, 'Not a style entry')
-      const row = luaToRow(L2, 1)
-      if (row.class !== 'style') return raiseError(L2, 'Not a style entry')
+      // 桌面 LuaToAssEntry 会转换整行，但 CalculateTextExtents 只用这几个字段
+      const style: LuaTextExtentsStyle = {
+        fontname: fieldString(L2, 1, 'fontname', 'style'),
+        fontsize: fieldNumber(L2, 1, 'fontsize', 'style'),
+        bold: fieldBool(L2, 1, 'bold', 'style'),
+        italic: fieldBool(L2, 1, 'italic', 'style'),
+        spacing: fieldNumber(L2, 1, 'spacing', 'style'),
+        scale_x: fieldNumber(L2, 1, 'scale_x', 'style'),
+        scale_y: fieldNumber(L2, 1, 'scale_y', 'style'),
+      }
       const text = checkString(L2, 2)
       const context = currentContext(L2)
-      const result = context?.host.textExtents?.(row, text) ?? null
+      const result = context?.host.textExtents?.(style, text) ?? null
       if (!result) return raiseError(L2, 'Some internal error occurred calculating text_extents')
       pushNumber(L2, result.width)
       pushNumber(L2, result.height)
@@ -1688,6 +1960,8 @@ function prepareRun(
     cancelled: false,
     hostCancelled: false,
     silent: options.silent,
+    co: null,
+    lastUiYieldAt: 0,
   }
   setContext(state.L, context)
   return { context, model }
@@ -1760,6 +2034,7 @@ export async function runAutomationMacro(
 
     // 移入协程：[xpcall, f, msgh, subs, sel, active]，nargs = 1 + 1 + 3
     const co = lua.lua_newthread(L)
+    context.co = co
     lua.lua_insert(L, -6)
     lua.lua_xmove(L, co, 5)
     lua.lua_getglobal(co, to_luastring('xpcall'))
@@ -2203,6 +2478,7 @@ export async function runAutomationFilter(
 
     // 移入协程：[xpcall, f, msgh, subs, config]，nargs = 1 + 1 + 2
     const co = lua.lua_newthread(L)
+    context.co = co
     lua.lua_insert(L, -5)
     lua.lua_xmove(L, co, 4)
     lua.lua_getglobal(co, to_luastring('xpcall'))

@@ -107,6 +107,102 @@ function boolField(raw: Record<string, unknown>, name: string, def: boolean): bo
 }
 
 // ---------------------------------------------------------------------------
+// 颜色（agi::Color 构造语义，libaegisub/common/parser.cpp 的 color_grammar）
+// ---------------------------------------------------------------------------
+
+interface Rgba {
+  r: number
+  g: number
+  b: number
+  a: number
+}
+
+function hexByte(digits: string): number {
+  return parseInt(digits, 16)
+}
+
+/** CSS `rgb()/rgba()` 分量：uint_parser<unsigned char>，超过 255 即解析失败 */
+function cssComponent(text: string): number | null {
+  const value = Number(text)
+  return value >= 0 && value <= 255 ? value : null
+}
+
+/**
+ * 解析颜色字符串（成功）或返回全 0（解析失败，agi::Color 默认值）。
+ * 支持：`#RGB`、`#RRGGBB`、`rgb(r,g,b)`、`rgba(r,g,b,a)`、
+ * SSA 十进制 ABGR、`[&][H]BBGGRR[&]`、`[&][H]AABBGGRR[&]`（ABGR 序）。
+ * 注意 `#RRGGBBAA` 不被源码语法接受（仅 3/6 位 CSS），与桌面一致。
+ */
+function parseColor(value: string): Rgba {
+  const zero: Rgba = { r: 0, g: 0, b: 0, a: 0 }
+  let match = /^#([0-9a-fA-F]{3})$/.exec(value)
+  if (match) {
+    const [r, g, b] = match[1].split('').map((digit) => hexByte(digit + digit))
+    return { r, g, b, a: 0 }
+  }
+  match = /^#([0-9a-fA-F]{6})$/.exec(value)
+  if (match)
+    return {
+      r: hexByte(match[1].slice(0, 2)),
+      g: hexByte(match[1].slice(2, 4)),
+      b: hexByte(match[1].slice(4, 6)),
+      a: 0,
+    }
+  match = /^rgb\([ \t]*(\d{1,3})[ \t]*,[ \t]*(\d{1,3})[ \t]*,[ \t]*(\d{1,3})[ \t]*\)$/.exec(value)
+  if (match) {
+    const r = cssComponent(match[1])
+    const g = cssComponent(match[2])
+    const b = cssComponent(match[3])
+    if (r !== null && g !== null && b !== null) return { r, g, b, a: 0 }
+  }
+  match =
+    /^rgba\([ \t]*(\d{1,3})[ \t]*,[ \t]*(\d{1,3})[ \t]*,[ \t]*(\d{1,3})[ \t]*,[ \t]*(\d{1,3})[ \t]*\)$/.exec(
+      value,
+    )
+  if (match) {
+    const r = cssComponent(match[1])
+    const g = cssComponent(match[2])
+    const b = cssComponent(match[3])
+    const a = cssComponent(match[4])
+    if (r !== null && g !== null && b !== null && a !== null) return { r, g, b, a }
+  }
+  // int_（SSA）在 ASS 十六进制之前：纯十进制数字一律按 ABGR 整数解释
+  if (/^[+-]?\d+$/.test(value)) {
+    const abgr = Number(value) >>> 0
+    return {
+      r: abgr & 0xff,
+      g: (abgr >>> 8) & 0xff,
+      b: (abgr >>> 16) & 0xff,
+      a: (abgr >>> 24) & 0xff,
+    }
+  }
+  match = /^&?[Hh]?([0-9a-fA-F]{8})&?$/.exec(value)
+  if (match)
+    return {
+      r: hexByte(match[1].slice(6, 8)),
+      g: hexByte(match[1].slice(4, 6)),
+      b: hexByte(match[1].slice(2, 4)),
+      a: hexByte(match[1].slice(0, 2)),
+    }
+  match = /^&?[Hh]?([0-9a-fA-F]{6})&?$/.exec(value)
+  if (match)
+    return {
+      r: hexByte(match[1].slice(4, 6)),
+      g: hexByte(match[1].slice(2, 4)),
+      b: hexByte(match[1].slice(0, 2)),
+      a: 0,
+    }
+  return zero
+}
+
+/** Color::GetHexFormatted：`#RRGGBB`（alpha=false）或 `#RRGGBBAA` */
+function colorHex(value: string, alpha: boolean): string {
+  const color = parseColor(value)
+  const byte = (component: number) => component.toString(16).padStart(2, '0').toUpperCase()
+  return `#${byte(color.r)}${byte(color.g)}${byte(color.b)}${alpha ? byte(color.a) : ''}`
+}
+
+// ---------------------------------------------------------------------------
 // 控件 spec
 // ---------------------------------------------------------------------------
 
@@ -237,8 +333,9 @@ function parseControl(raw: unknown): DialogControl {
     hint: stringField(record, 'hint'),
     x: intField(record, 'x', 0),
     y: intField(record, 'y', 0),
-    width: intField(record, 'width', 1),
-    height: intField(record, 'height', 1),
+    // docs：width/height 小于等于 0 时按 1 处理
+    width: Math.max(1, intField(record, 'width', 1)),
+    height: Math.max(1, intField(record, 'height', 1)),
   }
 
   if (controlClass === 'label')
@@ -299,9 +396,19 @@ function parseControl(raw: unknown): DialogControl {
       value: boolField(record, 'value', false),
     }
   if (controlClass === 'color')
-    return { ...base, kind: 'color', value: stringField(record, 'value'), alpha: false }
+    return {
+      ...base,
+      kind: 'color',
+      value: colorHex(stringField(record, 'value'), false),
+      alpha: false,
+    }
   if (controlClass === 'coloralpha')
-    return { ...base, kind: 'coloralpha', value: stringField(record, 'value'), alpha: true }
+    return {
+      ...base,
+      kind: 'coloralpha',
+      value: colorHex(stringField(record, 'value'), true),
+      alpha: true,
+    }
 
   throw new Error('bad control table entry')
 }
@@ -366,15 +473,11 @@ export function dialogReadBackValues(
       case 'edit':
       case 'textbox':
       case 'dropdown':
+        return typeof value === 'string' ? value : value == null ? '' : asLuaString(value)
       case 'color':
       case 'coloralpha':
-        return typeof value === 'string'
-          ? value
-          : value == null
-            ? control.kind === 'color' || control.kind === 'coloralpha'
-              ? control.value
-              : ''
-            : asLuaString(value)
+        // 回读值由宿主提供（已是 Color::GetHexFormatted 的 #RRGGBB[AA]，不再二次解析）
+        return typeof value === 'string' ? value : control.value
       case 'intedit':
         return asLuaInteger(value)
       case 'floatedit':

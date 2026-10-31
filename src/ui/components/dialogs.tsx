@@ -160,6 +160,22 @@ export function Dialog({
 // （auto4_lua_dialog.cpp 的 LuaDialog、auto4_lua_progresssink.cpp 的进度报告）
 // ---------------------------------------------------------------------------
 
+/** wxWidgets 标签助记符：单个 & 标记快捷键（显示时去掉），&& 表示字面 & */
+function wxLabel(label: string): string {
+  let result = ''
+  for (let i = 0; i < label.length; i++) {
+    if (label[i] !== '&') {
+      result += label[i]
+      continue
+    }
+    if (label[i + 1] === '&') {
+      result += '&'
+      i++
+    }
+  }
+  return result
+}
+
 /** #RRGGBB[AA] → <input type="color"> 的 #RRGGBB */
 function toColorInput(value: DialogValue): string {
   const hex = typeof value === 'string' ? value : ''
@@ -168,10 +184,11 @@ function toColorInput(value: DialogValue): string {
 
 /** <input type="color"> 的 #RRGGBB → 回读值（coloralpha 保留原 alpha 分量） */
 function fromColorInput(next: string, previous: DialogValue, alpha: boolean): string {
-  if (!alpha) return next
+  const rgb = next.toUpperCase()
+  if (!alpha) return rgb
   const match =
     typeof previous === 'string' ? previous.match(/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})$/) : null
-  return `${next}${match ? match[1] : 'FF'}`
+  return `${rgb}${match ? match[1].toUpperCase() : '00'}`
 }
 
 function DialogControlField({
@@ -185,12 +202,13 @@ function DialogControlField({
 }) {
   switch (control.kind) {
     case 'label':
-      return <span className="lua-config-label">{control.label}</span>
+      return <span className="lua-config-label">{wxLabel(control.label)}</span>
     case 'edit':
       return (
         <input
           type="text"
           value={typeof value === 'string' ? value : ''}
+          title={control.hint || undefined}
           onChange={(event) => onChange(event.target.value)}
         />
       )
@@ -199,6 +217,7 @@ function DialogControlField({
         <textarea
           rows={4}
           value={typeof value === 'string' ? value : ''}
+          title={control.hint || undefined}
           onChange={(event) => onChange(event.target.value)}
         />
       )
@@ -210,6 +229,7 @@ function DialogControlField({
           min={control.min}
           max={control.max}
           step={1}
+          title={control.hint || undefined}
           onChange={(event) => onChange(Math.trunc(Number(event.target.value)))}
         />
       )
@@ -221,6 +241,7 @@ function DialogControlField({
           min={control.min}
           max={control.max}
           step={control.step || 'any'}
+          title={control.hint || undefined}
           onChange={(event) => onChange(Number(event.target.value))}
         />
       )
@@ -228,6 +249,7 @@ function DialogControlField({
       return (
         <select
           value={typeof value === 'string' ? value : ''}
+          title={control.hint || undefined}
           onChange={(e) => onChange(e.target.value)}
         >
           {control.items.map((item, index) => (
@@ -239,13 +261,13 @@ function DialogControlField({
       )
     case 'checkbox':
       return (
-        <label className="lua-config-check">
+        <label className="lua-config-check" title={control.hint || undefined}>
           <input
             type="checkbox"
             checked={value === true}
             onChange={(e) => onChange(e.target.checked)}
           />
-          {control.label}
+          {wxLabel(control.label)}
         </label>
       )
     case 'color':
@@ -254,6 +276,7 @@ function DialogControlField({
         <input
           type="color"
           value={toColorInput(value)}
+          title={control.hint || undefined}
           onChange={(event) => onChange(fromColorInput(event.target.value, value, control.alpha))}
         />
       )
@@ -264,11 +287,14 @@ function DialogControlField({
 export function LuaConfigDialog({
   spec,
   initialValues,
+  title,
   onSubmit,
 }: {
   spec: DialogSpec
   /** 已有配置值（导出过滤器的 Configure 重开时回填）；缺省用控件默认值 */
   initialValues?: DialogValue[]
+  /** 对话框标题（源码 ProgressSink::ShowDialog 用 BackgroundScriptRunner 的标题） */
+  title?: string
   onSubmit: (response: DialogResponse) => void
 }) {
   const [values, setValues] = useState<DialogValue[]>(
@@ -278,7 +304,7 @@ export function LuaConfigDialog({
     setValues((current) => current.map((item, i) => (i === index ? value : item)))
 
   const buttonLabel = (id: number, label: string) => {
-    if (label) return label
+    if (label) return wxLabel(label)
     if (id === WX_ID.ok) return tPlain('OK')
     if (id === WX_ID.cancel) return tPlain('Cancel')
     if (id === WX_ID.yes) return tPlain('Yes')
@@ -286,9 +312,25 @@ export function LuaConfigDialog({
     return ''
   }
 
+  // wxGridBagSizer：每个控件按 (x, y, width, height) 占格；默认按钮（OK/YES/SAVE）
+  // 缺省时格子按 1 计算
+  const columns = Math.max(1, ...spec.controls.map((control) => control.x + control.width))
+  const rows = Math.max(1, ...spec.controls.map((control) => control.y + control.height))
+  const defaultButton = spec.buttons.findIndex(
+    (button) => button.id === WX_ID.ok || button.id === WX_ID.yes || button.id === WX_ID.save,
+  )
+  /** wxSetDefault：Enter 触发默认按钮（textarea 内换行、按钮自身回车除外） */
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Enter' || event.nativeEvent.isComposing || defaultButton < 0) return
+    const tag = (event.target as HTMLElement).tagName
+    if (tag === 'TEXTAREA' || tag === 'BUTTON') return
+    event.preventDefault()
+    onSubmit({ button: defaultButton, values })
+  }
+
   return (
     <Dialog
-      title={tPlain('Script Configuration')}
+      title={title || tPlain('Script Configuration')}
       onClose={() => onSubmit({ button: -1, values })}
       footer={spec.buttons.map((button, index) => (
         <button key={index} className="button" onClick={() => onSubmit({ button: index, values })}>
@@ -296,9 +338,23 @@ export function LuaConfigDialog({
         </button>
       ))}
     >
-      <div className="lua-config-body">
+      <div
+        className="lua-config-body"
+        style={{
+          gridTemplateColumns: `repeat(${columns}, auto)`,
+          gridTemplateRows: `repeat(${rows}, auto)`,
+        }}
+        onKeyDown={handleKeyDown}
+      >
         {spec.controls.map((control, index) => (
-          <div key={index} className="lua-config-control">
+          <div
+            key={index}
+            className={`lua-config-control${control.kind === 'label' ? ' lua-config-cell-label' : ''}`}
+            style={{
+              gridColumn: `${control.x + 1} / span ${control.width}`,
+              gridRow: `${control.y + 1} / span ${control.height}`,
+            }}
+          >
             <DialogControlField
               control={control}
               value={values[index]}
@@ -311,31 +367,51 @@ export function LuaConfigDialog({
   )
 }
 
-/** 宏运行期的进度/取消对话框（BackgroundScriptRunner 的 Web 版） */
+/** 宏运行期的进度/取消对话框（BackgroundScriptRunner 的 DialogProgress Web 版） */
 export function LuaProgressDialog({
   title,
   task,
   value,
+  log,
+  finished,
+  cancelling,
   onCancel,
+  onClose,
 }: {
   title: string
   task: string
   value: number
+  /** aegisub.log / debug.out 输出及运行期错误（wxTextCtrl 只读日志框） */
+  log: string
+  /** 任务结束：窗口保持打开显示日志，按钮变 Close，进度拉满 */
+  finished: boolean
+  /** 已请求取消：按钮禁用并显示 Cancelling... */
+  cancelling: boolean
   onCancel: () => void
+  onClose: () => void
 }) {
+  // 运行期关闭窗口等价于取消（wxDialog 关闭 → Run 抛 UserCancelException）
+  const requestClose = finished ? onClose : onCancel
   return (
     <Dialog
       title={title || tPlain('Progress')}
-      onClose={onCancel}
+      onClose={requestClose}
       footer={
-        <button className="button" onClick={onCancel}>
-          {tPlain('Cancel')}
-        </button>
+        finished ? (
+          <button className="button" onClick={onClose}>
+            {tPlain('Close')}
+          </button>
+        ) : (
+          <button className="button" onClick={onCancel} disabled={cancelling}>
+            {cancelling ? tPlain('Cancelling...') : tPlain('Cancel')}
+          </button>
+        )
       }
     >
       <div className="lua-progress">
         <progress max={100} value={Math.max(0, Math.min(100, value))} />
-        <span>{task}</span>
+        <span className="lua-progress-task">{task}</span>
+        {log ? <pre className="lua-progress-log">{log}</pre> : null}
       </div>
     </Dialog>
   )

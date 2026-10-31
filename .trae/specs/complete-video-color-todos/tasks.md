@@ -61,4 +61,13 @@
 - [x] 8.5 复验：DPR 1/1.25/1.5/1.75/2 下整张滑块画布非调色板颜色 **0 个**；点中滑块（焦点 + 游标在中间）后同样为 0
 - [x] 8.6 `pnpm typecheck` / `pnpm lint` / `pnpm test` 全通过（238 tests）
 
+## T9 WebCodecs 回退路径矩阵偏差（2026-10-28 实测修复）
+- [x] 9.1 实证（Chrome 1234，`test_h264.mp4` 640×360 未标记）：同一帧 `drawImage(VideoFrame)` = BT.709 + bilinear（与自算 max 2）；原生 `<video>` = BT.601 + bilinear（max 2）；两者 mean 19.15 → 回退路径与 `<video>`/Aegisub 差一个矩阵
+- [x] 9.2 `VideoDecoderConfig.colorSpace` 行为：四字段缺一不可（只给 matrix/fullRange 被整段忽略，帧仍 bt709）；primaries/transfer 换 601 系会触发 Chrome 原色转换（vs `<video>` mean 7.84）→ 只让矩阵/范围走 `guess_colorspace`，primaries/transfer 沿用容器值（缺省 bt709）
+- [x] 9.3 `src/media/videoColor.ts` 新增 `resolveDecoderColorSpace`（FFmpeg 名→WebCodecs 枚举；FCC 等不可映射返回 null 保持默认）；`src/media/webcodecsVideo.ts` 的 `isConfigSupported`/`configure` 改用补过 `colorSpace` 的配置
+- [x] 9.4 集成复验：真实 `WebCodecsVideoSource` seek 到 250ms，画布像素与 `<video>` 逐像素一致（max 0 / mean 0），与 601 参考 max 2
+- [x] 9.5 `pnpm typecheck` / `pnpm lint` / `pnpm test`（238 tests）通过
+- [x] 9.6 枚举收窄（Chrome 1234 探测）：matrix 仅 bt709/bt470bg/smpte170m/bt2020-ncl，transfer 仅 bt709/smpte170m/iec61966-2-1/linear/pq/hlg（smpte2084→pq、arib-std-b67→hlg；bt2020-10/12、smpte240m、bt2020-cl、fcc 会被 `isConfigSupported` 抛 TypeError）；`normalizeColorName` 把 ffmpeg 的 `unknown/unspecified` 归一为空串按缺省 bt709 处理，容器标记非空但不可映射时整段返回 null（保持浏览器默认，不强行回落 bt709）
+- [x] 9.7 复核：多时间点交叉比对中，WebCodecs 画布与 `<video>` 在 4 个不同内容帧上逐像素 max 0；`<video>` 的 `drawImage` 偶发陈旧帧（同一目标时间多次截图不一致），比对不能只看单次截图
+
 

@@ -5,9 +5,10 @@
  * 解封装（web-demuxer）→ VideoDecoder 解码 → canvas 逐帧上屏；
  * seek 从目标时间前最近的关键帧开始解码到目标帧（与 libav 的 AVSEEK_FLAG_BACKWARD 一致）。
  */
-import { AVSeekFlag } from 'web-demuxer'
+import { AVSeekFlag, type WebAVStream } from 'web-demuxer'
 
 import { openDemuxer, parseFraction, type DemuxProbe } from './demux'
+import { parseContainerColorspace, resolveDecoderColorSpace } from './videoColor'
 
 export interface WebCodecsVideoEvents {
   onDurationChange(durationMs: number): void
@@ -22,11 +23,54 @@ export interface WebCodecsVideoEvents {
 
 const FRAME_BUFFER_HIGH = 24 // 已解码帧缓冲上限（内存背压）
 const DECODE_QUEUE_HIGH = 32 // 解码器排队上限
-// seek 泵帧水位：未 close 的 VideoFrame 持有硬解 surface（D3D11 池约 20 个），
-// 耗尽后解码器停止输出，目标帧永远到不了——必须远低于该阈值并及时丢弃
-const SEEK_FRAME_HIGH = 12
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** web-demuxer 读流应答超时：worker 在等 ReadNextAVPacket/Stop 时不会回 AVPacketStream，
+ *  cancel() 永不 resolve；读包也可能丢应答。超时兜底避免 seek/打开永久卡死 */
+const READER_CANCEL_TIMEOUT_MS = 300
+const READ_TIMEOUT_MS = 8000
+
+/** 等待 promise 完成；超时或失败返回 false（不取消 promise 本身） */
+async function waitWithTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs)
+  })
+  try {
+    // 失败也视为"已应答"：读流异常由调用方的 await 处理，避免迟到的 rejection 无人接管
+    return await Promise.race([
+      promise.then(
+        () => true,
+        () => true,
+      ),
+      timeout,
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * 给解码配置补上帧色彩空间（VideoDecoderConfig.colorSpace）。
+ *
+ * Aegisub 的 YUV→RGB 矩阵由 guess_colorspace 决定（未标记时 SD 按 601、其余按 709，
+ * 范围缺省 limited），但 Chrome 的 VideoDecoder 对未标记视频一律报 BT.709，回退路径
+ * 会与 <video>/Aegisub 差一个矩阵。实测详见 media/videoColor.ts 的 resolveDecoderColorSpace。
+ */
+function withDecoderColorSpace(
+  config: VideoDecoderConfig,
+  stream: WebAVStream,
+): VideoDecoderConfig {
+  const colorSpace = resolveDecoderColorSpace(
+    parseContainerColorspace(stream.color_space ?? '', stream.color_range ?? ''),
+    stream.width || config.codedWidth || 0,
+    stream.height || config.codedHeight || 0,
+    stream.color_primaries ?? '',
+    stream.color_transfer ?? '',
+  )
+  return colorSpace ? { ...config, colorSpace } : config
+}
 
 export interface WebCodecsVideoOpenResult {
   source: WebCodecsVideoSource | null
@@ -40,6 +84,8 @@ export class WebCodecsVideoSource {
   private context: CanvasRenderingContext2D
   private events: WebCodecsVideoEvents
   private decoder: VideoDecoder
+  /** 解码配置：seek 时 reset() 会退回 unconfigured，必须原样重新 configure */
+  private decoderConfig: VideoDecoderConfig | null = null
   private reader: ReadableStreamDefaultReader<EncodedVideoChunk> | null = null
   /** 解码输出（呈现顺序），drawUpTo 消费 */
   private frames: VideoFrame[] = []
@@ -118,16 +164,17 @@ export class WebCodecsVideoSource {
         probe.demuxer.destroy()
         return { source: null, reason: '无法获取视频解码配置' }
       }
-      const support = await VideoDecoder.isConfigSupported(config).catch(() => null)
+      const decoderConfig = withDecoderColorSpace(config, probe.videoStream)
+      const support = await VideoDecoder.isConfigSupported(decoderConfig).catch(() => null)
       if (!support?.supported) {
         probe.demuxer.destroy()
         return {
           source: null,
-          reason: `此浏览器不支持解码 ${config.codec}（Firefox 的 HEVC 需要 134+ 且依赖系统；10bit H.264 多数浏览器不支持）`,
+          reason: `此浏览器不支持解码 ${config.codec}（Firefox 的 WebCodecs 未开放 HEVC，即使原生 <video> 可播；10bit H.264 多数浏览器也不支持）`,
         }
       }
       const source = new WebCodecsVideoSource(probe, canvas, events)
-      await source.open(config, probe)
+      await source.open(decoderConfig, probe)
       return { source, reason: '' }
     } catch (error) {
       probe.demuxer.destroy()
@@ -149,6 +196,7 @@ export class WebCodecsVideoSource {
     this.events.onIntrinsicSize(width, height)
     const fps = parseFraction(stream.avg_frame_rate) || parseFraction(stream.r_frame_rate) || 24
     this.events.onFrameRate(fps)
+    this.decoderConfig = config
     this.decoder.configure(config)
     // 打开即建读流（reader 仅由 restartReader 创建，doSeek 之外必须显式建立，
     // 否则 showFirstFrame/播放 pumpChunk 拿不到数据 → 永久黑屏卡 0）
@@ -171,7 +219,8 @@ export class WebCodecsVideoSource {
       if (!ok) return // 流结束或已由 onError 上报
       if (this.decoder.decodeQueueSize > 0) await sleep(0)
     }
-    while (this.decoder.decodeQueueSize > 0 && !this.destroyed) await sleep(4)
+    // 首帧即到即画：不等待解码队列排空（排空依赖输出释放 surface，持帧等待会互相卡死，
+    // 表现为打开视频后 source 迟迟注册不上，点击进度条完全无反应）
     if (this.destroyed || !this.frames.length) return
     this.drawUpTo(this.frames[0].timestamp)
     this.flushKeyframes()
@@ -289,6 +338,11 @@ export class WebCodecsVideoSource {
       abandon()
       return
     }
+    // 解复用器换流只停止"读"，已送入解码器的旧包仍留在解码队列并继续输出：
+    // 它们与目标位置的帧混进 this.frames（向后 seek 时旧帧 ≥ 目标还会让
+    // 解码循环提前结束），同一目标两次 seek 因此呈现不同帧。reset 丢弃全部
+    // 排队/在途解码请求，再重新 configure（reset 后解码器回到 unconfigured）。
+    this.resetDecoder()
     this.closeAllFrames()
     // 解码到出现 ≥ 目标时间的帧（起点为关键帧，之间全部可用于绘制）
     for (;;) {
@@ -297,24 +351,18 @@ export class WebCodecsVideoSource {
         return
       }
       if (this.frames.some((frame) => frame.timestamp >= targetUs)) break
-      // 帧背压：目标之前的帧不参与最终绘制，超水位即丢弃释放硬解 surface
-      if (this.frames.length >= SEEK_FRAME_HIGH) this.dropFramesBefore(targetUs)
+      // 帧背压：只需保留目标前最后一帧（drawUpTo 用），其余立即 close 释放硬解 surface；
+      // 持帧不放会让解码器耗尽 surface 停止输出，队列永远降不下来
+      this.dropFramesBefore(targetUs)
       // 解码队列水位：等输出消化再喂，避免整个文件被泵进队列
       while (this.decoder.decodeQueueSize >= DECODE_QUEUE_HIGH && !superseded()) await sleep(4)
       const ok = await this.pumpChunk()
       if (!ok) break
       if (this.decoder.decodeQueueSize > 0 && !this.frames.length) await sleep(0)
     }
-    // B 帧乱序（解码序 ≠ 显示序）：显示序 ≤ 目标的帧可能在 ≥ 目标的帧之后才输出，
-    // 等队列消化再绘制；期间同样需要帧背压，否则 surface 耗尽队列永远消化不完
-    while (this.decoder.decodeQueueSize > 0 && !superseded()) {
-      const crowded = this.frames.length >= SEEK_FRAME_HIGH
-      this.dropFramesBefore(targetUs)
-      // 丢弃无效（输出帧全部 ≥ 目标）：剩余队列帧最终都会被 closeAllFrames 丢弃
-      if (crowded && this.frames.length >= SEEK_FRAME_HIGH) break
-      await sleep(4)
-    }
-    // 被取代：不绘制、不恢复播放（最新目标自己的 job 会完成呈现）
+    // VideoDecoder 按呈现序输出（B 帧乱序在解码器内部已重排）：出现 ≥ 目标的帧即说明
+    // 目标帧已到达。这里不能等 decodeQueueSize 归零——排空依赖输出 dispose surface，
+    // 而帧由我们持有，等待只会互相卡死（表现为点击进度条后时间变、画面不动）。
     if (superseded()) {
       abandon()
       return
@@ -347,10 +395,16 @@ export class WebCodecsVideoSource {
   }
 
   private async restartReader(startSec: number): Promise<void> {
-    if (this.reader) {
-      const previous = this.reader
-      this.reader = null
-      await previous.cancel().catch(() => undefined)
+    const previous = this.reader
+    this.reader = null
+    if (previous) {
+      // StopReadAVPacket 已同步发给 worker（按消息顺序处理），因此不必等它回包；
+      // 但 worker 空闲等待下一次读请求时收到 Stop 不回包，cancel 永不 resolve，
+      // 必须超时兜底，否则 seekJob 链永久卡死、后续 seek 全部排队不执行
+      await waitWithTimeout(
+        previous.cancel().catch(() => undefined),
+        READER_CANCEL_TIMEOUT_MS,
+      )
     }
     const stream = this.probe.demuxer.read(
       'video',
@@ -362,12 +416,32 @@ export class WebCodecsVideoSource {
     this.streamDone = false
   }
 
-  /** 读一个包并送入解码器；false = 流结束或被取代 */
+  /** 丢弃解码器内所有排队/在途请求并恢复配置（seek 换流后调用，见 doSeek） */
+  private resetDecoder(): void {
+    if (this.decoder.state !== 'configured' || !this.decoderConfig) return
+    this.decoder.reset()
+    this.decoder.configure(this.decoderConfig)
+  }
+
+  /** 读一个包并送入解码器；false = 流结束、读应答超时或被取代 */
   private async pumpChunk(): Promise<boolean> {
     const reader = this.reader
     if (!reader || this.destroyed) return false
-    const { done, value } = await reader.read()
-    if (this.reader !== reader) return false
+    // worker 可能丢失读应答（ReadNextAVPacket/AVPacketStream）：超时放弃当前读流
+    // （下次 seek 重建），否则 seek/播放会永久挂起
+    const pending = reader.read()
+    if (!(await waitWithTimeout(pending, READ_TIMEOUT_MS))) {
+      if (this.reader === reader) this.reader = null
+      this.streamDone = true
+      void reader.cancel().catch(() => undefined)
+      this.events.onError('解复用器读包超时（已放弃当前读流，请重新定位）')
+      return false
+    }
+    if (this.reader !== reader) {
+      void pending.catch(() => undefined)
+      return false
+    }
+    const { done, value } = await pending
     if (done || !value) {
       this.streamDone = true
       return false
