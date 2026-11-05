@@ -1,14 +1,15 @@
 /**
  * 虚拟便携文件系统（VFS）。
  *
- * 对齐源码的便携包目录结构（Aegisub/src/main.cpp L167-181）：桌面版便携模式下
- * `?data/config.json` 存在即把 `?user`、`?local` 重定向到 `?data`（可执行文件目录）。
- * Web 版恒为便携模式，故 `?data`/`?user`/`?local` 三者指向同一虚拟根 `/`；
+ * 对齐源码的便携包目录结构（Aegisub/src/main.cpp L173-181）：桌面版便携模式下
+ * `?data/config.json` 存在即把 `?user`、`?cache`、`?state` 重定向到 `?data`（可执行文件目录）。
+ * Web 版恒为便携模式，故 `?data`/`?user`/`?cache`/`?state` 均指向同一虚拟根 `/`；
  * `?dictionary` 由 `?data/dictionaries` 派生为 `/dictionaries`。
  *
  * 令牌解析对齐 libaegisub/common/path.cpp：
- * - Decode（L66-74）：`?token/rest` → 根 / rest；令牌未设置或路径不以令牌开头时原样返回。
- * - Encode（L118-134）：逐令牌取最短相对编码，平局保留令牌数组序靠前者。
+ * - Decode（L76-86）：`?token/rest` → 根 / rest；令牌未设置或路径不以令牌开头时原样返回。
+ * - Encode（L132-148）：逐令牌取最短相对编码，平局保留令牌数组序靠前者。
+ * - `?local` 是 `?cache` 的遗留别名（源码 find_token L43-50 特判），Encode 不会产出它。
  * 路径一律使用 POSIX 风格虚拟绝对路径；`?temp`、`?audio`、`?video`、`?script`
  * 在 Web 无对应落盘位置（`?script` 为会话令牌，Decode 原样返回）。
  *
@@ -18,13 +19,14 @@
  */
 import { openMainDatabase } from './db'
 
-/** 令牌全集，顺序即源码 path.cpp L24-33，Encode 平局时取数组序靠前者 */
+/** 令牌全集，顺序即源码 path.cpp L27-37，Encode 平局时取数组序靠前者 */
 export const VFS_TOKENS = [
   '?audio',
+  '?cache',
   '?data',
   '?dictionary',
-  '?local',
   '?script',
+  '?state',
   '?temp',
   '?user',
   '?video',
@@ -34,26 +36,27 @@ export type VfsToken = (typeof VFS_TOKENS)[number]
 
 /**
  * Web 便携模式下的令牌根（对应 Path::SetToken 后的 paths[]）。
- * `?data`/`?user`/`?local` 同为便携包根；空串表示未设置（Decode 原样返回）。
+ * `?data`/`?user`/`?cache`/`?state` 同为便携包根；空串表示未设置（Decode 原样返回）。
  */
 const TOKEN_ROOTS: Record<VfsToken, string> = {
   '?audio': '',
+  '?cache': '/',
   '?data': '/',
   '?dictionary': '/dictionaries',
-  '?local': '/',
   '?script': '',
+  '?state': '/',
   '?temp': '',
   '?user': '/',
   '?video': '',
 }
 
-/** 虚拟目录标准位置（对应源码 OPT Path/* 默认值；便携模式 ?user/?data 同根合并） */
+/** 虚拟目录标准位置（对应源码 OPT Path/* 默认值；便携模式 ?user/?state/?cache 同根合并） */
 export const VFS_DIRS = {
-  /** Path/Auto/Save（?user/autosave） */
+  /** Path/Auto/Save（?state/autosave） */
   autosave: '/autosave',
-  /** Path/Auto/Backup（?user/autoback） */
+  /** Path/Auto/Backup（?state/autoback） */
   autoback: '/autoback',
-  /** 崩溃恢复目录（?user/recovered，main.cpp L398） */
+  /** 崩溃恢复目录（?state/recovered，main.cpp L403） */
   recovered: '/recovered',
   /** 样式库（?user/catalog，ass_style_storage.cpp） */
   catalog: '/catalog',
@@ -128,13 +131,15 @@ export function stem(path: string): string {
 
 function findToken(path: string): VfsToken | null {
   if (path.length < 5 || path[0] !== '?') return null
+  // ?local 是 ?cache 旧名（源码 find_token 特判，Encode 不产出）
+  if (path.startsWith('?local')) return '?cache'
   for (const token of VFS_TOKENS) {
     if (path.startsWith(token)) return token
   }
   return null
 }
 
-/** 令牌路径 → 虚拟绝对路径（Path::Decode，path.cpp L66-74） */
+/** 令牌路径 → 虚拟绝对路径（Path::Decode，path.cpp L76-86） */
 export function vfsDecode(tokenPath: string): string {
   if (!tokenPath) return tokenPath
   const token = findToken(tokenPath)
@@ -154,7 +159,7 @@ function componentCount(path: string): number {
     .filter((segment) => segment !== '').length
 }
 
-/** MakeRelative(path, base)：path.cpp L85-106 */
+/** MakeRelative(path, base)：path.cpp L97-118 */
 function makeRelative(path: string, base: string): string {
   const target = normalizePath(path)
   const reference = normalizePath(base)
@@ -171,7 +176,7 @@ function makeRelative(path: string, base: string): string {
   return [...baseParts.slice(index).map(() => '..'), ...targetParts.slice(index)].join('/')
 }
 
-/** 虚拟绝对路径 → 最短令牌编码（Path::Encode，path.cpp L118-134） */
+/** 虚拟绝对路径 → 最短令牌编码（Path::Encode，path.cpp L132-148） */
 export function vfsEncode(path: string): string {
   const target = normalizePath(path)
   let shortest = target

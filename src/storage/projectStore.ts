@@ -2,13 +2,13 @@
  * 自动保存与备份（对应源码 src/subs_controller.cpp）。
  *
  * AutoSave()（L255-292）：仅在文档有未自动保存的修改时写入
- * Path/Auto/Save（默认 ?user/autosave）下
+ * Path/Auto/Save（默认 ?state/autosave）下
  * `名称.年-月-日-时-分-秒.AUTOSAVE.ass`（源码 "%s.%s.AUTOSAVE.ass"，
  * name = filename.filename() 含扩展名；源码不清理旧自动保存，此处同样保留）。
  * 内容为真实 .ass 文本（core.export('ass')），落 VFS files store。
  * Load()（L184-194）：App/Auto/Backup 开启时把原始文件复制为
  * `名称.ORIGINAL.扩展名`（stem + ".ORIGINAL" + extension）到 Path/Auto/Backup
- * （默认 ?user/autoback），同名覆盖（每文件保留一份）。
+ * （默认 ?state/autoback），同名覆盖（每文件保留一份）。
  *
  * 旧数据（v4 projects store 的 autosave:<时间戳> 键与 v3 单槽 autosave 键）
  * 仅作只读回退：旧自动保存是内存文档快照，离线无法导出 .ass，

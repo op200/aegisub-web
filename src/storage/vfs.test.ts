@@ -15,12 +15,17 @@ import {
   vfsEncode,
 } from './vfs'
 
-describe('vfsDecode（Path::Decode，path.cpp L66-74）', () => {
-  it('展开便携根令牌 ?user/?local/?data 到虚拟根', () => {
+describe('vfsDecode（Path::Decode，path.cpp L76-86）', () => {
+  it('展开便携根令牌 ?user/?cache/?state/?data 到虚拟根', () => {
     expect(vfsDecode('?user/config.json')).toBe('/config.json')
     expect(vfsDecode('?data/automation/autoload')).toBe('/automation/autoload')
-    expect(vfsDecode('?local/ffms2cache')).toBe('/ffms2cache')
+    expect(vfsDecode('?cache/ffms2cache')).toBe('/ffms2cache')
+    expect(vfsDecode('?state/autosave')).toBe('/autosave')
     expect(vfsDecode('?user')).toBe('/')
+  })
+
+  it('?local 作为 ?cache 遗留别名仍可解码', () => {
+    expect(vfsDecode('?local/ffms2cache')).toBe('/ffms2cache')
   })
 
   it('?dictionary 派生为 /dictionaries', () => {
@@ -39,17 +44,17 @@ describe('vfsDecode（Path::Decode，path.cpp L66-74）', () => {
   })
 })
 
-describe('vfsEncode（Path::Encode，path.cpp L118-134）', () => {
+describe('vfsEncode（Path::Encode，path.cpp L132-148）', () => {
   it('取最短令牌前缀', () => {
     expect(vfsEncode('/dictionaries/x.dic')).toBe('?dictionary/x.dic')
   })
 
-  it('平局保留令牌数组序靠前者（?data 先于 ?local/?user）', () => {
-    expect(vfsEncode('/autosave/a.ass')).toBe('?data/autosave/a.ass')
+  it('平局保留令牌数组序靠前者（?cache 先于 ?data/?state/?user）', () => {
+    expect(vfsEncode('/autosave/a.ass')).toBe('?cache/autosave/a.ass')
   })
 
-  it('根路径编码为令牌本身', () => {
-    expect(vfsEncode('/')).toBe('?data')
+  it('根路径编码为令牌本身（?local 不再产出）', () => {
+    expect(vfsEncode('/')).toBe('?cache')
   })
 })
 

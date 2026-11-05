@@ -1,7 +1,7 @@
 /**
- * 配置持久化（对应源码 ?user/config.json、?user/hotkey.json 与 ?user/shift_history.json）。
+ * 配置持久化（对应源码 ?user/config.json、?user/hotkey.json 与 ?state/shift_history.json）。
  *
- * 桌面版三者在便携模式下都写 ?user（= 便携包根，main.cpp L167-181）；web 便携根
+ * 桌面版三者在便携模式下都写 ?user（?state 同根，main.cpp L173-181）；web 便携根
  * 即 VFS 根，故对应 /config.json、/hotkey.json、/shift_history.json。
  * - config.json：agi::Options 退出时 Flush 全量选项树；web 每次 OPT_SET 后写穿
  *   VFS（250ms 去抖），options.ts 的 localStorage 同步镜像保留为回退。
@@ -14,7 +14,7 @@
 import { openMainDatabase } from './db'
 import { deletePath, readTextFile, writeTextFile } from './vfs'
 
-/** VFS 根下的对应文件（?user/*.json） */
+/** VFS 根下的对应文件（?user/*.json，shift_history 为 ?state/*.json） */
 const CONFIG_FILE = '/config.json'
 const HOTKEY_FILE = '/hotkey.json'
 const SHIFT_HISTORY_FILE = '/shift_history.json'

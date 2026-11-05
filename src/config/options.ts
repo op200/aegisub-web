@@ -246,7 +246,7 @@ export const DEFAULT_CONFIG = {
   },
   Limits: { 'Find Replace': 16, MRU: 16, 'Undo Levels': 50 },
   Path: {
-    Auto: { Backup: '?user/autoback', Save: '?user/autosave' },
+    Auto: { Backup: '?state/autoback', Save: '?state/autosave' },
     Automation: {
       Autoload: '?user/automation/autoload/|?data/automation/autoload/',
       Base: '?data/automation/',

@@ -1207,7 +1207,9 @@ export function EditPanel({
   }, [historyNonce, textSelection, onTextSelection])
   // edit/clear、edit/revert、edit/font、edit/style/* 等编辑框本地命令的实现注册（command/edit.cpp）：
   // 每轮渲染刷新，保证命令层取到当前草稿与光标；无活动行时清空（命令按 no-op 处理）。
-  // 回调里引用的 commitText/toggleOverrideTag 等定义在本函数后段，effect 在渲染结束后才执行
+  // 回调里引用的 commitText/toggleOverrideTag 等定义在本函数后段；函数声明提升 + effect 延迟执行
+  // 保证运行期安全，React Compiler 的 immutability 规则会误报，故局部关闭
+  /* oxlint-disable react/immutability */
   useLayoutEffect(() => {
     if (!cue || !draft) {
       editBoxActions.clear = undefined
@@ -1233,6 +1235,7 @@ export function EditPanel({
     editBoxActions.font = openFontPicker
     editBoxActions.toggleStyle = toggleOverrideTag
   })
+  /* oxlint-enable react/immutability */
   /** 编辑框的提交合并槽（subs_edit_box.cpp 的 commit_id + last_commit_type / last_time_commit_type）：
    *  只有描述未变（时间修改按字段细分）才回传上次提交（amend），否则开新撤销点；行 id 参与 key
    *  以复现 OnActiveLineChanged 切行重置 commit_id 的行为 */

@@ -1,3 +1,14 @@
+/**
+ * 菜单/快捷键依赖本表提供 label/help：default_menu_platform.json 中只给 command 不给
+ * text 的项全靠此表，缺失会把原始命令 id 直接显示在菜单里；快捷键页也以本表判定
+ * 「无效命令」，故 default_hotkey.json 的所有 id（含对话框内部的
+ * tool/styling_assistant/*、tool/translation_assistant/*）都必须有条目。
+ *
+ * 有意不实现的桌面专属命令（后续勿当作缺失）：am/manager|reload*（自动化管理器窗口）、
+ * app/bring_to_front|hide|hide_others|maximize|minimize|show_all（窗口管理）、
+ * video/subtitles_provider/cycle（多 provider 轮换）；subtitle/close 保留现状。
+ */
+
 export type ShortcutContext =
   | 'Always'
   | 'Default'

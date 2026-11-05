@@ -14,6 +14,7 @@
  * 命令 label/help（STR_MENU/STR_HELP）与 default_menu.json 的 text/tlcontext
  * 均为 pot 的 msgid，可直接查表；Aegisub 侧含 & 加速键而 web 侧已剥离，
  * 查询先精确匹配、再按"去 &"回退索引（loose）。
+ * UI 字面串统一走 tPlain；数据串（OPT key、下拉 value、命令 id、逻辑比较值）不包。
  */
 import { useSyncExternalStore } from 'react'
 

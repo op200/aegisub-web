@@ -90,7 +90,10 @@ export class CoreClient {
     return this.request<CoreState>({ method: 'restore', document })
   }
 
-  /** amend = 显式修订上一次提交（只有编辑框/视觉拖拽等提交点传 true，其余各自成撤销点） */
+  /**
+   * amend = 显式修订上一次提交（只有编辑框/视觉拖拽等提交点传 true，其余各自成撤销点）
+   * label = 撤销描述：统一用源码 msgid 的小写措辞，可命中 po 翻译并正确参与同标签合并
+   */
   apply(commands: CoreCommand[], label: string, amend?: boolean): Promise<CoreState> {
     return this.request<CoreState>({ method: 'apply', commands, label, amend })
   }

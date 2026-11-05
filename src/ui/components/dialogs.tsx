@@ -421,7 +421,7 @@ export function LuaProgressDialog({
 // Shift Times
 // ---------------------------------------------------------------------------
 
-/** ?user/shift_history.json 条目（dialog_shift_times.cpp SaveHistory 的 JSON 键名） */
+/** ?state/shift_history.json 条目（dialog_shift_times.cpp SaveHistory 的 JSON 键名） */
 interface ShiftHistoryEntry {
   filename: string
   'is by time': boolean
@@ -518,7 +518,7 @@ export function ShiftTimesDialog({
   // 无选中行时强制 All rows（OnSelectedSetChanged）：由状态派生，避免 effect 内 setState
   const activeByTime = framesEnabled ? byTime : true
   const activeMode = hasSelection ? mode : 0
-  // LoadHistory：读取 ?user/shift_history.json
+  // LoadHistory：读取 ?state/shift_history.json
   useEffect(() => {
     void (async () => {
       const stored = await loadShiftHistoryFile()
@@ -1233,6 +1233,7 @@ export function StylingAssistantDialog({
   }
 
   // 对话框按键：wxEVT_CHAR_HOOK → hotkey::check("Styling Assistant")
+  // 命中命令必须 preventDefault + stopPropagation，否则冒泡到 App 全局处理器会重复执行
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement
     // 原生控件自行消费导航/激活键（wxCheckBox/wxButton 同理）

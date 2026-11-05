@@ -1,5 +1,5 @@
 /**
- * 视频关键帧缓存（对应源码 FFMS2 的 ?local/ffms2cache/*.ffindex 索引缓存）。
+ * 视频关键帧缓存（对应源码 FFMS2 的 ?cache/ffms2cache/*.ffindex 索引缓存）。
  *
  * 源码：FFmpegSourceProvider::GetCacheFilename 以 crc32(文件名)_文件字节数_修改时间
  * 命名索引文件（内容含关键帧/时间码），FFmpegSourceProvider::CleanCache 按

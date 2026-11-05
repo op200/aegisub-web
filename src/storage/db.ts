@@ -2,7 +2,7 @@
  * aegisub-web 主 IndexedDB 库的共享打开器。
  * v3：projects（自动保存）、recent（MRU + Automation 脚本）、fonts（导入的字体）。
  * v4：config（config.json / hotkey.json 持久化）、keyframes（视频关键帧缓存，
- *     对应源码 ?local/ffms2cache/*.ffindex 索引缓存）。
+ *     对应源码 ?cache/ffms2cache/*.ffindex 索引缓存）。
  * v5：files（虚拟便携文件系统，见 storage/vfs.ts；键 = 虚拟绝对路径，
  *     目录以 '/' 结尾；旧 store 保留为惰性迁移来源）。
  * 所有访问方必须共用此函数——IndexedDB 版本号是库级共享的，各自 open 不同
