@@ -8,6 +8,7 @@
  */
 
 import { getOptionString } from '../config/options'
+import { logWarning } from '../ui/log'
 
 export interface LuaVmApi {
   lua: any
@@ -29,6 +30,8 @@ export interface LuaBackend {
 const backends = new Map<string, LuaBackend>()
 let activeId: string | null = null
 let activeApi: LuaVmApi | null = null
+/** 进行中的初始化：并发调用共享同一个 Promise（WASM 后端每次 load 都会新建 VM 实例） */
+let pending: { id: string; promise: Promise<LuaVmApi> } | null = null
 
 export function registerLuaBackend(backend: LuaBackend): void {
   backends.set(backend.id, backend)
@@ -46,28 +49,52 @@ export function selectedLuaBackendId(): string {
   return backends.values().next().value?.id ?? id
 }
 
-/** 加载选中后端；同一 id 只初始化一次（幂等） */
+/**
+ * 加载选中后端；同一 id 只初始化一次（幂等）。
+ * 并发调用必须共享同一次加载：WASM 后端每次 load 都会实例化一份新的 VM，
+ * 而脚本状态句柄只在所属实例内有效，两个实例并存会让句柄指向另一个实例的同号状态。
+ */
 export async function ensureLuaBackend(id: string): Promise<LuaVmApi> {
   if (activeApi && activeId === id) return activeApi
+  // 同一后端的并发首次调用必须共享同一次加载
+  if (pending && pending.id === id) return pending.promise
   const backend = backends.get(id)
   if (!backend) throw new Error(`Unknown Lua backend: ${id}`)
-  const api = await backend.load()
-  activeApi = api
-  activeId = id
-  return api
+  const promise = backend.load().then(
+    (api) => {
+      activeApi = api
+      activeId = id
+      if (pending?.promise === promise) pending = null
+      return api
+    },
+    (error: unknown) => {
+      if (pending?.promise === promise) pending = null
+      // 默认后端是 WASM：产物 public/wasm/lua55.js 不入库（需 native 构建），
+      // 缺失时回退到 fengari，保证 Automation 在未构建的环境里仍可运行。
+      if (id !== 'fengari') {
+        const reason = error instanceof Error ? error.message : String(error)
+        logWarning('automation', `Lua 后端 ${id} 加载失败，已回退到 fengari：${reason}`)
+        return ensureLuaBackend('fengari')
+      }
+      throw error
+    },
+  )
+  pending = { id, promise }
+  return promise
 }
 
 /** 丢弃已加载的后端（由 luaEngine 关闭全部脚本状态后调用） */
 export function resetActiveLuaBackend(): void {
   activeApi = null
   activeId = null
+  pending = null
 }
 
 // ---------------------------------------------------------------------------
 // 已注册后端
 // ---------------------------------------------------------------------------
 
-/** fengari：纯 JS 的 Lua 5.3（默认后端） */
+/** fengari：纯 JS 的 Lua 5.3（WASM 后端加载失败时的回退后端） */
 registerLuaBackend({
   id: 'fengari',
   label: 'fengari (Lua 5.3)',

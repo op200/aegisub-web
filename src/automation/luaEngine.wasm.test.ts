@@ -118,4 +118,37 @@ describe.skipIf(!hasWasm)('Lua Automation 运行时（Lua 5.5 WASM）', () => {
     expect(result.error).toContain('attempt to index')
     closeAutomationState(loaded.stateId)
   })
+
+  it('并发加载的脚本状态互不共享全局（后端只实例化一次）', async () => {
+    // App 用 Promise.all 并发加载脚本：WASM 后端若被并发初始化会创建两个 VM 实例，
+    // 状态句柄只在实例内有效，两个实例的同号句柄会指向彼此的状态（全局互相覆盖）。
+    resetAutomationBackend()
+    const count = 6
+    const loaded = await Promise.all(
+      Array.from({ length: count }, (_, i) =>
+        loadAutomationScript(
+          `
+          script_name = "Concurrent${i}"
+          script_version = "${i}"
+          aegisub.register_macro("Who", "", function(subs, sel)
+            aegisub.log(script_name .. "/" .. script_version)
+            return sel, 0
+          end)
+          `,
+          `concurrent_${i}.lua`,
+        ),
+      ),
+    )
+    const results = await Promise.all(
+      loaded.map((script) => runAutomationMacro(script.stateId, 'Who', baseRows(), [0], 0)),
+    )
+    for (let i = 0; i < count; i++) {
+      expect(loaded[i].loaded, loaded[i].error).toBe(true)
+      expect(loaded[i].name).toBe(`Concurrent${i}`)
+      expect(results[i].ok, results[i].error).toBe(true)
+      // 每个脚本状态必须看到自己写入的全局，而不是另一个实例同号状态的
+      expect(results[i].log.join('')).toContain(`Concurrent${i}/${i}`)
+      closeAutomationState(loaded[i].stateId)
+    }
+  })
 })

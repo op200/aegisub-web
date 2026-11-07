@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from 'vitest'
 
+import { setOption } from '../config/options'
 import { makeDialogueRow, makeInfoRow, makeStyleRow, type LuaRow } from './luaAssFile'
 import { defaultDialogValues, dialogConfigTable, type DialogSpec } from './luaDialog'
 import {
@@ -69,6 +70,11 @@ function baseRows(): LuaRow[] {
 }
 
 describe('Lua Automation 运行时（fengari）', () => {
+  // 默认后端已改为 lua55-wasm，本套件固定用 fengari 验证同一套桥接代码
+  beforeAll(() => {
+    setOption('Automation/Backend', 'fengari')
+  })
+
   it('register_macro + 修改行 + 返回选区表', async () => {
     const loaded = await loadAutomationScript(
       `

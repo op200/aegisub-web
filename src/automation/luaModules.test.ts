@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest'
 
 // 直接引用仓库内的真实 include 文件（?raw 由 Vite 转成字符串，避免测试依赖 node:fs）
+import aegisubClipboardSource from '../../Aegisub/automation/include/aegisub/clipboard.lua?raw'
+import clipboardSource from '../../Aegisub/automation/include/clipboard.lua?raw'
 import karaskelAuto4Source from '../../Aegisub/automation/include/karaskel-auto4.lua?raw'
 import karaskelSource from '../../Aegisub/automation/include/karaskel.lua?raw'
 import reSource from '../../Aegisub/automation/include/re.lua?raw'
@@ -237,6 +239,39 @@ describe('内置 aegisub.* 模块（Lua 5.3 移植）', () => {
     closeDirectState(state)
   })
 
+  it('lfs / lpeg / luabins / jit：可 require，调用时才报错', async () => {
+    const state = await createDirectState({}, [])
+    const result = runLua(
+      state,
+      `
+      local lfs = require 'lfs'
+      assert(type(lfs.attributes) == 'function')
+      assert(lfs.__placeholder == true)
+      assert(_G.lfs == lfs)
+      local ok, err = pcall(lfs.attributes, '/')
+      assert(not ok and err:find('lfs.attributes'), tostring(err))
+
+      local lpeg = require 'lpeg'
+      assert(lpeg.__placeholder == true)
+      assert(not pcall(lpeg.P, 'a'))
+      assert(not pcall(require('aegisub.lfs').attributes, '/'))
+
+      local luabins = require 'luabins'
+      assert(not pcall(luabins.save, 1))
+      assert(not pcall(luabins.load, 'x'))
+
+      local jit = require 'jit'
+      assert(jit.__placeholder == true and _G.jit == jit)
+      jit.off()
+      jit.on()
+      assert(jit.status() == false)
+      assert(jit.version:find('LuaJIT') == nil)
+      `,
+    )
+    expect(result, result.error).toEqual({ ok: true, error: '' })
+    closeDirectState(state)
+  })
+
   it('aegisub.re：UTF-8 字节偏移、捕获组与替换', async () => {
     const state = await createDirectState({}, [])
     const result = runLua(
@@ -290,6 +325,43 @@ describe('内置 aegisub.* 模块（Lua 5.3 移植）', () => {
       assert(not ok and err:find('should be a string'), tostring(err))
       local ok2, err2 = pcall(fn, 'x', 'y')
       assert(not ok2 and err2:find('should be a number'), tostring(err2))
+      `,
+    )
+    expect(result, result.error).toEqual({ ok: true, error: '' })
+    closeDirectState(state)
+  })
+
+  it('aegisub.internal.ffi：字符串透传，clipboard 内置 include 可加载', async () => {
+    const state = await createDirectState(
+      {
+        '/automation/include/clipboard.lua': clipboardSource,
+        '/automation/include/aegisub/clipboard.lua': aegisubClipboardSource,
+      },
+      ['/automation/include'],
+    )
+    const result = runLua(
+      state,
+      `
+      local ffi_util = require 'aegisub.internal.ffi'
+      assert(ffi_util.string('abc') == 'abc')
+      assert(ffi_util.string(nil) == nil)
+      local wrap = ffi_util.err_arg_to_multiple_return(function(a) return a .. '?' end)
+      assert(wrap('x') == 'x?')
+
+      -- aegisub.clipboard 的宿主桥（luaEngine 的 aegisub.__init_clipboard 同形）
+      _G.aegisub = {
+        __init_clipboard = function()
+          return {
+            get = function() return 'from-host' end,
+            set = function(text) return text == 'ok' end,
+          }
+        end,
+      }
+      local clipboard = require 'clipboard'
+      assert(_G.clipboard == clipboard)
+      assert(clipboard.get() == 'from-host')
+      assert(clipboard.set('ok') == true)
+      assert(not pcall(clipboard.set, 42))
       `,
     )
     expect(result, result.error).toEqual({ ok: true, error: '' })

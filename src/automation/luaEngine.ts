@@ -62,13 +62,25 @@ import {
 
 /** 当前已加载的 Lua VM 后端（Automation/Backend 选项；首次加载脚本时才拉取 VM） */
 let backendLoaded = false
+/** 进行中的后端初始化（并发加载脚本时共享，避免重复实例化 VM） */
+let backendLoading: Promise<void> | null = null
 let lua: any, lauxlib: any, lualib: any, to_luastring: any, to_jsstring: any
 
 async function ensureLuaBackendRuntime(): Promise<void> {
   if (backendLoaded) return
-  const api = await ensureLuaBackend(selectedLuaBackendId())
-  ;({ lua, lauxlib, lualib, to_luastring, to_jsstring } = api)
-  backendLoaded = true
+  // 脚本是 Promise.all 并发加载的：WASM 后端每次 load 都会新建一个 VM 实例，
+  // 而脚本状态句柄（L）只在所属实例内有效，重复初始化会让句柄指向另一个实例的同号状态。
+  if (!backendLoading) {
+    backendLoading = ensureLuaBackend(selectedLuaBackendId())
+      .then((api) => {
+        ;({ lua, lauxlib, lualib, to_luastring, to_jsstring } = api)
+        backendLoaded = true
+      })
+      .finally(() => {
+        backendLoading = null
+      })
+  }
+  await backendLoading
 }
 
 /**
@@ -87,6 +99,7 @@ export function resetAutomationBackend(): void {
   }
   states.clear()
   backendLoaded = false
+  backendLoading = null
   resetActiveLuaBackend()
 }
 

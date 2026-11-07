@@ -65,7 +65,7 @@ local rewrite_traceback
 rewrite_traceback = function(text, err)
   -- lpeg 仅用于重写 traceback；web 版没有 lpeg 时直接放弃重写（返回 nil）
   local ok, lpeg = pcall(require, "lpeg")
-  if not ok then
+  if not ok or (type(lpeg) == "table" and lpeg.__placeholder) then
     return nil
   end
   local line_tables = require("moonscript.line_tables")

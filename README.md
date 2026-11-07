@@ -18,6 +18,7 @@ Aegisub Web 目的在于尽可能在 Web 端实现 Aegisub 功能，同时提供
 - 左下角可切换视频解码: 浏览器原生 / 内置解码
 - 首帧偏移将显式提醒
 - 字幕编辑器内的 `!...!` 块有代码高亮
+- 最新版的 Lua 标准，但暂时没有 LuaJIT
 
 # 已知问题
 
@@ -25,14 +26,14 @@ Aegisub Web 目的在于尽可能在 Web 端实现 Aegisub 功能，同时提供
 
 核心功能基本完成
 
-- Lua 后端可在首选项 `Automation/Backend` 切换：默认 fengari（JS 实现的 Lua 5.3），或 Lua 5.5 (WASM)（官方 Lua 5.5.1 源码经 Emscripten 编译，需本地构建，见 native/README.md）
+- Lua 后端可在首选项 `Automation/Backend` 切换：默认 Lua 5.5 (WASM)（官方 Lua 5.5.1 源码经 Emscripten 编译，需本地构建，见 native/README.md；产物缺失时自动回退 fengari），或 fengari（JS 实现的 Lua 5.3）
 - MoonScript 用 vendored 0.8 纯 Lua 解析器编译（无 lpeg，编译比桌面 0.7 + lpeg 慢）
 
 ## 浏览器兼容性
 
 ### Firefox
 
-v158.0.1
+v159.0.1
 
 - 不支持 [`window.queryLocalFonts`](https://caniuse.com/wf-local-fonts)，需要手动载入字体文件
 - MP4 容器的部分视频（疑似因为 open-gop）随机 seek 有无法从 IDR 帧解码、会从头解码的 bug

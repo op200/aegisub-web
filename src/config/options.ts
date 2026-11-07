@@ -71,7 +71,7 @@ export const DEFAULT_CONFIG = {
     'Wheel Default to Zoom': false,
     Zoom: { Horizontal: 0, Vertical: 50 },
   },
-  Automation: { 'Autoreload Mode': 1, Backend: 'fengari', 'Trace Level': 3 },
+  Automation: { 'Autoreload Mode': 1, Backend: 'lua55-wasm', 'Trace Level': 3 },
   Colour: {
     'Audio Display': {
       Keyframe: 'rgb(255,0,255)',

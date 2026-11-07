@@ -7,8 +7,9 @@
  * - installLuaModuleSearch 把 include 目录写进 package.path 并替换 searcher #2，
  *   从 include 缓存同步加载 .lua 模块（同路径的 .moon 优先，对齐 module_loader），
  *   并清空 cpath/jspath 阻断 fengari 的 XHR 回退；
- * - installLuaModules 把 aegisub.internal.argcheck / aegisub.util / aegisub.unicode /
- *   aegisub.re / bit / ffi 注册到 package.preload（ffi 为可 require 的报错占位）；
+ * - installLuaModules 把 aegisub.internal.argcheck / aegisub.internal.ffi / aegisub.util /
+ *   aegisub.unicode / aegisub.re / bit / ffi 注册到 package.preload（ffi 为可 require 的报错占位）；
+ *   未实现的 lfs / lpeg / luabins / jit 也注册惰性占位：require 成功，调用函数时才报错；
  * - installMoonscriptModules / compileMoonscriptChunk 是 vendored MoonScript 0.8
  *   （纯 Lua 解析器，不需要 lpeg），把 .moon 编译成 Lua 在同一 VM 内执行。
  */
@@ -67,11 +68,18 @@ function registerLuaFunction(
 /** 注册 Aegisub 标准模块（桌面版由 MoonScript 编译的那批） */
 export function installLuaModules(L: any, runtime: LuaRuntime): void {
   registerLuaSource(L, runtime, 'aegisub.internal.argcheck', ARGCHECK_SOURCE)
+  registerLuaSource(L, runtime, 'aegisub.internal.ffi', INTERNAL_FFI_SOURCE)
   registerLuaSource(L, runtime, 'aegisub.util', UTIL_SOURCE)
   registerLuaSource(L, runtime, 'aegisub.unicode', UNICODE_SOURCE)
   registerLuaSource(L, runtime, 'aegisub.re', RE_SOURCE)
   registerLuaSource(L, runtime, 'bit', BIT_SOURCE)
   registerLuaSource(L, runtime, 'ffi', FFI_SOURCE)
+  // 未实现的库：require / 全局表可用，函数被调用时才报错（惰性降级）
+  registerLuaSource(L, runtime, 'lfs', placeholderModuleSource('lfs', LFS_API))
+  registerLuaSource(L, runtime, 'aegisub.lfs', "return require('lfs')")
+  registerLuaSource(L, runtime, 'lpeg', placeholderModuleSource('lpeg', LPEG_API))
+  registerLuaSource(L, runtime, 'luabins', placeholderModuleSource('luabins', LUABINS_API))
+  registerLuaSource(L, runtime, 'jit', JIT_SOURCE)
   registerLuaFunction(L, runtime, 'aegisub.__unicode_impl', (L2) => makeUnicodeImpl(L2, runtime))
   registerLuaFunction(L, runtime, 'aegisub.__re_impl', (L2) => makeReImpl(L2, runtime))
 }
@@ -768,6 +776,29 @@ return function(argfmt)
 end
 `
 
+const INTERNAL_FFI_SOURCE = `
+-- 桌面版把 C 返回的 char* 转成 Lua 字符串并在非常量指针上 free；
+-- web 桥（aegisub.__init_clipboard 等）返回的就是普通 Lua 字符串，恒等返回即可
+local ffi_util = {}
+
+function ffi_util.string(cdata)
+  return cdata
+end
+
+-- 桌面版把带 err 出参的 C 函数转成 (result, err) 多返回值；
+-- web 桥的函数没有 err 出参，直接透传原返回值
+function ffi_util.err_arg_to_multiple_return(f)
+  return function(arg)
+    if arg ~= nil then
+      return f(arg)
+    end
+    return f()
+  end
+end
+
+return ffi_util
+`
+
 const UTIL_SOURCE = `
 local error = error
 local pairs = pairs
@@ -1430,4 +1461,77 @@ ffi.C = setmetatable({}, {
 })
 
 return ffi
+`
+
+/** `require 'lfs'` 的 API（Aegisub 的 lfs.moon 包装层暴露的函数） */
+const LFS_API = ['attributes', 'chdir', 'currentdir', 'dir', 'mkdir', 'rmdir', 'touch']
+/** LPeg 的构造器与函数（调用即报错的占位，__placeholder 供 features 探测跳过） */
+const LPEG_API = [
+  'P',
+  'V',
+  'S',
+  'R',
+  'C',
+  'Cc',
+  'Cf',
+  'Cg',
+  'Cb',
+  'Ct',
+  'Cs',
+  'Cp',
+  'Carg',
+  'Cmt',
+  'match',
+  'type',
+  'version',
+  'setmaxstack',
+  'locale',
+  'setlocale',
+]
+/** luabins（Aegisub 已标记废弃）的序列化入口 */
+const LUABINS_API = ['save', 'load']
+
+/**
+ * 惰性占位模块：require 成功（同时暴露同名全局，对齐 luaL_openlibs 的行为），
+ * 只有真正调用其中的函数时才报错。这样 `local ok, lfs = pcall(require, 'lfs')`
+ * 之类的探测不会在导入阶段就中断脚本。
+ */
+function placeholderModuleSource(moduleName: string, functions: string[]): string {
+  const list = functions.map((name) => `'${name}'`).join(', ')
+  return `
+local module = {}
+local function unavailable(name)
+  return function()
+    error('${moduleName}.' .. name .. ' is not available in the web build of Aegisub', 2)
+  end
+end
+for _, name in ipairs({ ${list} }) do module[name] = unavailable(name) end
+module.__placeholder = true
+_G['${moduleName}'] = module
+return module
+`
+}
+
+/**
+ * LuaJIT 的 jit 库占位。控制函数做成空操作（`if jit then jit.off() end`
+ * 是脚本常见写法，调用即报错反而破坏兼容）；version 有意不冒充 LuaJIT，
+ * 让按版本分支的脚本走通用路径。
+ */
+const JIT_SOURCE = `
+local jit = {
+  version = 'Lua 5.5',
+  version_num = 505,
+  os = 'Other',
+  arch = 'wasm',
+  __placeholder = true,
+}
+jit.on = function() end
+jit.off = function() end
+jit.flush = function() end
+jit.attach = function() end
+jit.security = function() return nil end
+jit.status = function() return false end
+jit.opt = { start = function() end }
+_G.jit = jit
+return jit
 `

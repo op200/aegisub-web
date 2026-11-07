@@ -22,15 +22,24 @@ const entries: LogEntry[] = []
 let nextId = 0
 const listeners = new Set<(entry: LogEntry) => void>()
 
+/** console 镜像里 [tag] 前缀的样式（DevTools 支持 %c；按级别上色便于扫读） */
+const TAG_CONSOLE_STYLES: Record<LogLevel, string> = {
+  info: 'color:#38bdf8;font-weight:600',
+  warning: 'color:#f59e0b;font-weight:600',
+  error: 'color:#ef4444;font-weight:600',
+}
+
 export function log(level: LogLevel, tag: string, message: string): void {
   const entry: LogEntry = { id: nextId++, time: Date.now(), level, tag, message }
   entries.push(entry)
   if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES)
-  // 镜像到 console，保持 DevTools 可诊断性
-  const text = `[${tag}] ${message}`
-  if (level === 'error') console.error(text)
-  else if (level === 'warning') console.warn(text)
-  else console.info(text)
+  // 镜像到 console，保持 DevTools 可诊断性；message 作为独立参数传入，
+  // 避免其中的 %c/%s 等格式符吃掉样式参数。
+  const prefix = `%c[${tag}]`
+  const style = TAG_CONSOLE_STYLES[level]
+  if (level === 'error') console.error(prefix, style, message)
+  else if (level === 'warning') console.warn(prefix, style, message)
+  else console.info(prefix, style, message)
   for (const listener of listeners) listener(entry)
 }
 
