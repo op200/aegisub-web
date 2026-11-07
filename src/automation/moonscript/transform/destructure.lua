@@ -1,0 +1,364 @@
+local ntype, mtype, build, is_assignable
+do
+  local _obj_0 = require("moonscript.types")
+  ntype, mtype, build, is_assignable = _obj_0.ntype, _obj_0.mtype, _obj_0.build, _obj_0.is_assignable
+end
+local NameProxy
+NameProxy = require("moonscript.transform.names").NameProxy
+local insert
+insert = table.insert
+local unpack
+unpack = require("moonscript.util").unpack
+local user_error
+user_error = require("moonscript.errors").user_error
+local join
+join = function(...)
+  do
+    local out = { }
+    local i = 1
+    local _list_0 = {
+      ...
+    }
+    for _index_0 = 1, #_list_0 do
+      local tbl = _list_0[_index_0]
+      for _index_1 = 1, #tbl do
+        local v = tbl[_index_1]
+        out[i] = v
+        i = i + 1
+      end
+    end
+    return out
+  end
+end
+local has_destructure
+has_destructure = function(names)
+  for _index_0 = 1, #names do
+    local n = names[_index_0]
+    if ntype(n) == "table" then
+      return true
+    end
+  end
+  return false
+end
+local is_multi_return
+is_multi_return = function(node)
+  if node == "..." then
+    return true
+  end
+  if not (type(node) == "table") then
+    return false
+  end
+  local _exp_0 = node[1]
+  if "chain" == _exp_0 then
+    return ntype(node[#node]) == "call"
+  elseif "explist" == _exp_0 then
+    return true
+  else
+    return false
+  end
+end
+local extract_assign_names
+extract_assign_names = function(name, accum, prefix)
+  if accum == nil then
+    accum = { }
+  end
+  if prefix == nil then
+    prefix = { }
+  end
+  local i = 1
+  local _list_0 = name[2]
+  for _index_0 = 1, #_list_0 do
+    local tuple = _list_0[_index_0]
+    local value, suffix
+    if #tuple == 1 then
+      local s = {
+        "index",
+        {
+          "number",
+          i
+        }
+      }
+      i = i + 1
+      value, suffix = tuple[1], s
+    else
+      local key = tuple[1]
+      local s
+      if ntype(key) == "key_literal" then
+        local key_name = key[2]
+        if ntype(key_name) == "colon" then
+          s = key_name
+        else
+          s = {
+            "dot",
+            key_name
+          }
+        end
+      else
+        s = {
+          "index",
+          key
+        }
+      end
+      value, suffix = tuple[2], s
+    end
+    suffix = join(prefix, {
+      suffix
+    })
+    if ntype(value) == "table" then
+      extract_assign_names(value, accum, suffix)
+    elseif is_assignable(value) then
+      insert(accum, {
+        value,
+        suffix
+      })
+    else
+      local pos = type(value) == "table" and value[-1] or name[-1]
+      if value == "..." then
+        user_error("Can't destructure into '...'", pos)
+      elseif ntype(value) == "chain" then
+        user_error("Can't destructure into chain ending in " .. tostring(ntype(value[#value])), pos)
+      else
+        user_error("Can't destructure value of type: " .. tostring(ntype(value)), pos)
+      end
+    end
+  end
+  return accum
+end
+local keyword_refs = {
+  ["nil"] = true,
+  ["true"] = true,
+  ["false"] = true
+}
+local chainable_receiver
+chainable_receiver = function(node)
+  local _exp_0 = type(node)
+  if "string" == _exp_0 then
+    return node ~= "..." and not keyword_refs[node]
+  elseif "table" == _exp_0 then
+    local _exp_1 = node[1]
+    if "ref" == _exp_1 then
+      return not keyword_refs[node[2]]
+    elseif "chain" == _exp_1 or "self" == _exp_1 or "self_class" == _exp_1 or "temp_name" == _exp_1 or "parens" == _exp_1 or "exp" == _exp_1 or "table" == _exp_1 or "string" == _exp_1 then
+      return true
+    else
+      return false
+    end
+  else
+    return false
+  end
+end
+local build_assign
+build_assign = function(scope, destruct_literal, receiver, opts)
+  assert(receiver, "attempting to build destructure assign with no receiver")
+  local extracted_names = extract_assign_names(destruct_literal)
+  local names = { }
+  local values = { }
+  local inner = {
+    "assign",
+    names,
+    values
+  }
+  local obj
+  if chainable_receiver(receiver) and (scope:is_local(receiver) or #extracted_names == 1) then
+    obj = receiver
+  else
+    do
+      obj = NameProxy("obj")
+      inner = build["do"]({
+        build.assign_one(obj, receiver),
+        {
+          "assign",
+          names,
+          values
+        }
+      })
+      obj = obj
+    end
+  end
+  for _index_0 = 1, #extracted_names do
+    local tuple = extracted_names[_index_0]
+    insert(names, tuple[1])
+    local chain
+    if obj then
+      chain = NameProxy.chain(obj, unpack(tuple[2]))
+    else
+      chain = "nil"
+    end
+    insert(values, chain)
+  end
+  local group = { }
+  if opts and opts.shadow then
+    local shadow_names
+    do
+      local _accum_0 = { }
+      local _len_0 = 1
+      for _index_0 = 1, #names do
+        local name = names[_index_0]
+        if ntype(name) == "ref" or type(name) == "string" then
+          _accum_0[_len_0] = name
+          _len_0 = _len_0 + 1
+        end
+      end
+      shadow_names = _accum_0
+    end
+    if next(shadow_names) then
+      insert(group, {
+        "declare_with_shadows",
+        shadow_names
+      })
+    end
+  else
+    insert(group, {
+      "declare",
+      names
+    })
+  end
+  insert(group, inner)
+  return build.group(group)
+end
+local split_assign
+split_assign = function(scope, assign)
+  local names, values = unpack(assign, 2)
+  local g = { }
+  local total_names = #names
+  local total_values = #values
+  local suffix_start
+  if total_names > total_values and is_multi_return(values[total_values]) then
+    for i = total_values, total_names do
+      if ntype(names[i]) == "table" then
+        suffix_start = total_values
+        break
+      end
+    end
+  end
+  local start = 1
+  local stop = suffix_start and suffix_start - 1 or total_names
+  for i = 1, stop do
+    local n = names[i]
+    if ntype(n) == "table" then
+      if i > start then
+        insert(g, {
+          "assign",
+          (function()
+            local _accum_0 = { }
+            local _len_0 = 1
+            for j = start, i - 1 do
+              _accum_0[_len_0] = names[j]
+              _len_0 = _len_0 + 1
+            end
+            return _accum_0
+          end)(),
+          (function()
+            local _accum_0 = { }
+            local _len_0 = 1
+            for j = start, i - 1 do
+              _accum_0[_len_0] = values[j]
+              _len_0 = _len_0 + 1
+            end
+            return _accum_0
+          end)()
+        })
+      end
+      insert(g, build_assign(scope, n, values[i]))
+      start = i + 1
+    end
+  end
+  if suffix_start then
+    if start <= stop then
+      insert(g, {
+        "assign",
+        (function()
+          local _accum_0 = { }
+          local _len_0 = 1
+          for j = start, stop do
+            _accum_0[_len_0] = names[j]
+            _len_0 = _len_0 + 1
+          end
+          return _accum_0
+        end)(),
+        (function()
+          local _accum_0 = { }
+          local _len_0 = 1
+          for j = start, stop do
+            _accum_0[_len_0] = values[j]
+            _len_0 = _len_0 + 1
+          end
+          return _accum_0
+        end)()
+      })
+    end
+    local suffix_names = { }
+    local destructures = { }
+    for i = suffix_start, total_names do
+      local name = names[i]
+      if ntype(name) == "table" then
+        local proxy = NameProxy("destruct")
+        insert(suffix_names, proxy)
+        insert(destructures, {
+          name,
+          proxy
+        })
+      else
+        insert(suffix_names, name)
+      end
+    end
+    insert(g, {
+      "assign",
+      suffix_names,
+      {
+        values[total_values]
+      }
+    })
+    for _index_0 = 1, #destructures do
+      local _des_0 = destructures[_index_0]
+      local literal, proxy
+      literal, proxy = _des_0[1], _des_0[2]
+      insert(g, build_assign(scope, literal, proxy))
+    end
+  elseif total_names >= start or total_values >= start then
+    local name_slice
+    if total_names < start then
+      name_slice = {
+        scope:discard_name()
+      }
+    else
+      do
+        local _accum_0 = { }
+        local _len_0 = 1
+        for i = start, total_names do
+          _accum_0[_len_0] = names[i]
+          _len_0 = _len_0 + 1
+        end
+        name_slice = _accum_0
+      end
+    end
+    local value_slice
+    if total_values < start then
+      value_slice = {
+        "nil"
+      }
+    else
+      do
+        local _accum_0 = { }
+        local _len_0 = 1
+        for i = start, total_values do
+          _accum_0[_len_0] = values[i]
+          _len_0 = _len_0 + 1
+        end
+        value_slice = _accum_0
+      end
+    end
+    insert(g, {
+      "assign",
+      name_slice,
+      value_slice
+    })
+  end
+  return build.group(g)
+end
+return {
+  has_destructure = has_destructure,
+  split_assign = split_assign,
+  build_assign = build_assign,
+  extract_assign_names = extract_assign_names
+}

@@ -25,6 +25,9 @@ Aegisub Web 目的在于尽可能在 Web 端实现 Aegisub 功能，同时提供
 
 核心功能基本完成
 
+- Lua 后端可在首选项 `Automation/Backend` 切换：默认 fengari（JS 实现的 Lua 5.3），或 Lua 5.5 (WASM)（官方 Lua 5.5.1 源码经 Emscripten 编译，需本地构建，见 native/README.md）
+- MoonScript 用 vendored 0.8 纯 Lua 解析器编译（无 lpeg，编译比桌面 0.7 + lpeg 慢）
+
 ## 浏览器兼容性
 
 ### Firefox

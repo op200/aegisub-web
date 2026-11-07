@@ -138,6 +138,7 @@ export const WEB_SUPPLEMENT: Record<string, Record<string, string>> = {
     'Loading Aegisub Web': '正在加载 Aegisub Web',
     'Local font access granted': '已授权本地字体访问',
     'Local Font Access: ': '本地字体访问：',
+    'Lua backend': 'Lua 后端',
     'Main toolbar': '主工具栏',
     'Match text': '匹配文本',
     'Measuring…': '正在测量…',

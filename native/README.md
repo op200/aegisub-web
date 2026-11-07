@@ -3,6 +3,9 @@
 把 Aegisub 的 **wx-free 文档核心**直接编译成 WASM，实现 `wasm/aegisub_core_api.h` 的 C ABI，
 替换 `src/workers/subtitle.worker.ts` 里的 TypeScript 核心运行时。
 
+此外本目录还编译 **Lua 5.5.1**（官方源码）到 WASM，为 Automation 提供 `lua55-wasm` 后端
+（与 JS 实现的 fengari 并存，首选项 `Automation/Backend` 切换）。
+
 ```
 src/workers/subtitle.worker.ts  ← 换成本模块加载器（协议不变）
         │  ABI (aegisub_core_api.h)
@@ -26,11 +29,14 @@ wxWidgets：只有个别签名用到 `wxString`（前向声明）和 UI 专用�
 native/
 ├── CMakeLists.txt            # Emscripten 构建（源文件引用 ../Aegisub）
 ├── README.md
+├── scripts/
+│   └── build_lua_wasm.ps1    # 下载并编译 Lua 5.5.1 → public/wasm/lua55.js
 ├── src/
 │   ├── aegisub_core_api.cpp  # ABI 实现（文档、撤销、JSON 投影、命令）
 │   ├── aegisub_core_api_entry.cpp  # Emscripten 模块入口（可选）
+│   ├── lua_web_api.cpp       # Lua C API ↔ JS 桥接（lua55_wasm 入口）
 │   └── vendor/               # Aegisub 中无法直接编译的文件的精简副本
-└── third_party/              # vendor 的 Boost 头文件（如 subprojects/boost 缺失时）
+└── third_party/              # vendor 头文件 + 构建脚本下载的 lua-5.5.1/（均不入库）
 ```
 
 ## Vendoring 策略
@@ -71,6 +77,22 @@ cmake --build build
 #   build/aegisub_core.js
 #   build/aegisub_core.wasm
 ```
+
+## Lua 5.5（WASM）后端
+
+```powershell
+# 下载、校验（SHA-256 FFED0B0E…FD91810）并编译官方 lua-5.5.1
+powershell -ExecutionPolicy Bypass -File native/scripts/build_lua_wasm.ps1
+
+# 产物（SINGLE_FILE ESM，首屏不加载，首次运行 Automation 脚本时拉取）
+#   native/build/lua55.js → public/wasm/lua55.js
+```
+
+- 源码：`https://codeload.github.com/lua/lua/tar.gz/refs/tags/v5.5.1`，解压到
+  `native/third_party/lua-5.5.1/`（不入库）。
+- CMake 目标 `lua55_wasm`（`native/src/lua_web_api.cpp`），导出 `lua_web_*` 桥接函数；
+  JS 适配器见 `src/automation/backends/lua55Wasm.ts`，后端 id `lua55-wasm`。
+- Lua 5.5 起 `for` 循环变量为 const，内置 Lua 模块需避免直接改写循环变量。
 
 ## 在 Web 项目中接入
 

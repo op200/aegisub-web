@@ -19,3 +19,35 @@ platforms/windows/**/bin/
 platforms/windows/**/obj/
 
 /.test_data/
+
+# 根目录白名单
+/*
+!/.github/
+!/.vscode/
+!/Aegisub/
+!/native/
+!/patches/
+!/platforms/
+!/public/
+!/scripts/
+!/src/
+!/tests/
+!/wasm/
+!/.gitattributes
+!/.gitignore
+!/.gitmodules
+!/.oxfmtrc.jsonc
+!/.oxlintrc.jsonc
+!/AGENTS.md
+!/README.md
+!/index.html
+!/package.json
+!/playwright.config.ts
+!/pnpm-lock.yaml
+!/pnpm-workspace.yaml
+!/tsconfig.app.json
+!/tsconfig.json
+!/tsconfig.node.json
+!/vite.config.ts
+!/未完成计划.md
+!/源码架构.md

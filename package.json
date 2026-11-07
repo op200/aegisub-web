@@ -20,14 +20,14 @@
   },
   "dependencies": {
     "fengari": "^0.1.5",
-    "jassub": "^2.5.26",
-    "lucide-react": "^1.68.0",
+    "jassub": "^2.5.35",
+    "lucide-react": "^1.70.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "web-demuxer": "^4.0.0"
   },
   "devDependencies": {
-    "@playwright/test": "1.64.1",
+    "@playwright/test": "1.65.0",
     "@types/node": "^26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
@@ -35,13 +35,13 @@
     "oxfmt": "0.76.0",
     "oxlint": "1.91.0",
     "typescript": "7.0.2",
-    "vite": "8.3.5",
+    "vite": "8.3.6",
     "vitest": "5.1.0"
   },
   "engines": {
     "node": ">=26.10.0"
   },
-  "packageManager": "pnpm@12.16.1",
+  "packageManager": "pnpm@12.18.0",
   "pnpm": {
     "ignoredBuiltDependencies": [
       "lfa-ponyfill"

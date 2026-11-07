@@ -12,7 +12,8 @@
  *
  * fengari 按需动态加载（首次加载脚本时拉取 Lua VM）。
  *
- * Web 环境的有意偏差：无 aegisub.* 原生模块与 MoonScript（脚本引擎列表只列 Lua *.lua）；
+ * Web 环境的有意偏差：无 aegisub.* 原生模块；MoonScript 用 vendored 0.8 纯 Lua
+ * 解析器（桌面版是 0.7 + lpeg），脚本引擎列表仍只有 Lua（`*.lua,*.moon`）；
  * aegisub.dialog.open/save 恒返回 nil；text_extents 由宿主 host.textExtents 提供；
  * 无 AssDialogue* 指针，active/selected 用对白行序数表达；__raise_warning 仅在注册期收集；
  * 颜色控件用 <input type=color>（不支持编辑 alpha，alpha 分量保留）；LuaConfigDialog 用
@@ -43,6 +44,7 @@ import {
   type LuaRow,
   type StyleRowFields,
 } from './luaAssFile'
+import { ensureLuaBackend, resetActiveLuaBackend, selectedLuaBackendId } from './luaBackend'
 import {
   dialogReadBackValues,
   parseDialogSpec,
@@ -51,19 +53,41 @@ import {
   type DialogSpec,
   type DialogValue,
 } from './luaDialog'
-import { installLuaModuleSearch, installLuaModules } from './luaModules'
+import {
+  compileMoonscriptChunk,
+  installLuaModuleSearch,
+  installLuaModules,
+  installMoonscriptModules,
+} from './luaModules'
 
-type FengariModule = typeof import('fengari')
-let fengariModules: FengariModule | null = null
+/** 当前已加载的 Lua VM 后端（Automation/Backend 选项；首次加载脚本时才拉取 VM） */
+let backendLoaded = false
 let lua: any, lauxlib: any, lualib: any, to_luastring: any, to_jsstring: any
 
-async function ensureFengari(): Promise<void> {
-  if (fengariModules) return
-  fengariModules = await import('fengari')
-  ;({ lua, lauxlib, lualib, to_luastring, to_jsstring } = fengariModules as unknown as Record<
-    string,
-    any
-  >)
+async function ensureLuaBackendRuntime(): Promise<void> {
+  if (backendLoaded) return
+  const api = await ensureLuaBackend(selectedLuaBackendId())
+  ;({ lua, lauxlib, lualib, to_luastring, to_jsstring } = api)
+  backendLoaded = true
+}
+
+/**
+ * 切换 Lua 后端：旧 VM 的脚本状态全部失效（L/函数引用绑在旧 VM 上），
+ * 关闭后由调用方重新加载全部 Automation 脚本。
+ */
+export function resetAutomationBackend(): void {
+  if (backendLoaded) {
+    for (const state of states.values()) {
+      try {
+        lua.lua_close(state.L)
+      } catch {
+        /* 旧 VM 状态关闭失败无需处理 */
+      }
+    }
+  }
+  states.clear()
+  backendLoaded = false
+  resetActiveLuaBackend()
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +820,51 @@ function pushRowTable(L: any, row: LuaRow): void {
 // 错误处理（add_stack_trace）
 // ---------------------------------------------------------------------------
 
+/** 编译后的 Lua 行号 → MoonScript 源行号（libaegisub/lua/utils.cpp moon_line L91-125） */
+function moonscriptLine(L2: any, line: number, file: string): number {
+  if (line <= 0) return line
+  // require 'moonscript.line_tables'（未安装编译器时原样返回）
+  lua.lua_getglobal(L2, to_luastring('require'))
+  lua.lua_pushstring(L2, to_luastring('moonscript.line_tables'))
+  if (lua.lua_pcall(L2, 1, 1, 0) !== 0) {
+    lua.lua_pop(L2, 1)
+    return line
+  }
+  lua.lua_pushstring(L2, to_luastring(file))
+  lua.lua_rawget(L2, -2)
+  if (!lua.lua_istable(L2, -1)) {
+    lua.lua_pop(L2, 2)
+    return line
+  }
+  lua.lua_rawgeti(L2, -1, line)
+  if (!lua.lua_isnumber(L2, -1)) {
+    lua.lua_pop(L2, 3)
+    return line
+  }
+  const charPos = Math.trunc(lua.lua_tonumber(L2, -1))
+  lua.lua_pop(L2, 3)
+
+  lua.lua_getfield(L2, lua.LUA_REGISTRYINDEX, to_luastring(`raw moonscript: ${file}`))
+  if (!lua.lua_isstring(L2, -1)) {
+    lua.lua_pop(L2, 1)
+    return line
+  }
+  const source = to_jsstring(lua.lua_tostring(L2, -1))
+  lua.lua_pop(L2, 1)
+
+  // line_tables 存的是 UTF-8 字节偏移（Lua 字符串下标），按码点累加字节数
+  let bytes = 0
+  let lines = 0
+  let index = 0
+  while (index < source.length && bytes < charPos) {
+    const code = source.codePointAt(index) as number
+    if (code === 10) lines++
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4
+    index += code > 0xffff ? 2 : 1
+  }
+  return lines + 1
+}
+
 function addStackTrace(L2: any): number {
   let level = 1
   if (lua.lua_isnumber(L2, 2)) {
@@ -821,15 +890,17 @@ function addStackTrace(L2: any): number {
     // fengari 的 JS 实现 C 函数帧（=[JS] / what='J'）不进 traceback
     if (what[0] === 'J' || file === '=[JS]') continue
     if (file === '=[C]') file = '<C function>'
+    const isMoon = /\.moon$/i.test(file)
+    const realLine = (line: number) => (isMoon ? moonscriptLine(L2, line, file) : line)
     const name = ar.name ? to_jsstring(ar.name) : ''
     const namewhat = ar.namewhat ? to_jsstring(ar.namewhat) : ''
     let fn: string
     if (what[0] === 'm') fn = '<main>'
     else if (what[0] === 'C') fn = '?'
     else if (!namewhat)
-      fn = `<anonymous function at lines ${ar.linedefined}-${ar.lastlinedefined - 1}>`
+      fn = `<anonymous function at lines ${realLine(ar.linedefined)}-${realLine(ar.lastlinedefined - 1)}>`
     else fn = name
-    frames.push(`    File "${file}", line ${ar.currentline}\n${fn}`)
+    frames.push(`    File "${file}", line ${realLine(ar.currentline)}\n${fn}`)
   }
   pushString(L2, frames.reverse().join('\n'))
   return 1
@@ -1499,7 +1570,7 @@ export async function loadAutomationScript(
   code: string,
   filename: string,
 ): Promise<LoadedAutomationScript> {
-  await ensureFengari()
+  await ensureLuaBackendRuntime()
   const L = lauxlib.luaL_newstate()
   const scriptStem = stem(filename)
   const pretty = prettyFilename(filename)
@@ -1542,7 +1613,20 @@ export async function loadAutomationScript(
     // （对齐 script_reader.cpp Install / module_loader）
     const runtime = { lua, lauxlib, to_luastring, to_jsstring }
     installLuaModules(L, runtime)
-    installLuaModuleSearch(L, runtime, includeDirs, includeCache)
+    // 主脚本或 include 目录里存在 .moon 时才装编译器（约 500KB Lua 源码）
+    const moonScript = /\.moon$/i.test(filename)
+    const moonAvailable =
+      moonScript || Array.from(includeCache.keys()).some((path) => /\.moon$/i.test(path))
+    if (moonAvailable) await installMoonscriptModules(L, runtime)
+    installLuaModuleSearch(
+      L,
+      runtime,
+      includeDirs,
+      includeCache,
+      moonAvailable
+        ? (L2, source, chunkName) => compileMoonscriptChunk(L2, runtime, source, chunkName)
+        : undefined,
+    )
 
     const state: ScriptState = {
       id: nextStateId++,
@@ -1778,13 +1862,17 @@ export async function loadAutomationScript(
       const cached = filepath ? includeCache.get(filepath) : undefined
       if (!filepath || !cached) return raiseError(L2, `Lua include not found: ${includeName}`)
       // LuaInclude L666-671：LoadFile 失败报错；成功则调用（0 参、多返回值）并返回其结果个数
-      if (
-        lauxlib.luaL_loadbuffer(
-          L2,
-          to_luastring(stripLoaderBom(cached.code)),
-          null,
-          to_luastring(filepath),
-        ) !== 0
+      const includeSource = stripLoaderBom(cached.code)
+      if (/\.moon$/i.test(filepath)) {
+        const compiled = compileMoonscriptChunk(L2, runtime, includeSource, filepath)
+        if (!compiled.ok) {
+          return raiseError(
+            L2,
+            `Error loading Lua include "${includeName}":\n${compiled.error ?? 'MoonScript compilation failed'}`,
+          )
+        }
+      } else if (
+        lauxlib.luaL_loadbuffer(L2, to_luastring(includeSource), null, to_luastring(filepath)) !== 0
       ) {
         const message = luaErrorText(L2, -1)
         lua.lua_pop(L2, 1)
@@ -1829,11 +1917,19 @@ export async function loadAutomationScript(
     lua.lua_pushcfunction(L, includeFn)
     lua.lua_setglobal(L, to_luastring('include'))
 
-    // 执行脚本本体（错误处理器在函数下方：先压 msgh，再 loadbuffer 得到 [msgh, chunk]）
+    // 执行脚本本体（错误处理器在函数下方：先压 msgh，再得到 [msgh, chunk]）
     lua.lua_pushcclosure(L, addStackTrace, 0)
-    if (
-      lauxlib.luaL_loadbuffer(L, to_luastring(stripLoaderBom(code)), null, to_luastring(pretty)) !==
-      0
+    const scriptSource = stripLoaderBom(code)
+    if (moonScript) {
+      const compiled = compileMoonscriptChunk(L, runtime, scriptSource, pretty)
+      if (!compiled.ok) {
+        lua.lua_pop(L, 1) // msgh
+        return fail(
+          `Error initialising Lua script "${pretty}":\n\n${compiled.error ?? 'MoonScript compilation failed'}`,
+        )
+      }
+    } else if (
+      lauxlib.luaL_loadbuffer(L, to_luastring(scriptSource), null, to_luastring(pretty)) !== 0
     ) {
       const message = luaErrorText(L, -1)
       return fail(`Error initialising Lua script "${pretty}":\n\n${message}`)
@@ -1992,7 +2088,7 @@ export async function runAutomationMacro(
   activeDialogueIndex: number,
   host: AutomationHost = {},
 ): Promise<AutomationRunResult> {
-  if (!fengariModules) throw new Error('Automation runtime is not loaded yet')
+  if (!backendLoaded) throw new Error('Automation runtime is not loaded yet')
   const state = states.get(stateId)
   const entry = findMacro(stateId, macroName)
   if (!state || !entry) throw new Error(`Automation macro "${macroName}" is not loaded`)
@@ -2283,7 +2379,7 @@ export async function validateAutomationMacro(
   activeDialogueIndex: number | null,
   host: AutomationHost = {},
 ): Promise<AutomationValidateResult> {
-  if (!fengariModules) throw new Error('Automation runtime is not loaded yet')
+  if (!backendLoaded) throw new Error('Automation runtime is not loaded yet')
   const state = states.get(stateId)
   const entry = findMacro(stateId, macroName)
   if (!state || !entry || entry.validateRef === null) return { ok: true, help: null, log: [] }
@@ -2325,7 +2421,7 @@ export async function isActiveAutomationMacro(
   activeDialogueIndex: number | null,
   host: AutomationHost = {},
 ): Promise<AutomationIsActiveResult> {
-  if (!fengariModules) throw new Error('Automation runtime is not loaded yet')
+  if (!backendLoaded) throw new Error('Automation runtime is not loaded yet')
   const state = states.get(stateId)
   const entry = findMacro(stateId, macroName)
   if (!state || !entry || entry.isActiveRef === null) return { ok: true, active: false, log: [] }
@@ -2451,7 +2547,7 @@ export async function runAutomationFilter(
   config: Record<string, DialogValue> | null,
   host: AutomationHost = {},
 ): Promise<AutomationFilterRunResult> {
-  if (!fengariModules) throw new Error('Automation runtime is not loaded yet')
+  if (!backendLoaded) throw new Error('Automation runtime is not loaded yet')
   const state = states.get(stateId)
   const entry = findFilter(stateId, filterName)
   if (!state || !entry) throw new Error(`Automation filter "${filterName}" is not loaded`)
@@ -2534,7 +2630,7 @@ export async function configureAutomationFilter(
   rows: LuaRow[],
   host: AutomationHost = {},
 ): Promise<AutomationFilterConfigResult> {
-  if (!fengariModules) throw new Error('Automation runtime is not loaded yet')
+  if (!backendLoaded) throw new Error('Automation runtime is not loaded yet')
   const state = states.get(stateId)
   const entry = findFilter(stateId, filterName)
   if (!state || !entry) throw new Error(`Automation filter "${filterName}" is not loaded`)

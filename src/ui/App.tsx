@@ -19,6 +19,7 @@ import {
   isActiveAutomationMacro,
   loadAutomationScript,
   orderedAutomationFilters,
+  resetAutomationBackend,
   runAutomationFilter,
   runAutomationMacro,
   validateAutomationMacro,
@@ -908,9 +909,20 @@ export function App() {
     void reloadAllAutomationScripts()
   }, [reloadAllAutomationScripts])
 
+  // Automation/Backend 变更：旧 VM 的脚本状态全部失效，重建后端并重新加载脚本
+  const luaBackendRef = useRef(getOptionString('Automation/Backend'))
+  useEffect(() => {
+    const backend = getOptionString('Automation/Backend')
+    if (backend === luaBackendRef.current) return
+    luaBackendRef.current = backend
+    resetAutomationBackend()
+    void reloadAllAutomationScripts()
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- optionsVersion 仅为触发重读配置
+  }, [optionsVersion, reloadAllAutomationScripts])
+
   const addAutomationScript = async () => {
     const file = await host.openFile([
-      { description: 'Lua scripts', accept: { 'text/plain': ['.lua'] } },
+      { description: 'Lua scripts', accept: { 'text/plain': ['.lua', '.moon'] } },
     ])
     if (!file) return
     // 桌面 DialogAutomation::OnAdd：同名脚本已加载时报错（"Script '%s' is already loaded"）

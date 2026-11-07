@@ -389,4 +389,74 @@ describe('Lua Automation 运行时（fengari）', () => {
     expect(result.commits).toEqual([])
     closeAutomationState(loaded.stateId)
   })
+
+  it('加载 .moon 脚本（vendored MoonScript 0.8 纯 Lua 编译器）', async () => {
+    const loaded = await loadAutomationScript(
+      `export script_name = "Moon"
+export script_description = "MoonScript test"
+aegisub.register_macro "MoonUpper", "Uppercase", (subs, sel) ->
+  for i = 1, #subs
+    line = subs[i]
+    if line.class == "dialogue"
+      line.text = string.upper line.text
+      subs[i] = line
+  sel
+`,
+      '/automation/autoload/moon-test.moon',
+    )
+    expect(loaded.loaded, loaded.error).toBe(true)
+    expect(loaded.name).toBe('Moon')
+    expect(loaded.macros[0].id).toBe('automation/lua/moon-test/MoonUpper')
+
+    const result = await runAutomationMacro(loaded.stateId, 'MoonUpper', baseRows(), [0], 0)
+    expect(result.ok, result.error).toBe(true)
+    expect(result.commits[0].payload.cues.map((cue) => cue.text)).toEqual(['HELLO', 'WORLD'])
+    closeAutomationState(loaded.stateId)
+  })
+
+  it('.moon 编译错误带源码行号', async () => {
+    const loaded = await loadAutomationScript(
+      `script_name = "Bad"
+
+if true
+  x = = 1
+`,
+      '/automation/autoload/bad.moon',
+    )
+    expect(loaded.loaded).toBe(false)
+    expect(loaded.error).toContain('Error initialising Lua script "bad.moon"')
+    expect(loaded.error).toContain('failed to parse')
+  })
+
+  it('.moon 运行时错误映射回 MoonScript 行号', async () => {
+    const loaded = await loadAutomationScript(
+      `export script_name = "MoonErr"
+aegisub.register_macro "Fail", "", () ->
+  error "boom"
+`,
+      '/automation/autoload/moon-err.moon',
+    )
+    expect(loaded.loaded, loaded.error).toBe(true)
+    const result = await runAutomationMacro(loaded.stateId, 'Fail', baseRows(), [0], 0)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('line 3')
+    closeAutomationState(loaded.stateId)
+  })
+
+  it('源码自带的 select-overlaps.moon 可编译并注册宏', async () => {
+    const bundled = import.meta.glob('../../Aegisub/automation/autoload/*.moon', {
+      query: '?raw',
+      import: 'default',
+      eager: true,
+    }) as Record<string, string>
+    const key = Object.keys(bundled).find((path) => path.endsWith('select-overlaps.moon'))
+    expect(key).toBeTruthy()
+    const loaded = await loadAutomationScript(
+      bundled[key as string],
+      '/automation/autoload/select-overlaps.moon',
+    )
+    expect(loaded.loaded, loaded.error).toBe(true)
+    expect(loaded.macros[0]?.name).toBe('Select overlaps')
+    expect(loaded.macros[0]?.id).toBe('automation/lua/select-overlaps/Select overlaps')
+  })
 })

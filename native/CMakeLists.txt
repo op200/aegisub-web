@@ -22,11 +22,13 @@
 #   - 若某个上游文件依赖缺失，优先在 vendor/ 提供最小替代，而不是修改 Aegisub 源码。
 
 cmake_minimum_required(VERSION 3.20)
-project(aegisub_core CXX)
+project(aegisub_core C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Emscripten 专属链接选项（仅作用于 wasm 可执行目标）
 if(DEFINED EMSCRIPTEN)
@@ -128,4 +130,42 @@ if(DEFINED EMSCRIPTEN)
   target_include_directories(aegisub_core_wasm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}/../wasm")
   target_link_options(aegisub_core_wasm PRIVATE ${WASM_LINK_OPTIONS})
   target_link_libraries(aegisub_core_wasm aegisub_core)
+endif()
+
+# ---------------------------------------------------------------------------
+# Lua 5.5 —— Automation WASM 后端
+# ---------------------------------------------------------------------------
+# 官方源码放在 native/third_party/lua-5.5.1（由 build_lua_wasm.ps1 下载/校验）。
+# 只编译解释器与标准库，排除 lua.c / luac.c / ltests.c / onelua.c。
+# 产物 lua55.js 复制到 public/wasm/，由 src/automation/backends/lua55Wasm.ts 加载。
+
+set(LUA55_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua-5.5.1")
+
+file(GLOB LUA55_SOURCES "${LUA55_ROOT}/*.c")
+list(FILTER LUA55_SOURCES EXCLUDE REGEX "/(lua|luac|ltests|onelua)\\.c$")
+
+if(NOT LUA55_SOURCES)
+  message(WARNING "Lua 5.5.1 sources not found under ${LUA55_ROOT}; skipping lua55_wasm")
+else()
+  add_library(lua55 STATIC ${LUA55_SOURCES})
+  target_include_directories(lua55 PUBLIC "${LUA55_ROOT}")
+
+  if(DEFINED EMSCRIPTEN)
+    set(LUA55_WASM_LINK_OPTIONS
+      -sMODULARIZE=1
+      -sEXPORT_NAME=createLua55
+      -sEXPORT_ES6=1
+      -sSINGLE_FILE=1
+      -sALLOW_MEMORY_GROWTH=1
+      -sSTACK_SIZE=1048576
+      -sENVIRONMENT=web,worker,node
+      -sEXPORTED_FUNCTIONS=_lua_web_registry_index,_lua_web_newstate,_lua_web_close,_lua_web_newthread,_lua_web_main_handle,_lua_web_openlibs,_lua_web_gettop,_lua_web_settop,_lua_web_pushvalue,_lua_web_pop,_lua_web_insert,_lua_web_remove,_lua_web_replace,_lua_web_absindex,_lua_web_xmove,_lua_web_type,_lua_web_typename,_lua_web_isnil,_lua_web_isnumber,_lua_web_isstring,_lua_web_istable,_lua_web_isboolean,_lua_web_isfunction,_lua_web_isuserdata,_lua_web_isyieldable,_lua_web_toboolean,_lua_web_tonumber,_lua_web_tointeger,_lua_web_tolstring,_lua_web_touserdata,_lua_web_pushnil,_lua_web_pushboolean,_lua_web_pushnumber,_lua_web_pushinteger,_lua_web_pushstring,_lua_web_pushlightuserdata,_lua_web_newuserdata,_lua_web_newtable,_lua_web_getfield,_lua_web_setfield,_lua_web_getglobal,_lua_web_setglobal,_lua_web_rawget,_lua_web_rawset,_lua_web_rawgeti,_lua_web_rawseti,_lua_web_rawlen,_lua_web_setmetatable,_lua_web_next,_lua_web_pushclosure,_lua_web_pcall,_lua_web_call,_lua_web_resume,_lua_web_ref,_lua_web_loadbuffer,_lua_web_dostring,_lua_web_set_error,_lua_web_buffer,_lua_web_buffer2,_lua_web_strlen_addr,_lua_web_next_ref,_lua_web_getstack,_lua_web_getinfo,_lua_web_dbg_str,_lua_web_dbg_int
+      -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32,HEAP8,HEAP16,HEAPU16,HEAPF32,HEAPF64,getValue,setValue
+    )
+    add_executable(lua55_wasm "${CMAKE_CURRENT_SOURCE_DIR}/src/lua_web_api.cpp")
+    set_target_properties(lua55_wasm PROPERTIES OUTPUT_NAME lua55)
+    target_include_directories(lua55_wasm PRIVATE "${LUA55_ROOT}")
+    target_link_options(lua55_wasm PRIVATE ${LUA55_WASM_LINK_OPTIONS})
+    target_link_libraries(lua55_wasm lua55)
+  endif()
 endif()

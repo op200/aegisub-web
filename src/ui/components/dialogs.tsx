@@ -2548,7 +2548,7 @@ function automationInfoText(
     ),
   )
   info.push(tPlain('Scripting engines installed:'))
-  info.push('- Lua (*.lua)')
+  info.push('- Lua (*.lua,*.moon)')
   if (script) {
     info.push(
       tFmt(

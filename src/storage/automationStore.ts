@@ -93,14 +93,14 @@ async function migrateLegacyScripts(): Promise<void> {
   await clearLegacyScripts()
 }
 
-/** 枚举 autoload 目录中的 Lua 脚本（web 仅支持 .lua；.moon 需 MoonScript 运行时） */
+/** 枚举 autoload 目录中的 Lua / MoonScript 脚本（auto4_lua.cpp 的 "*.lua,*.moon"） */
 export async function loadAutomationScripts(): Promise<StoredAutomationScript[]> {
   try {
     await migrateLegacyScripts()
     const entries = await listDir(VFS_DIRS.automationAutoload)
     const scripts: StoredAutomationScript[] = []
     for (const entry of entries) {
-      if (entry.directory || !entry.name.toLowerCase().endsWith('.lua')) continue
+      if (entry.directory || !/\.(lua|moon)$/i.test(entry.name)) continue
       // oxlint-disable-next-line no-await-in-loop -- 逐个读取脚本内容
       const code = await readTextFile(entry.path)
       if (code !== null) scripts.push({ id: entry.path, filename: entry.name, code })

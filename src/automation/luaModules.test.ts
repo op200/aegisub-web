@@ -8,7 +8,12 @@ import unicodeSource from '../../Aegisub/automation/include/unicode.lua?raw'
 import utilsAuto4Source from '../../Aegisub/automation/include/utils-auto4.lua?raw'
 import utilsSource from '../../Aegisub/automation/include/utils.lua?raw'
 import { closeAutomationState, loadAutomationScript } from './luaEngine'
-import { installLuaModuleSearch, installLuaModules } from './luaModules'
+import {
+  compileMoonscriptChunk,
+  installLuaModuleSearch,
+  installLuaModules,
+  installMoonscriptModules,
+} from './luaModules'
 
 /** 假 VFS：refreshIncludeCache 走 dirExists + listTree，条目自带 text 不再读盘 */
 const fake = vi.hoisted(() => {
@@ -89,6 +94,7 @@ let fengariModule: Fengari | null = null
 async function createDirectState(
   files: Record<string, string>,
   dirs: string[],
+  moonscript = false,
 ): Promise<DirectState> {
   fengariModule ??= await import('fengari')
   const fengari = fengariModule as Fengari
@@ -101,8 +107,18 @@ async function createDirectState(
     clock += 1
     cache.set(path, { mtime: clock, code })
   }
-  installLuaModules(L, { lua, lauxlib, to_luastring, to_jsstring })
-  installLuaModuleSearch(L, { lua, lauxlib, to_luastring, to_jsstring }, dirs, cache)
+  const runtime = { lua, lauxlib, to_luastring, to_jsstring }
+  installLuaModules(L, runtime)
+  if (moonscript) await installMoonscriptModules(L, runtime)
+  installLuaModuleSearch(
+    L,
+    runtime,
+    dirs,
+    cache,
+    moonscript
+      ? (L2, source, chunkName) => compileMoonscriptChunk(L2, runtime, source, chunkName)
+      : undefined,
+  )
   return { fengari, L }
 }
 
@@ -298,6 +314,26 @@ describe('内置 aegisub.* 模块（Lua 5.3 移植）', () => {
       assert(other.name == 'other')
       -- 重复 require 走 package.loaded 缓存
       assert(require 'mypkg.mod' == mod)
+      `,
+    )
+    expect(result, result.error).toEqual({ ok: true, error: '' })
+    closeDirectState(state)
+  })
+
+  it('模块搜索器：同路径 .moon 优先于 .lua（script_reader.cpp module_loader）', async () => {
+    const state = await createDirectState(
+      {
+        '/automation/include/mypkg/mod.lua': 'return { lang = "lua" }',
+        '/automation/include/mypkg/mod.moon': 'lang = "moon"\nreturn { lang: lang }',
+      },
+      ['/automation/include'],
+      true,
+    )
+    const result = runLua(
+      state,
+      `
+      local mod = require 'mypkg.mod'
+      assert(mod.lang == 'moon', mod.lang)
       `,
     )
     expect(result, result.error).toEqual({ ok: true, error: '' })

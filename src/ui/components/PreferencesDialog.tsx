@@ -21,6 +21,7 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 
+import { luaBackendOptions } from '../../automation/luaBackend'
 import {
   getOption,
   getOptionInt,
@@ -64,6 +65,12 @@ type FieldSpec =
       opt: string
       choices?: string[]
       from?: 'catalogs' | 'audio-schemes'
+    }
+  | {
+      kind: 'select'
+      label: string
+      opt: string
+      options: Array<{ value: string; label: string }>
     }
   | { kind: 'font'; prefix: string }
   | { kind: 'browse'; label: string; opt: string; enabler?: Enabler }
@@ -734,6 +741,12 @@ const PAGES: Page[] = [
               'All scripts',
             ],
           },
+          {
+            kind: 'select',
+            label: 'Lua backend',
+            opt: 'Automation/Backend',
+            options: luaBackendOptions(),
+          },
         ],
       },
     ],
@@ -1095,6 +1108,29 @@ function ChoiceControl({
   )
 }
 
+/** 字符串枚举下拉（值即 option 存储值，区别于 ChoiceControl 的下标语义） */
+function SelectControl({
+  value,
+  onCommit,
+  options,
+  enabled,
+}: ControlProps & { options: Array<{ value: string; label: string }> }) {
+  const current = String(value)
+  return (
+    <select
+      value={options.some((option) => option.value === current) ? current : options[0]?.value}
+      disabled={!enabled}
+      onChange={(event) => onCommit(event.target.value)}
+    >
+      {options.map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </select>
+  )
+}
+
 function FontControl({
   prefix,
   read,
@@ -1380,6 +1416,9 @@ export function PreferencesDialog({ onClose }: PreferencesDialogProps) {
               control = <ChoiceControl {...enabledProp} choices={choices} />
               break
             }
+            case 'select':
+              control = <SelectControl {...enabledProp} options={row.options} />
+              break
           }
           return (
             <div

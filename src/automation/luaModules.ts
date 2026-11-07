@@ -3,12 +3,14 @@
  * 与 VFS 版模块搜索器。
  *
  * 桌面版由 script_reader.cpp 的 Install()/module_loader 从真实文件系统加载模块，
- * 并用 MoonScript 运行时编译 aegisub/*.moon。web 无 MoonScript/lpeg（官方编译器
- * 依赖 LPeg），因此：
+ * 并用 MoonScript 运行时编译 aegisub/*.moon。web 没有 lpeg，因此：
  * - installLuaModuleSearch 把 include 目录写进 package.path 并替换 searcher #2，
- *   从 include 缓存同步加载 .lua 模块，并清空 cpath/jspath 阻断 fengari 的 XHR 回退；
+ *   从 include 缓存同步加载 .lua 模块（同路径的 .moon 优先，对齐 module_loader），
+ *   并清空 cpath/jspath 阻断 fengari 的 XHR 回退；
  * - installLuaModules 把 aegisub.internal.argcheck / aegisub.util / aegisub.unicode /
- *   aegisub.re / bit / ffi 注册到 package.preload（ffi 为可 require 的报错占位）。
+ *   aegisub.re / bit / ffi 注册到 package.preload（ffi 为可 require 的报错占位）；
+ * - installMoonscriptModules / compileMoonscriptChunk 是 vendored MoonScript 0.8
+ *   （纯 Lua 解析器，不需要 lpeg），把 .moon 编译成 Lua 在同一 VM 内执行。
  */
 
 import { normalizePath } from '../storage/vfs'
@@ -83,6 +85,8 @@ export function installLuaModuleSearch(
   runtime: LuaRuntime,
   dirs: string[],
   cache: ReadonlyMap<string, { mtime: number; code: string }>,
+  /** .moon 编译（未安装 MoonScript 时省略，此时忽略 .moon 候选） */
+  loadMoonscript?: (L: any, source: string, chunkName: string) => MoonscriptChunkResult,
 ): void {
   const { lua, lauxlib, to_luastring, to_jsstring } = runtime
 
@@ -99,13 +103,27 @@ export function installLuaModuleSearch(
     const missing: string[] = []
     for (const token of packagePath.split(';')) {
       if (!token) continue
-      const candidate = normalizePath(token.split('?').join(modulePath))
+      let candidate = normalizePath(token.split('?').join(modulePath))
+      // script_reader.cpp module_loader L102-110：同路径的 .moon 优先于 .lua
+      if (loadMoonscript && /\.lua$/i.test(candidate)) {
+        const moonCandidate = candidate.replace(/\.lua$/i, '.moon')
+        if (cache.has(moonCandidate)) candidate = moonCandidate
+      }
       const cached = cache.get(candidate)
       if (!cached) {
         missing.push(`\n\tno file '${candidate}'`)
         continue
       }
-      if (
+      if (loadMoonscript && /\.moon$/i.test(candidate)) {
+        const compiled = loadMoonscript(L2, stripBom(cached.code), candidate)
+        if (!compiled.ok) {
+          return raiseError(
+            L2,
+            runtime,
+            `Error loading Lua module "${candidate}":\n${compiled.error ?? 'MoonScript compilation failed'}`,
+          )
+        }
+      } else if (
         lauxlib.luaL_loadbuffer(
           L2,
           to_luastring(stripBom(cached.code)),
@@ -141,6 +159,120 @@ export function installLuaModuleSearch(
   lua.lua_pushvalue(L, -1)
   lua.lua_setfield(L, -3, to_luastring('loaders'))
   lua.lua_pop(L, 2)
+}
+
+// ---------------------------------------------------------------------------
+// MoonScript（vendored 0.8.0，纯 Lua 解析器；桌面版是 include/moonscript.lua 0.7 + lpeg）
+// ---------------------------------------------------------------------------
+
+export interface MoonscriptChunkResult {
+  ok: boolean
+  error?: string
+}
+
+/**
+ * 编译器源码懒加载表：`./moonscript/base.lua` → 模块名 `moonscript.base`。
+ * init.lua 会调用 insert_loader()（依赖 io.open 的模块搜索器，web 无文件系统），
+ * 故不注册；桌面版也不把编译器暴露成可 require 的模块，而是存进 registry。
+ */
+const moonscriptLoaders = import.meta.glob('./moonscript/**/*.lua', {
+  query: '?raw',
+  import: 'default',
+}) as Record<string, () => Promise<unknown>>
+
+let moonscriptSources: Promise<Map<string, string>> | null = null
+
+function moonscriptModuleName(key: string): string | null {
+  const prefix = './moonscript/'
+  if (!key.startsWith(prefix) || !key.endsWith('.lua')) return null
+  const relative = key.slice(prefix.length, -4)
+  if (relative === 'init') return null
+  return `moonscript.${relative.split('/').join('.')}`
+}
+
+function loadMoonscriptSources(): Promise<Map<string, string>> {
+  moonscriptSources ??= (async () => {
+    const sources = new Map<string, string>()
+    await Promise.all(
+      Object.entries(moonscriptLoaders).map(async ([key, load]) => {
+        const name = moonscriptModuleName(key)
+        if (!name) return
+        sources.set(name, stripBom(String(await load())))
+      }),
+    )
+    return sources
+  })()
+  return moonscriptSources
+}
+
+/** 把 MoonScript 编译器注册进 package.preload（每个 Lua 状态各注册一次） */
+export async function installMoonscriptModules(L: any, runtime: LuaRuntime): Promise<void> {
+  const sources = await loadMoonscriptSources()
+  for (const [name, source] of sources) registerLuaSource(L, runtime, name, source)
+}
+
+/**
+ * 把 .moon 源码编译成 Lua 函数并压栈（script_reader.cpp LoadFile L59-84）。
+ * chunkName 兼作 moonscript.line_tables 的键；原文写入 registry，供
+ * addStackTrace 把编译后 Lua 行号映射回 MoonScript 行号（utils.cpp moon_line）。
+ */
+export function compileMoonscriptChunk(
+  L: any,
+  runtime: LuaRuntime,
+  source: string,
+  chunkName: string,
+): MoonscriptChunkResult {
+  const { lua, lauxlib, to_luastring, to_jsstring } = runtime
+
+  lua.lua_getglobal(L, to_luastring('require'))
+  lua.lua_pushstring(L, to_luastring('moonscript.base'))
+  if (lua.lua_pcall(L, 1, 1, 0) !== 0) {
+    const message = to_jsstring(lua.lua_tostring(L, -1))
+    lua.lua_pop(L, 1)
+    return { ok: false, error: message }
+  }
+
+  // to_lua(text, options) → code, line_table（失败时 code = nil, err）
+  lua.lua_getfield(L, -1, to_luastring('to_lua'))
+  lua.lua_pushstring(L, to_luastring(source))
+  lua.lua_newtable(L)
+  if (lua.lua_pcall(L, 2, 2, 0) !== 0) {
+    const message = to_jsstring(lua.lua_tostring(L, -1))
+    lua.lua_pop(L, 2)
+    return { ok: false, error: message }
+  }
+  if (lua.lua_isnil(L, -2)) {
+    const message = lua.lua_isstring(L, -1)
+      ? to_jsstring(lua.lua_tostring(L, -1))
+      : 'MoonScript compilation failed'
+    lua.lua_pop(L, 3)
+    return { ok: false, error: message }
+  }
+  const code = to_jsstring(lua.lua_tostring(L, -2))
+
+  // line_tables[chunkName] = line_table（base.loadstring 的同款记录）
+  lua.lua_getglobal(L, to_luastring('require'))
+  lua.lua_pushstring(L, to_luastring('moonscript.line_tables'))
+  if (lua.lua_pcall(L, 1, 1, 0) === 0) {
+    lua.lua_pushstring(L, to_luastring(chunkName))
+    lua.lua_pushvalue(L, -3)
+    lua.lua_rawset(L, -3)
+    lua.lua_pop(L, 1)
+  } else {
+    lua.lua_pop(L, 1)
+  }
+  lua.lua_pop(L, 2) // code, line_table
+  lua.lua_pop(L, 1) // moonscript.base
+
+  lua.lua_pushstring(L, to_luastring(source))
+  lua.lua_setfield(L, lua.LUA_REGISTRYINDEX, to_luastring(`raw moonscript: ${chunkName}`))
+
+  if (lauxlib.luaL_loadbuffer(L, to_luastring(code), null, to_luastring(chunkName)) !== 0) {
+    const message = to_jsstring(lua.lua_tostring(L, -1))
+    lua.lua_pop(L, 1)
+    return { ok: false, error: message }
+  }
+  return { ok: true }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +709,9 @@ return function(argfmt)
   assert(type(argfmt) == 'string')
   local min_args, max_args = 0, 0
   local checks = {}
-  for arg in argfmt:gmatch('[^ ]+') do
+  for token in argfmt:gmatch('[^ ]+') do
+    -- Lua 5.5 起 for 循环变量是 const，不能直接改写，复制到局部变量
+    local arg = token
     if arg == '...' then
       max_args = nil
       break
