@@ -667,14 +667,13 @@ button:disabled {
 }
 .video-position,
 .video-subs-pos {
-  /* video_box.cpp：VideoPosition/VideoSubsPos 是 wxSizerFlags(1)（可拉伸，min size 110px）。
-     web 侧不写死最小宽，改由**内容**决定：field-sizing: content 让输入框固有宽跟随 value
-     文本（"时间码 - 帧号" / "相对字幕起止的偏移串"），min-width: min-content 保证窗口缩到
-     极小时也不小于这段文本宽；值变长/变短时最小宽跟着变。
-     不支持 field-sizing 的浏览器退回输入框固有内容宽（Chromium 约 139px），仍不会被压扁 */
-  field-sizing: content;
-  flex: 1 1 auto;
-  min-width: min-content;
+  /* video_box.cpp：VideoPosition/VideoSubsPos 是 wxTextCtrl(wxSize(110,-1)) +
+     wxSizerFlags(1)：最小宽恒为 110px（与文本长度无关），多余空间按比例拉伸。
+     不能按内容撑宽：播放位置/相对字幕偏移文本变长（拖到后面）会撑大 VideoBox 的
+     min-content，视频框右侧露出面板底色（"视频右边出现空白"）。 */
+  flex: 1 1 110px;
+  width: 110px;
+  min-width: 110px;
   height: 21px;
   padding: 0 4px;
   border: 1px solid var(--border);

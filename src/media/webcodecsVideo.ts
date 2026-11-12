@@ -5,9 +5,9 @@
  * 解封装（web-demuxer）→ VideoDecoder 解码 → canvas 逐帧上屏；
  * seek 从目标时间前最近的关键帧开始解码到目标帧（与 libav 的 AVSEEK_FLAG_BACKWARD 一致）。
  */
-import { AVSeekFlag, type WebAVStream } from 'web-demuxer'
+import type { WebAVStream } from 'web-demuxer'
 
-import { openDemuxer, parseFraction, type DemuxProbe } from './demux'
+import { AVSEEK_FLAG_BACKWARD, openDemuxer, parseFraction, type DemuxProbe } from './demux'
 import { parseContainerColorspace, resolveDecoderColorSpace } from './videoColor'
 
 export interface WebCodecsVideoEvents {
@@ -410,7 +410,7 @@ export class WebCodecsVideoSource {
       'video',
       Math.max(0, startSec),
       undefined,
-      AVSeekFlag.AVSEEK_FLAG_BACKWARD,
+      AVSEEK_FLAG_BACKWARD,
     )
     this.reader = stream.getReader()
     this.streamDone = false

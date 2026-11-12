@@ -33,7 +33,7 @@ Aegisub Web 目的在于尽可能在 Web 端实现 Aegisub 功能，同时提供
 
 ### Firefox
 
-v159.0.1
+v160.0
 
 - 不支持 [`window.queryLocalFonts`](https://caniuse.com/wf-local-fonts)，需要手动载入字体文件
 - MP4 容器的部分视频（疑似因为 open-gop）随机 seek 有无法从 IDR 帧解码、会从头解码的 bug

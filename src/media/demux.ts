@@ -8,8 +8,8 @@
  * 注意：web-demuxer 的 d.ts 无 default export（只能 named import），
  * info.streams 类型不精确，需断言为 WebAVStream[]。
  */
-import { WebDemuxer, AVMediaType } from 'web-demuxer'
-import type { WebAVStream, WebMediaInfo } from 'web-demuxer'
+// 仅类型导入：web-demuxer 主模块在打开文件时动态加载，避免进首屏 chunk
+import type { AVMediaType, AVSeekFlag, WebAVStream, WebDemuxer, WebMediaInfo } from 'web-demuxer'
 import demuxerWasmAsset from 'web-demuxer/wasm?url'
 
 import type { PeaksWorkerResponse } from './peaks.worker'
@@ -17,6 +17,15 @@ import type { PeaksWorkerResponse } from './peaks.worker'
 // web-demuxer 的 worker 由 blob URL 创建（内嵌 base64 脚本），blob: 无层次路径，
 // worker 内 fetch 相对/根相对 URL 会 "Failed to parse URL" —— 必须先解析为绝对 URL
 const demuxerWasmUrl = new URL(demuxerWasmAsset, globalThis.location.href).href
+
+/**
+ * AVSeekFlag.AVSEEK_FLAG_BACKWARD（ffmpeg 枚举值 1，向目标时间前最近的关键帧 seek）。
+ * 用常量替代运行时枚举：避免把整个 web-demuxer 静态打进首屏 chunk。
+ */
+export const AVSEEK_FLAG_BACKWARD = 1 as AVSeekFlag
+
+/** AVMediaType.AVMEDIA_TYPE_VIDEO（ffmpeg 枚举值 0；同上，避免运行时导入枚举） */
+export const AVMEDIA_TYPE_VIDEO = 0 as AVMediaType
 
 export interface DemuxProbe {
   demuxer: WebDemuxer
@@ -36,6 +45,7 @@ export function parseFraction(value: string | undefined): number {
 
 /** 打开文件并读取头信息（容器不支持时抛错） */
 export async function openDemuxer(file: File): Promise<DemuxProbe> {
+  const { WebDemuxer, AVMediaType } = await import('web-demuxer')
   const demuxer = new WebDemuxer({ wasmFilePath: demuxerWasmUrl })
   try {
     await demuxer.load(file)

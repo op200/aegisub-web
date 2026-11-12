@@ -15,6 +15,13 @@ const PANEL_SIDE_CHROME = 31
 const CHROME_HEIGHT = 56
 
 /**
+ * 未载入视频时视频栏的占位分辨率：按最常见的 1080p 预留。
+ * 载入 1080p 视频后 FitClientSizeToVideo 得到的面板尺寸与此一致，
+ * 避免从占位状态载入视频时视频栏尺寸跳变。
+ */
+export const PLACEHOLDER_VIDEO_SIZE: VideoSize = { width: 1920, height: 1080 }
+
+/**
  * frame_main.cpp FrameMain::OnVideoOpen：视频载入后按分辨率与主窗口尺寸调整窗口缩放，
  * 而不是一律按 100% 显示（否则不同分辨率的视频载入时外观大小差异巨大）：
  *   视频显示宽 > 窗口宽 4/3 或高 > 窗口高 6/4 → 缩到 1/4；
@@ -65,4 +72,16 @@ export function calculateAttachedVideoLayout(
     panelWidth: displayWidth + PANEL_SIDE_CHROME,
     panelHeight: displayHeight + CHROME_HEIGHT,
   }
+}
+
+/**
+ * 未载入视频时的等效窗口缩放：等价于"此刻载入 1080p 视频"经 FrameMain::OnVideoOpen
+ * 减档后的 windowZoom。占位面板与占位预览共用该值，载入 1080p 时尺寸与缩放都不跳变。
+ */
+export function placeholderVideoZoom(
+  zoom: number,
+  windowWidth: number,
+  windowHeight: number,
+): number {
+  return fitWindowZoomToVideo(PLACEHOLDER_VIDEO_SIZE, zoom, windowWidth, windowHeight)
 }

@@ -53,12 +53,50 @@ function poLocalesPlugin(): Plugin {
   }
 }
 
+/**
+ * fengari 同时面向 Node 与浏览器：源码里有 `require('fs'/'path'/'os'/'crypto'/
+ * 'child_process')` 以及 Node 专用依赖 tmp / readline-sync。这些分支在浏览器里
+ * 都被 `typeof process` 守卫，不会执行，但 rolldown 仍会解析它们并对每个 Node
+ * 内置模块告警「externalized for browser compatibility」。
+ *
+ * 构建期把 fengari 链路上的这些模块替换成空模块（运行时分支本就不执行，行为不变），
+ * 顺带把 tmp / readline-sync 的 Node 代码移出产物。仅作用于 build，dev / Vitest
+ * 仍走 Node 原生模块（Lua 测试依赖真实 fs）。
+ */
+function fengariNodeStubPlugin(): Plugin {
+  const STUBBED = new Set(['fs', 'path', 'os', 'crypto', 'child_process', 'tmp', 'readline-sync'])
+  const VIRTUAL_ID = '\0aegisub-node-stub'
+
+  return {
+    name: 'aegisub-fengari-node-stub',
+    apply: 'build',
+    enforce: 'pre',
+    resolveId(id, importer) {
+      if (!STUBBED.has(id)) return
+      if (!importer || !/(fengari|readline-sync|tmp)[\\/]/.test(importer)) return
+      return VIRTUAL_ID
+    },
+    load(id) {
+      if (id === VIRTUAL_ID) return 'export default {}'
+    },
+  }
+}
+
 export default defineConfig({
   base: repository ? `/${repository}/` : './',
-  plugins: [react(), poLocalesPlugin()],
+  plugins: [react(), poLocalesPlugin(), fengariNodeStubPlugin()],
   build: {
     target: 'es2022',
     sourcemap: true,
+    // 首屏静态依赖链（React + 应用代码）超过 500 kB 警告阈值，按 maxSize 自动再分包；
+    // 动态 import 的模块（jassub / web-demuxer / fengari 等）不在 $initial 组内，不受影响。
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [{ name: 'initial', tags: ['$initial'], maxSize: 400 * 1024 }],
+        },
+      },
+    },
   },
   worker: {
     format: 'es',

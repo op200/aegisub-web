@@ -139,7 +139,12 @@ import { StyleManagerDialog } from './components/StyleManagerDialog'
 import { gridRowHeight, SubtitleGrid } from './components/SubtitleGrid'
 import { Toolbar } from './components/Toolbar'
 import { initLocale, tFmt, tPlain, tPlural, useLocaleVersion } from './i18n'
-import { calculateAttachedVideoLayout, fitWindowZoomToVideo } from './layout/videoLayout'
+import {
+  calculateAttachedVideoLayout,
+  fitWindowZoomToVideo,
+  placeholderVideoZoom,
+  PLACEHOLDER_VIDEO_SIZE,
+} from './layout/videoLayout'
 import { installGlobalLogHandlers, logError, logInfo, getLogEntries, subscribeLogs } from './log'
 import { useSystemTheme } from './theme'
 
@@ -383,6 +388,9 @@ export function App() {
       )
   }, [devicePixelRatioValue])
   const [videoIntrinsicSize, setVideoIntrinsicSize] = useState({ width: 1280, height: 720 })
+  // 当前视频的真实尺寸是否已上报：载入中（已 setVideoMedia、尚未拿到元数据）沿用占位布局，
+  // 避免视频栏先跳到上一个视频/默认 1280×720 的尺寸再跳回
+  const [videoSizeReady, setVideoSizeReady] = useState(false)
   // AudioBox（wxSashWindow）底边 sash：SetSashVisible(wxSASH_BOTTOM) + OnSashDrag 改变
   // 音频栏高度（SetMinSize → 父 Layout），OPT_SET("Audio/Display Height") 持久化
   const [audioBoxHeight, setAudioBoxHeight] = useState(() => getOptionInt('Audio/Display Height'))
@@ -406,6 +414,7 @@ export function App() {
     setVideoIntrinsicSize((prev) =>
       prev.width === width && prev.height === height ? prev : { width, height },
     )
+    setVideoSizeReady(true)
     // frame_main.cpp FrameMain::OnVideoOpen：参数是 provider 的像素尺寸与主窗口尺寸
     // （wx GetSize 为逻辑像素，Web 对应 CSS 像素的 window.innerWidth/Height）。
     // 同一视频在原生/WebCodecs 通道间切换会重复上报尺寸，只在本轮打开后结算第一次
@@ -772,15 +781,22 @@ export function App() {
       .map((id) => core.document.cues.find((cue) => cue.id === id))
       .filter((cue) => cue !== undefined)
   }, [core, selectedSet, activeId])
+  // 无视频或真实尺寸尚未上报（载入中）时，视频面板按 1080p 占位；预览内部视口
+  // 必须用同一组 intrinsic/zoom，否则会按上一个视频的尺寸与缩放渲染（看似缩放错乱）
+  const videoPlaceholder = !videoMedia || !videoSizeReady
+  const previewZoom = videoPlaceholder
+    ? placeholderVideoZoom(videoWindowZoom, window.innerWidth, window.innerHeight)
+    : videoWindowZoom
+  const previewIntrinsic = videoPlaceholder ? PLACEHOLDER_VIDEO_SIZE : videoIntrinsicSize
   const videoLayout = useMemo(
     () =>
       calculateAttachedVideoLayout(
-        videoIntrinsicSize,
-        videoWindowZoom,
-        aspectOverride ?? videoIntrinsicSize.width / Math.max(1, videoIntrinsicSize.height),
+        previewIntrinsic,
+        previewZoom,
+        aspectOverride ?? previewIntrinsic.width / Math.max(1, previewIntrinsic.height),
         devicePixelRatioValue,
       ),
-    [aspectOverride, videoIntrinsicSize, videoWindowZoom, devicePixelRatioValue],
+    [aspectOverride, previewIntrinsic, previewZoom, devicePixelRatioValue],
   )
 
   // JumpToTime(ms, START)（video_controller.cpp）：FrameAtTime(start, START) 定帧后
@@ -1539,6 +1555,7 @@ export function App() {
       if (previousAudio && previousAudio !== previousVideo) URL.revokeObjectURL(previousAudio.url)
     }
     setVideoMedia(source)
+    setVideoSizeReady(false)
     // FrameMain::OnVideoOpen 的减档等真实尺寸上报后结算（见 setIntrinsicSizeStable）
     pendingZoomFitRef.current = true
     setVideoTimeMs(0)
@@ -1640,6 +1657,7 @@ export function App() {
   const closeVideo = () => {
     if (videoMedia && videoMedia !== audioMedia) URL.revokeObjectURL(videoMedia.url)
     setVideoMedia(null)
+    setVideoSizeReady(false)
     pendingZoomFitRef.current = false
     setVideoDurationMs(0)
     setVideoTimeMs(0)
@@ -2280,6 +2298,7 @@ export function App() {
     openDummyVideo: (options) => {
       if (videoMedia && videoMedia !== audioMedia) URL.revokeObjectURL(videoMedia.url)
       setVideoMedia({ name: 'Dummy Video', url: '', kind: 'video', dummy: options })
+      setVideoSizeReady(false)
       // dummy provider 同样经 FrameMain::OnVideoOpen 减档（尺寸由面板 effect 上报）
       pendingZoomFitRef.current = true
       setVideoDurationMs(options.lengthMs)
@@ -2549,11 +2568,11 @@ export function App() {
             ? {
                 // video_box.cpp 挂靠 TopSizer proportion 0：视频栏高度=精确最小高（display+56），
                 // 多余空间全给 Grid（proportion 1）；窗口放不下时 wx 靠 frame 最小尺寸强制窗口变大
-                // （永不压缩视频栏），浏览器侧由 .workspace 的 overflow:auto 滚动到达（见 styles.css）
-                gridTemplateRows:
-                  videoMedia && !isNarrowViewport
-                    ? `minmax(${videoLayout.panelHeight}px, min-content) minmax(120px, 1fr)`
-                    : `min(${videoLayout.panelHeight}px, calc(100dvh - 194px)) minmax(120px, 1fr)`,
+                // （永不压缩视频栏），浏览器侧由 .workspace 的 overflow:auto 滚动到达（见 styles.css）。
+                // 未载入视频时占位面板已按 1080p 预留同一高度，故空/有视频共用同一行高
+                gridTemplateRows: isNarrowViewport
+                  ? `min(${videoLayout.panelHeight}px, calc(100dvh - 194px)) minmax(120px, 1fr)`
+                  : `minmax(${videoLayout.panelHeight}px, min-content) minmax(120px, 1fr)`,
               }
             : undefined
         }
@@ -2589,14 +2608,14 @@ export function App() {
               }
               isCommandEnabled={isCommandEnabled}
               isCommandChecked={isCommandChecked}
-              windowZoom={videoWindowZoom}
+              windowZoom={previewZoom}
               devicePixelRatio={devicePixelRatioValue}
               onWindowZoomChange={setVideoWindowZoom}
               onIntrinsicSizeChange={setIntrinsicSizeStable}
               localFontsEpoch={localFontsEpoch}
               onLocalFontsAuthorize={() => setLocalFontsEpoch((epoch) => epoch + 1)}
-              intrinsicWidth={videoIntrinsicSize.width}
-              intrinsicHeight={videoIntrinsicSize.height}
+              intrinsicWidth={previewIntrinsic.width}
+              intrinsicHeight={previewIntrinsic.height}
               overscan={videoOverscan}
               keyframes={activeKeyframes}
               currentFrame={currentFrame}

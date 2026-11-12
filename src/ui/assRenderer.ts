@@ -17,7 +17,8 @@
  * - 内嵌字体（track 的 [Fonts]）由 libass 原生解析，优先级与原版一致
  * - setTrack 防抖（编辑器高频修改）；render 由 PreviewPane 的时间/尺寸变化驱动
  */
-import JASSUB from 'jassub'
+// 仅类型导入：JASSUB 主库在首次创建渲染器时动态加载，避免进首屏 chunk
+import type JASSUB from 'jassub'
 import jassubDefaultFontUrl from 'jassub/dist/default.woff2?url'
 import jassubModernWasmUrl from 'jassub/dist/wasm/jassub-worker-modern.wasm?url'
 import jassubWasmUrl from 'jassub/dist/wasm/jassub-worker.wasm?url'
@@ -251,7 +252,8 @@ export async function createAssRenderer(
     // fontconfig/DirectWrite 供字）；全 miss 返回空数组走懒加载兜底。
     // 之后文档变化（打开文件/改样式）经 flushTrack 增量同步新字体
     const systemFonts = await loadSystemFonts(collectFontNames(subContent))
-    instance = new JASSUB({
+    const { default: JassubRenderer } = await import('jassub')
+    instance = new JassubRenderer({
       canvas,
       subContent: stripBom(subContent),
       workerUrl: jassubWorkerUrl,

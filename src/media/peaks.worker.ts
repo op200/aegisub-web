@@ -13,11 +13,10 @@
  *    demux.ts extractVideoKeyframes 的 worker 化）。
  */
 import './workerWindow'
-import { AVSeekFlag, AVMediaType } from 'web-demuxer'
 import type { WebAVStream } from 'web-demuxer'
 
 import { ptsToMs } from '../core/vfr'
-import { openDemuxer } from './demux'
+import { AVMEDIA_TYPE_VIDEO, AVSEEK_FLAG_BACKWARD, openDemuxer } from './demux'
 import { audioDataToMono } from './pcm'
 import { finalize, StreamAnalyzer } from './peakAnalyzer'
 
@@ -186,7 +185,7 @@ async function runAudioDemux(file: File): Promise<void> {
       error: () => undefined,
     })
     decoder.configure(config)
-    const stream = probe.demuxer.read('audio', 0, undefined, AVSeekFlag.AVSEEK_FLAG_BACKWARD)
+    const stream = probe.demuxer.read('audio', 0, undefined, AVSEEK_FLAG_BACKWARD)
     const reader = stream.getReader()
     for (;;) {
       const { done, value } = await reader.read()
@@ -272,7 +271,7 @@ async function runVideoScan(file: File): Promise<void> {
   try {
     const info = await demuxer.getMediaInfo()
     const streams = (info.streams ?? []) as WebAVStream[]
-    if (!streams.some((stream) => stream.codec_type === AVMediaType.AVMEDIA_TYPE_VIDEO)) {
+    if (!streams.some((stream) => stream.codec_type === AVMEDIA_TYPE_VIDEO)) {
       post({ type: 'scan-done' })
       return
     }

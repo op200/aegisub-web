@@ -6,9 +6,7 @@
  * 播放区间 [startMs, endMs) 在 play() 时给定（音频计时按行播放的语义，
  * audio_player_audio.cpp 的 PlayRange），进度以 AudioContext.currentTime 推算。
  */
-import { AVSeekFlag } from 'web-demuxer'
-
-import { openDemuxer, type DemuxProbe } from './demux'
+import { AVSEEK_FLAG_BACKWARD, openDemuxer, type DemuxProbe } from './demux'
 import { audioDataToChannels } from './pcm'
 
 export interface WebCodecsAudioEvents {
@@ -157,7 +155,7 @@ export class WebCodecsAudioPlayer {
         'audio',
         startMs / 1000,
         undefined,
-        AVSeekFlag.AVSEEK_FLAG_BACKWARD,
+        AVSEEK_FLAG_BACKWARD,
       )
       const reader = stream.getReader()
       this.reader = reader
