@@ -88,15 +88,11 @@ export default defineConfig({
   build: {
     target: 'es2022',
     sourcemap: true,
-    // 首屏静态依赖链（React + 应用代码）超过 500 kB 警告阈值，按 maxSize 自动再分包；
-    // 动态 import 的模块（jassub / web-demuxer / fengari 等）不在 $initial 组内，不受影响。
-    rolldownOptions: {
-      output: {
-        codeSplitting: {
-          groups: [{ name: 'initial', tags: ['$initial'], maxSize: 400 * 1024 }],
-        },
-      },
-    },
+    // 首屏静态依赖链（React + 应用代码）约 870 kB，超过默认 500 kB 警告阈值。
+    // 不能按 maxSize 再分包：rolldown 会把存在循环引用的模块拆到不同 chunk，
+    // 各 chunk 以 <script type="module"> 独立执行时互相读到未初始化的导出
+    // （表现为 Object.keys(undefined) 白屏，vite 8.3.8 起必现）。
+    chunkSizeWarningLimit: 1000,
   },
   worker: {
     format: 'es',
