@@ -43,9 +43,13 @@ function crc32(text: string): number {
 }
 
 /** 索引缓存键（ffmpegsource_common.cpp GetCacheFilename 命名规则） */
-export function keyframeCacheKey(file: File): string {
+export function keyframeCacheKey(file: File, videoStreamIndex?: number): string {
   const modifiedSeconds = Math.floor(file.lastModified / 1000)
-  return `${crc32(file.name)}_${file.size}_${modifiedSeconds}`
+  const base = `${crc32(file.name)}_${file.size}_${modifiedSeconds}`
+  // 多轨视频的不同流索引必须区分缓存（关键帧/时间码不同）
+  return videoStreamIndex === undefined || videoStreamIndex === 0
+    ? base
+    : `${base}_s${videoStreamIndex}`
 }
 
 export interface CachedVideoIndex {
@@ -54,13 +58,19 @@ export interface CachedVideoIndex {
   frameTimesMs?: number[]
 }
 
-export async function loadCachedKeyframes(file: File): Promise<CachedVideoIndex | null> {
+export async function loadCachedKeyframes(
+  file: File,
+  videoStreamIndex?: number,
+): Promise<CachedVideoIndex | null> {
   try {
     if (typeof indexedDB === 'undefined') return null
     const database = await openMainDatabase()
     try {
       const entry = await new Promise<StoredKeyframeEntry | undefined>((resolve, reject) => {
-        const request = database.transaction(STORE).objectStore(STORE).get(keyframeCacheKey(file))
+        const request = database
+          .transaction(STORE)
+          .objectStore(STORE)
+          .get(keyframeCacheKey(file, videoStreamIndex))
         request.onsuccess = () => resolve(request.result as StoredKeyframeEntry | undefined)
         request.onerror = () => reject(request.error)
       })
@@ -104,10 +114,11 @@ export async function storeCachedKeyframes(
   file: File,
   keyframeTimesMs: number[],
   frameTimesMs?: number[],
+  videoStreamIndex?: number,
 ): Promise<void> {
   try {
     if (typeof indexedDB === 'undefined' || keyframeTimesMs.length === 0) return
-    const key = keyframeCacheKey(file)
+    const key = keyframeCacheKey(file, videoStreamIndex)
     const database = await openMainDatabase()
     try {
       // 渐进上报（WebCodecs 读流路径）不带表调用时保留既有条目的时间码表，

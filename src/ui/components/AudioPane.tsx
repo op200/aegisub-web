@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { getOptionInt, setOption } from '../../config/options'
 import type { SubtitleCue } from '../../core/types'
+import type { Framerate } from '../../core/vfr'
 import { detachElementGain, setElementGain } from '../../media/elementGain'
 import { WebCodecsAudioPlayer } from '../../media/webcodecsAudio'
 import type { MediaSource } from '../../platform/types'
@@ -19,12 +20,16 @@ interface AudioPaneProps {
   currentTimeMs: number
   videoTimeMs: number | null
   selectedCue: SubtitleCue | null
+  /** 全部选中行（吸附目标包含选中行标记） */
+  selectedCues: SubtitleCue[]
   /** 全部行（Audio/Inactive Lines Display Mode 的非活动行绘制） */
   cues: SubtitleCue[]
   /** 关键帧列表（Audio/Display/Draw/Keyframes in * Mode） */
   keyframes: number[]
   /** 视频帧率（关键帧帧号 → 时间换算） */
   fps: number
+  /** 精确帧率/时间码（VFR 下用 TimeAtFrame，而不是按 fps 近似） */
+  frameRate: Framerate
   /** audio/karaoke 开关（卡拉OK模式关键帧用独立开关控制） */
   karaokeMode: boolean
   view: 'waveform' | 'spectrum'
@@ -36,11 +41,13 @@ interface AudioPaneProps {
   isCommandChecked: (id: string) => boolean
   onSeek: (timeMs: number) => void
   onVideoSeek: (timeMs: number) => void
-  mediaAction: { sequence: number; type: string }
+  mediaAction: { sequence: number; type: string; startMs?: number; endMs?: number }
   /** 双击网格行 / audio/go_to* 的 ScrollToActiveLine 请求（App nonce，Waveform 无条件滚动） */
   scrollToActiveLine: number
   /** 滚动目标：range=活动行范围，start/end=把起点/终点居中（audio_box.cpp ScrollMode） */
   scrollToActiveLineMode: 'range' | 'start' | 'end'
+  /** audio/scroll/left|right：按像素滚动视图（audio_box.cpp ScrollAudioBy） */
+  scrollBy: { seq: number; delta: number }
   onDurationChange: (durationMs: number) => void
   onPatchCue: (
     id: string,
@@ -103,7 +110,8 @@ export function AudioPane(props: AudioPaneProps) {
   const [wcAudioMedia, setWcAudioMedia] = useState(media)
   if (wcAudioMedia !== media) {
     setWcAudioMedia(media)
-    setWcAudioMode(false)
+    // 多轨选择：<audio> 无法切换轨道，必须走 WebCodecs 解复用播放选定音轨
+    setWcAudioMode(media?.audioStreamIndex !== undefined)
   }
   const wcPlayerRef = useRef<WebCodecsAudioPlayer | null>(null)
   const wcEpochRef = useRef(0)
@@ -195,17 +203,21 @@ export function AudioPane(props: AudioPaneProps) {
   useEffect(() => {
     if (!wcAudioMode || !media?.file || wcPlayerRef.current) return
     const epoch = wcEpochRef.current
-    void WebCodecsAudioPlayer.create(media.file, {
-      onTime: (timeMs) => {
-        if (epoch === wcEpochRef.current) onSeek(timeMs)
+    void WebCodecsAudioPlayer.create(
+      media.file,
+      {
+        onTime: (timeMs) => {
+          if (epoch === wcEpochRef.current) onSeek(timeMs)
+        },
+        onEnd: () => {
+          if (epoch === wcEpochRef.current) onPlayingChange(false)
+        },
+        onError: () => {
+          if (epoch === wcEpochRef.current) onPlayingChange(false)
+        },
       },
-      onEnd: () => {
-        if (epoch === wcEpochRef.current) onPlayingChange(false)
-      },
-      onError: () => {
-        if (epoch === wcEpochRef.current) onPlayingChange(false)
-      },
-    }).then((player) => {
+      media.audioStreamIndex,
+    ).then((player) => {
       if (epoch !== wcEpochRef.current) {
         player?.destroy()
         return
@@ -323,6 +335,11 @@ export function AudioPane(props: AudioPaneProps) {
         break
       case 'play-to-end':
         play(currentTimeMs, durationMs)
+        break
+      // Audio/Plays When Stepping Video：逐帧步进时播放该帧音频范围
+      case 'play-range':
+        if (mediaAction.startMs !== undefined && mediaAction.endMs !== undefined)
+          play(mediaAction.startMs, mediaAction.endMs)
         break
       case 'stop':
         wc?.stop()
@@ -472,14 +489,17 @@ export function AudioPane(props: AudioPaneProps) {
           currentTimeMs={props.currentTimeMs}
           videoTimeMs={props.videoTimeMs}
           selectedCue={props.selectedCue}
+          selectedCues={props.selectedCues}
           cues={props.cues}
           keyframes={props.keyframes}
           fps={props.fps}
+          frameRate={props.frameRate}
           karaokeMode={props.karaokeMode}
           playing={props.playing}
           autoScroll={options.autoScroll}
           scrollToActiveLine={props.scrollToActiveLine}
           scrollToActiveLineMode={props.scrollToActiveLineMode}
+          scrollBy={props.scrollBy}
           view={view}
           zoomLevel={zoomLevel}
           amplitude={amplitude}

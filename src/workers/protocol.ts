@@ -1,3 +1,4 @@
+import type { ExportOptions, ParseOptions } from '../core/formats'
 import type { CoreCommand, CoreState, SubtitleDocument, SubtitleFormat } from '../core/types'
 
 export interface SearchSettings {
@@ -22,13 +23,26 @@ export type CoreRequest =
   // 无法自行从相对 base 解析出 wasm 资产位置）
   | { id?: number; method: 'init'; baseUrl: string }
   | { id: number; method: 'state' }
-  | { id: number; method: 'open'; bytes: Uint8Array; sourceName: string }
+  | {
+      id: number
+      method: 'open'
+      bytes: Uint8Array
+      sourceName: string
+      encoding?: string
+      options?: ParseOptions
+    }
   | { id: number; method: 'restore'; document: SubtitleDocument }
   // amend = 显式修订上一次提交（源码 AssFile::Commit 的 commitId 回传）：只有编辑框文本/逐键
   // 字段、连续同字段的时间修改、同一次视觉工具拖拽才传 true；命令类提交省略（false）→ 各自成点
   | { id: number; method: 'apply'; commands: CoreCommand[]; label: string; amend?: boolean }
   | { id: number; method: 'undo' | 'redo' }
-  | { id: number; method: 'export'; format?: SubtitleFormat }
+  | {
+      id: number
+      method: 'export'
+      format?: SubtitleFormat
+      options?: ExportOptions
+      encoding?: string
+    }
   | { id: number; method: 'search'; settings: SearchSettings }
   | { id: number; method: 'replaceAll'; settings: SearchSettings }
   // Limits/Undo Levels 等运行时配置（无响应，fire-and-forget）

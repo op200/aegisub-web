@@ -5,6 +5,7 @@ import type {
   SearchMatch,
   SearchSettings,
 } from '../workers/protocol'
+import type { ExportOptions, ParseOptions } from './formats'
 import type { CoreCommand, CoreState, SubtitleDocument, SubtitleFormat } from './types'
 
 type CoreRequestPayload = CoreRequest extends infer Request
@@ -82,8 +83,15 @@ export class CoreClient {
     return this.request<CoreState>({ method: 'state' })
   }
 
-  open(bytes: Uint8Array, sourceName: string): Promise<CoreState> {
-    return this.request<CoreState>({ method: 'open', bytes, sourceName }, [bytes.buffer])
+  open(
+    bytes: Uint8Array,
+    sourceName: string,
+    encoding?: string,
+    options?: ParseOptions,
+  ): Promise<CoreState> {
+    return this.request<CoreState>({ method: 'open', bytes, sourceName, encoding, options }, [
+      bytes.buffer,
+    ])
   }
 
   restore(document: SubtitleDocument): Promise<CoreState> {
@@ -117,8 +125,8 @@ export class CoreClient {
       selEnd,
     } satisfies CoreRequest)
   }
-  export(format?: SubtitleFormat): Promise<Uint8Array> {
-    return this.request<Uint8Array>({ method: 'export', format })
+  export(format?: SubtitleFormat, options?: ExportOptions, encoding?: string): Promise<Uint8Array> {
+    return this.request<Uint8Array>({ method: 'export', format, options, encoding })
   }
   search(settings: SearchSettings): Promise<SearchMatch[]> {
     return this.request<SearchMatch[]>({ method: 'search', settings })

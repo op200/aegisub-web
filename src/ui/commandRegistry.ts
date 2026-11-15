@@ -1,5 +1,6 @@
-import { getOptionInt } from '../config/options'
+import { getOptionBool, getOptionInt } from '../config/options'
 import { exportAudioClip } from '../core/audioClip'
+import { formatCueEntryData, parseCueEntryData } from '../core/format'
 /**
  * Aegisub 命令层（Web 版 "无 UI Context"）。
  *
@@ -16,6 +17,7 @@ export type DialogKind =
   | 'jump'
   | 'about'
   | 'video-details'
+  | 'aspect-ratio'
   | 'dummy-video'
   | 'properties'
   | 'styling-assistant'
@@ -32,6 +34,9 @@ export type DialogKind =
   | 'export'
   | 'language'
   | 'file-manager'
+  | 'text-import'
+  | 'charset'
+  | 'paste-over'
   | null
 export type AudioView = 'waveform' | 'spectrum'
 export type GridTagsMode = 'show' | 'hide' | 'simplify'
@@ -64,6 +69,8 @@ export interface CommandContext {
   toolbarVisible: boolean
   /** video/show_overscan toggle（Video/Overscan Mask） */
   videoOverscan: boolean
+  /** video/detach toggle：视频面板是否在独立窗口 */
+  videoDetached: boolean
   /** video/aspect/*：null = Default，否则为强制宽高比 */
   aspectOverride: number | null
   /** 帧率状态机（timecodes 文件 > 视频 CFR；无视频为 empty） */
@@ -86,9 +93,12 @@ export interface CommandApi {
   apply(commands: CoreCommand[], label: string): Promise<CoreState | null>
   undo(): Promise<void>
   redo(): Promise<void>
-  openSubtitles(): Promise<void>
+  openSubtitles(options?: { charset?: boolean }): Promise<void>
+  openSubtitlesFromVideo(): Promise<void>
   newSubtitles(): Promise<void>
   saveSubtitles(format?: SubtitleFormat): Promise<void>
+  /** Paste over：字段与目标行由对话框决定（command/edit.cpp paste_over） */
+  openPasteOver(lines: Omit<SubtitleCue, 'id'>[], targetIds: string[]): void
   openVideo(): Promise<void>
   closeVideo(): void
   openAudio(): Promise<void>
@@ -100,11 +110,13 @@ export interface CommandApi {
   setAudioTime(value: number): void
   /** audio/go_to*：滚动音频显示到活动行范围/起点/终点（audio_box.cpp ScrollToActiveLine） */
   scrollAudioToSelection(mode: 'range' | 'start' | 'end'): void
+  /** audio/scroll/left|right：audio_box.cpp ScrollAudioBy（像素，正数=视图右移） */
+  scrollAudioBy(deltaPx: number): void
   setStatus(message: string): void
   sendVideoAction(type: string): void
-  sendAudioAction(type: string): void
+  sendAudioAction(type: string, range?: { startMs: number; endMs: number }): void
   moveSelection(direction: number): void
-  moveSelectionOrCreate(): void
+  moveSelectionOrCreate(resetDefault?: boolean): void
   selectLines(ids: string[]): void
   openFind(mode: 'find' | 'replace'): void
   findNext(): void
@@ -119,6 +131,7 @@ export interface CommandApi {
   setGridTags(mode: GridTagsMode): void
   setDisplayMode(mode: DisplayMode): void
   setVideoOverscan(value: boolean): void
+  setVideoDetached(value: boolean): void
   setAspectOverride(value: number | null): void
   restoreAutosave(): void
   /** keyframe/open（timecode.cpp / keyframe.cpp 命令层负责文件选择与解析） */
@@ -144,9 +157,67 @@ export interface CommandDef {
 }
 
 // ---------------------------------------------------------------------------
-// 剪贴板（Web 版无系统 ASS 剪贴板，用模块级内存模拟）
+// 剪贴板（对齐 command/edit.cpp：系统剪贴板存放 Dialogue: 行；内存缓存仅作
+// 浏览器剪贴板 API 不可用时的回退，桌面版没有该回退）
 // ---------------------------------------------------------------------------
 let clipboardLines: SubtitleCue[] = []
+/** 编辑框 paste 事件提供的文本（有它就不必再读系统剪贴板） */
+let pendingPasteText: string | null = null
+
+/** edit_line_paste 在编辑框内检测到 ASS 行时，把 paste 事件中的文本交给命令 */
+export function setPendingPasteText(text: string): void {
+  pendingPasteText = text
+}
+
+/** 读取系统剪贴板文本；API 不可用或被拒绝时返回 null（回退内存缓存） */
+async function readClipboardText(): Promise<string | null> {
+  try {
+    return (await navigator.clipboard?.readText()) ?? null
+  } catch {
+    return null
+  }
+}
+
+/** copy_lines：AssDialogue::GetEntryData() 行以 \r\n 连接 */
+function writeLinesToClipboard(cues: SubtitleCue[]): void {
+  clipboardLines = cues.map((cue) => structuredClone(cue))
+  const text = cues.map(formatCueEntryData).join('\r\n')
+  void navigator.clipboard?.writeText(text).catch(() => undefined)
+}
+
+/** get_dialogue：ASS 行解析失败时整行落入 Text，End=0（edit.cpp） */
+function clipboardLineToCue(line: string): Omit<SubtitleCue, 'id'> {
+  return (
+    parseCueEntryData(line) ?? {
+      layer: 0,
+      startMs: 0,
+      endMs: 0,
+      style: 'Default',
+      actor: '',
+      marginL: 0,
+      marginR: 0,
+      marginV: 0,
+      effect: '',
+      text: line,
+      comment: false,
+      extra: {},
+    }
+  )
+}
+
+/** paste_lines：系统剪贴板按行解析；读不到时用内存缓存 */
+async function clipboardCues(): Promise<Omit<SubtitleCue, 'id'>[]> {
+  const pending = pendingPasteText
+  pendingPasteText = null
+  const text = pending ?? (await readClipboardText())
+  if (text === null) return clipboardLines.map((cue) => cueData(cue))
+  if (!text) return []
+  // boost::char_separator("\r\n") 丢弃空 token；每 token 先 trim
+  return text
+    .split(/[\r\n]+/)
+    .filter((line) => line.length > 0)
+    .map((line) => clipboardLineToCue(line.trim()))
+}
 
 /**
  * 编辑框光标状态（对应 text_selection_controller：命令取 selectionStart 拆行）。
@@ -212,16 +283,14 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     run: (_, api) => api.openDialog('properties'),
   },
   'subtitle/open/charset': {
-    // Aegisub 以指定编码打开；Web 版文本一律按 UTF-8 解码
-    run: (_, api) => api.setStatus('Web build decodes subtitles as UTF-8'),
+    run: (_, api) => void api.openSubtitles({ charset: true }),
   },
   'subtitle/open/autosave': {
     run: (_, api) => api.restoreAutosave(),
   },
   'subtitle/open/video': {
-    // CanLoadSubtitlesFromVideo = false：Web 版无法从视频容器提取字幕
-    enabled: () => false,
-    run: () => undefined,
+    run: (_, api) => void api.openSubtitlesFromVideo(),
+    enabled: (ctx) => Boolean(ctx.videoMedia?.file || ctx.videoMedia?.url),
   },
 
   // ---- 撤销/重做/剪贴板 ----
@@ -236,10 +305,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   'edit/line/copy': {
     run: (ctx, api) => {
       const lines = ctx.core.document.cues.filter((cue) => ctx.selected.includes(cue.id))
-      clipboardLines = lines.map((cue) => structuredClone(cue))
-      void navigator.clipboard
-        ?.writeText(lines.map((cue) => cue.text).join('\n'))
-        .catch(() => undefined)
+      writeLinesToClipboard(lines)
       api.setStatus(`Copied ${lines.length} line${lines.length === 1 ? '' : 's'}`)
     },
     enabled: requireSelection,
@@ -247,39 +313,50 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   'edit/line/cut': {
     run: (ctx, api) => {
       const lines = ctx.core.document.cues.filter((cue) => ctx.selected.includes(cue.id))
-      clipboardLines = lines.map((cue) => structuredClone(cue))
-      void navigator.clipboard
-        ?.writeText(lines.map((cue) => cue.text).join('\n'))
-        .catch(() => undefined)
+      writeLinesToClipboard(lines)
       void api.apply([{ type: 'deleteCues', ids: ctx.selected }], 'cut lines')
     },
     enabled: requireSelection,
   },
   'edit/line/paste': {
-    run: (ctx, api) => {
-      if (!clipboardLines.length) return
+    run: async (ctx, api) => {
+      const active = ctx.activeCue
+      if (!active) return
+      const lines = await clipboardCues()
+      if (!lines.length) return
+      // paste_lines：插到活动行之前；同一插入点按剪贴板顺序依次插入
       const before = new Set(ctx.core.document.cues.map((cue) => cue.id))
-      const commands = [...clipboardLines].reverse().map((cue): CoreCommand => ({
+      const commands = lines.map((cue): CoreCommand => ({
         type: 'addCue',
-        afterId: ctx.activeCue?.id,
-        cue: cueData(cue),
+        beforeId: active.id,
+        cue,
       }))
-      void api.apply(commands, 'paste').then((next) => {
-        if (!next) return
-        const inserted = next.document.cues.filter((cue) => !before.has(cue.id))
-        if (inserted.length) api.selectLines(inserted.map((cue) => cue.id))
-      })
+      const next = await api.apply(commands, 'paste')
+      if (!next) return
+      const inserted = next.document.cues.filter((cue) => !before.has(cue.id))
+      if (inserted.length) api.selectLines(inserted.map((cue) => cue.id))
     },
-    enabled: () => clipboardLines.length > 0,
+    enabled: (ctx) => Boolean(ctx.activeCue),
   },
   'edit/line/paste/over': {
-    run: (ctx, api) => {
-      if (!clipboardLines.length || !ctx.activeCue) return
-      const lines = clipboardLines.map((cue) => structuredClone(cue))
-      const first = lines[0]
-      void api.apply([{ type: 'updateCue', id: ctx.activeCue.id, patch: cueData(first) }], 'paste')
+    run: async (ctx, api) => {
+      if (!ctx.activeCue) return
+      const lines = await clipboardCues()
+      if (!lines.length) return
+      const cues = ctx.core.document.cues
+      let targetIds: string[]
+      if (ctx.selected.length >= 2) {
+        // 多选：按行序覆盖选中行
+        targetIds = cues.filter((cue) => ctx.selected.includes(cue.id)).map((cue) => cue.id)
+      } else {
+        // 单行：从活动行起向下覆盖
+        const index = cues.findIndex((cue) => cue.id === ctx.activeCue?.id)
+        targetIds = index < 0 ? [] : cues.slice(index).map((cue) => cue.id)
+      }
+      if (!targetIds.length) return
+      api.openPasteOver(lines, targetIds)
     },
-    enabled: (ctx) => clipboardLines.length > 0 && Boolean(ctx.activeCue),
+    enabled: (ctx) => Boolean(ctx.activeCue),
   },
 
   // ---- 查找 ----
@@ -774,11 +851,32 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     run: (_, api) => api.sendVideoAction('stop'),
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
+  // video_controller.cpp PrevFrame/NextFrame：
+  // 帧步进后若 Audio/Plays When Stepping Video，播放新旧帧之间的音频
   'video/frame/prev': {
-    run: (_, api) => api.sendVideoAction('frame-prev'),
+    run: (ctx, api) => {
+      api.sendVideoAction('frame-prev')
+      if (!ctx.videoMedia || !ctx.audioMedia || ctx.currentFrame <= 0) return
+      if (!getOptionBool('Audio/Plays When Stepping Video')) return
+      const target = ctx.currentFrame - 1
+      api.sendAudioAction('play-range', {
+        startMs: ctx.frameRate.timeAtFrame(target, 'exact'),
+        endMs: ctx.frameRate.timeAtFrame(target + 1, 'exact'),
+      })
+    },
+    enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/frame/next': {
-    run: (_, api) => api.sendVideoAction('frame-next'),
+    run: (ctx, api) => {
+      api.sendVideoAction('frame-next')
+      if (!ctx.videoMedia || !ctx.audioMedia || ctx.currentFrame >= ctx.frameCount - 1) return
+      if (!getOptionBool('Audio/Plays When Stepping Video')) return
+      api.sendAudioAction('play-range', {
+        startMs: ctx.frameRate.timeAtFrame(ctx.currentFrame, 'exact'),
+        endMs: ctx.frameRate.timeAtFrame(ctx.currentFrame + 1, 'exact'),
+      })
+    },
+    enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/frame/prev/large': {
     // Video/Slider/Fast Jump Step（Preferences → Video → Options）
@@ -901,8 +999,9 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/detach': {
-    // Web 版不支持分离视频窗口
-    run: (_, api) => api.setStatus('Detached video is not available in the web build'),
+    // dialog_detached_video.cpp：独立窗口显示视频；关闭窗口即重新挂回
+    run: (ctx, api) => api.setVideoDetached(!ctx.videoDetached),
+    checked: (ctx) => ctx.videoDetached,
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/show_overscan': {
@@ -932,7 +1031,8 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/aspect/custom': {
-    run: (_, api) => api.setStatus('Custom aspect ratio is not available in the web build'),
+    // command/video.cpp video_aspect_ratio：解析小数 / 分数 / WxH，范围 0.5..5.0
+    run: (_, api) => api.openDialog('aspect-ratio'),
     enabled: (ctx) => Boolean(ctx.videoMedia),
   },
   'video/reset_pan': {
@@ -1069,7 +1169,12 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     },
   },
   'audio/commit/default': {
-    run: (_, api) => api.setStatus('Line committed'),
+    // Commit + Next(LINE_RESET_DEFAULT)：下一行时间重置为默认时长
+    run: (ctx, api) => {
+      if (!ctx.activeCue) return
+      api.setStatus('Line committed')
+      api.moveSelectionOrCreate(true)
+    },
     enabled: (ctx) => Boolean(ctx.activeCue),
   },
   'audio/commit/stay': {
@@ -1182,14 +1287,14 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   'audio/play/toggle': {
     run: (_, api) => api.sendAudioAction('toggle'),
   },
+  // audio_box.cpp：ScrollAudioBy(±128)，只滚动音频显示视图，不移动播放头
   'audio/scroll/left': {
-    run: (ctx, api) => api.setAudioTime(Math.max(0, ctx.audioTimeMs - 1000)),
+    run: (_, api) => api.scrollAudioBy(-128),
+    enabled: (ctx) => Boolean(ctx.audioMedia),
   },
   'audio/scroll/right': {
-    run: (ctx, api) =>
-      api.setAudioTime(
-        Math.min(ctx.audioDurationMs || ctx.audioTimeMs + 1000, ctx.audioTimeMs + 1000),
-      ),
+    run: (_, api) => api.scrollAudioBy(128),
+    enabled: (ctx) => Boolean(ctx.audioMedia),
   },
   'audio/stop': {
     run: (_, api) => api.sendAudioAction('stop'),

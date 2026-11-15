@@ -16,13 +16,15 @@ import './workerWindow'
 import type { WebAVStream } from 'web-demuxer'
 
 import { ptsToMs } from '../core/vfr'
-import { AVMEDIA_TYPE_VIDEO, AVSEEK_FLAG_BACKWARD, openDemuxer } from './demux'
+import { AVMEDIA_TYPE_VIDEO, AVSEEK_FLAG_BACKWARD, openDemuxer, readEncodedChunks } from './demux'
 import { audioDataToMono } from './pcm'
 import { finalize, StreamAnalyzer } from './peakAnalyzer'
 
 interface AudioDemuxJob {
   kind: 'audio-demux'
   file: File
+  quality?: number
+  audioStreamIndex?: number
 }
 
 interface AudioPcmJob {
@@ -30,11 +32,13 @@ interface AudioPcmJob {
   channels: Float32Array[]
   sampleRate: number
   durationMs: number
+  quality?: number
 }
 
 interface VideoScanJob {
   kind: 'video-scan'
   file: File
+  videoStreamIndex?: number
 }
 
 type Job = AudioDemuxJob | AudioPcmJob | VideoScanJob
@@ -114,11 +118,11 @@ const post = (msg: Response, transfer: Transferable[] = []) =>
 // ---------------------------------------------------------------------------
 // 音频：demux + WebCodecs 解码 + 分析（全部在 worker 内）
 // ---------------------------------------------------------------------------
-async function runAudioDemux(file: File): Promise<void> {
-  const probe = await openDemuxer(file)
+async function runAudioDemux(file: File, quality = 1, audioStreamIndex?: number): Promise<void> {
+  const probe = await openDemuxer(file, { audioStreamIndex })
   try {
     if (!probe.audioStream) throw new Error('No audio track')
-    const config = await probe.demuxer.getDecoderConfig('audio')
+    const config = probe.demuxer.genDecoderConfig('audio', probe.audioStream)
     if (!config?.codec) throw new Error('Unsupported audio codec')
     const support = await AudioDecoder.isConfigSupported(config).catch(() => null)
     if (!support?.supported)
@@ -128,7 +132,7 @@ async function runAudioDemux(file: File): Promise<void> {
         ? probe.info.duration
         : probe.audioStream.duration) || 0) * 1000,
     )
-    const analyzer = new StreamAnalyzer(config.sampleRate, durationMs)
+    const analyzer = new StreamAnalyzer(config.sampleRate, durationMs, quality)
     // 主线程 live buffer 按此容量一次性分配；后续 ensure() 扩容（时间戳越界等
     // 边界情况）不得超报——超出会让主线程 TypedArray.set 抛 RangeError
     const capBuckets = analyzer.peakMin.length
@@ -185,7 +189,10 @@ async function runAudioDemux(file: File): Promise<void> {
       error: () => undefined,
     })
     decoder.configure(config)
-    const stream = probe.demuxer.read('audio', 0, undefined, AVSEEK_FLAG_BACKWARD)
+    const stream =
+      audioStreamIndex === undefined
+        ? probe.demuxer.read('audio', 0, undefined, AVSEEK_FLAG_BACKWARD)
+        : readEncodedChunks(probe.demuxer, 'audio', 0, audioStreamIndex, AVSEEK_FLAG_BACKWARD)
     const reader = stream.getReader()
     for (;;) {
       const { done, value } = await reader.read()
@@ -229,8 +236,8 @@ async function runAudioDemux(file: File): Promise<void> {
 // 音频：decodeAudioData 快路径的 PCM 分析（解码留在主线程——AudioContext 不可入 worker）
 // ---------------------------------------------------------------------------
 function runAudioPcm(job: AudioPcmJob): void {
-  const { channels, sampleRate, durationMs } = job
-  const analyzer = new StreamAnalyzer(sampleRate, durationMs)
+  const { channels, sampleRate, durationMs, quality } = job
+  const analyzer = new StreamAnalyzer(sampleRate, durationMs, quality ?? 1)
   const length = channels[0]?.length ?? 0
   const count = channels.length
   const chunk = 1 << 20
@@ -266,8 +273,8 @@ function runAudioPcm(job: AudioPcmJob): void {
 // ---------------------------------------------------------------------------
 // 视频：关键帧 + 全部视频包 PTS 扫描（demux.ts extractVideoKeyframes 的 worker 化）
 // ---------------------------------------------------------------------------
-async function runVideoScan(file: File): Promise<void> {
-  const demuxer = (await openDemuxer(file)).demuxer
+async function runVideoScan(file: File, videoStreamIndex?: number): Promise<void> {
+  const demuxer = (await openDemuxer(file, { videoStreamIndex })).demuxer
   try {
     const info = await demuxer.getMediaInfo()
     const streams = (info.streams ?? []) as WebAVStream[]
@@ -278,7 +285,19 @@ async function runVideoScan(file: File): Promise<void> {
     const found: number[] = []
     const frameTimes: number[] = []
     let reported = 0
-    const reader = demuxer.readMediaPacket('video').getReader()
+    // 多轨：readMediaPacket 不支持流索引，改用 readAVPacket(streamIndex)
+    const reader =
+      videoStreamIndex === undefined
+        ? demuxer.readMediaPacket('video').getReader()
+        : (
+            demuxer.readAVPacket(
+              0,
+              undefined,
+              AVMEDIA_TYPE_VIDEO,
+              videoStreamIndex,
+              AVSEEK_FLAG_BACKWARD,
+            ) as ReadableStream<import('web-demuxer').WebAVPacket>
+          ).getReader()
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
@@ -307,9 +326,10 @@ async function runVideoScan(file: File): Promise<void> {
 
 self.onmessage = async ({ data }: MessageEvent<Job>) => {
   try {
-    if (data.kind === 'audio-demux') await runAudioDemux(data.file)
+    if (data.kind === 'audio-demux')
+      await runAudioDemux(data.file, data.quality, data.audioStreamIndex)
     else if (data.kind === 'audio-pcm') runAudioPcm(data)
-    else if (data.kind === 'video-scan') await runVideoScan(data.file)
+    else if (data.kind === 'video-scan') await runVideoScan(data.file, data.videoStreamIndex)
   } catch (error) {
     post({ type: 'error', message: error instanceof Error ? error.message : String(error) })
   }

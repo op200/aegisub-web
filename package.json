@@ -27,7 +27,7 @@
     "web-demuxer": "^4.0.0"
   },
   "devDependencies": {
-    "@playwright/test": "1.65.0",
+    "@playwright/test": "1.65.1",
     "@types/node": "^26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
@@ -41,7 +41,7 @@
   "engines": {
     "node": ">=26.10.0"
   },
-  "packageManager": "pnpm@12.18.0",
+  "packageManager": "pnpm@12.21.0",
   "pnpm": {
     "ignoredBuiltDependencies": [
       "lfa-ponyfill"

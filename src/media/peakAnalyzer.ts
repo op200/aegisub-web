@@ -72,7 +72,7 @@ export class StreamAnalyzer {
   private re: Float32Array
   private im: Float32Array
 
-  constructor(sampleRate: number, durationMs: number) {
+  constructor(sampleRate: number, durationMs: number, quality = 1) {
     this.sampleRate = sampleRate
     this.durationMs = durationMs
     const buckets = durationMs > 0 ? Math.max(1, Math.ceil(durationMs / MS_PER_BUCKET)) : 65536
@@ -81,9 +81,14 @@ export class StreamAnalyzer {
     this.peakAvg = new Float32Array(buckets)
     this.filled = new Uint8Array(buckets)
     if (durationMs > 0) {
-      // update_derivation_values：>50kHz 逐倍升档
-      let size = SPECTRUM_DERIVATION_SIZE
-      let dist = SPECTRUM_DERIVATION_DIST
+      // update_derivation_values（audio_renderer_spectrum.cpp）：
+      // Quality 0..8 → 查档位表；官方构建（FFTW）额外 +2；
+      // >50kHz 逐倍升档
+      const sizeTable = [6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11]
+      const distTable = [3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9]
+      const level = Math.max(0, Math.min(10, Math.trunc(quality) + 2))
+      let size = sizeTable[level]
+      let dist = distTable[level]
       let mult = sampleRate / 50000
       while (mult > 1) {
         size++

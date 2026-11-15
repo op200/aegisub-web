@@ -6,7 +6,7 @@
  * 播放区间 [startMs, endMs) 在 play() 时给定（音频计时按行播放的语义，
  * audio_player_audio.cpp 的 PlayRange），进度以 AudioContext.currentTime 推算。
  */
-import { AVSEEK_FLAG_BACKWARD, openDemuxer, type DemuxProbe } from './demux'
+import { AVSEEK_FLAG_BACKWARD, openDemuxer, readEncodedChunks, type DemuxProbe } from './demux'
 import { audioDataToChannels } from './pcm'
 
 export interface WebCodecsAudioEvents {
@@ -50,23 +50,31 @@ export class WebCodecsAudioPlayer {
   private generation = 0
   private volume = 1
   private destroyed = false
+  private audioStreamIndex?: number
 
-  private constructor(probe: DemuxProbe, config: AudioDecoderConfig, events: WebCodecsAudioEvents) {
+  private constructor(
+    probe: DemuxProbe,
+    config: AudioDecoderConfig,
+    events: WebCodecsAudioEvents,
+    audioStreamIndex?: number,
+  ) {
     this.probe = probe
     this.config = config
     this.events = events
+    this.audioStreamIndex = audioStreamIndex
   }
 
-  /** 探测并打开：无音频轨 / 编解码不受支持时返回 null */
+  /** 探测并打开：无音频轨 / 编解码不受支持时返回 null；audioStreamIndex 用于多轨选择 */
   static async create(
     file: File,
     events: WebCodecsAudioEvents,
+    audioStreamIndex?: number,
   ): Promise<WebCodecsAudioPlayer | null> {
     // Firefox 130+ 才有 AudioDecoder
     if (typeof AudioDecoder === 'undefined') return null
     let probe: DemuxProbe
     try {
-      probe = await openDemuxer(file)
+      probe = await openDemuxer(file, { audioStreamIndex })
     } catch {
       return null
     }
@@ -75,7 +83,10 @@ export class WebCodecsAudioPlayer {
         probe.demuxer.destroy()
         return null
       }
-      const config = await probe.demuxer.getDecoderConfig('audio')
+      const config =
+        audioStreamIndex === undefined
+          ? await probe.demuxer.getDecoderConfig('audio')
+          : probe.demuxer.genDecoderConfig('audio', probe.audioStream)
       if (!config?.codec) {
         probe.demuxer.destroy()
         return null
@@ -85,7 +96,7 @@ export class WebCodecsAudioPlayer {
         probe.demuxer.destroy()
         return null
       }
-      return new WebCodecsAudioPlayer(probe, config, events)
+      return new WebCodecsAudioPlayer(probe, config, events, audioStreamIndex)
     } catch {
       probe.demuxer.destroy()
       return null
@@ -151,12 +162,16 @@ export class WebCodecsAudioPlayer {
       })
       decoder.configure(this.config)
       this.decoder = decoder
-      const stream = this.probe.demuxer.read(
-        'audio',
-        startMs / 1000,
-        undefined,
-        AVSEEK_FLAG_BACKWARD,
-      )
+      const stream =
+        this.audioStreamIndex === undefined
+          ? this.probe.demuxer.read('audio', startMs / 1000, undefined, AVSEEK_FLAG_BACKWARD)
+          : (readEncodedChunks(
+              this.probe.demuxer,
+              'audio',
+              startMs / 1000,
+              this.audioStreamIndex,
+              AVSEEK_FLAG_BACKWARD,
+            ) as ReadableStream<EncodedAudioChunk>)
       const reader = stream.getReader()
       this.reader = reader
       this.nextStartMs = startMs

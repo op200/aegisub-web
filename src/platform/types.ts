@@ -29,6 +29,9 @@ export interface MediaSource {
   kind?: 'video' | 'audio'
   dummy?: DummyVideoOptions
   syntheticAudio?: { kind: SyntheticAudioKind; durationMs: number }
+  /** 多轨道选择：容器内视频/音频流索引（ffmpegsource 的 TrackSelection） */
+  videoStreamIndex?: number
+  audioStreamIndex?: number
 }
 
 export interface HostCapabilities {

@@ -2122,6 +2122,106 @@ button:disabled {
   flex: 1;
   min-width: 0;
 }
+/* edit/font 字体对话框（wxGetFontFromUser：字体列表 + 字形/大小/脚本 + 样本预览） */
+.font-picker {
+  display: grid;
+  gap: 8px;
+  min-width: min(470px, calc(100vw - 54px));
+  padding: 10px 12px 12px;
+}
+.font-picker-main {
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) 200px;
+  align-items: start;
+  gap: 10px;
+}
+.font-picker-list-column {
+  display: grid;
+  gap: 4px;
+}
+.font-picker-caption {
+  font-size: 11px;
+}
+.font-picker-list-column input {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 2px 5px;
+  color: var(--text);
+  background: var(--control);
+  border: 1px solid var(--border);
+  border-radius: 1px;
+}
+.font-picker-families {
+  height: 168px;
+  margin: 0;
+  padding: 2px;
+  overflow-y: auto;
+  list-style: none;
+  background: var(--control);
+  border: 1px solid var(--border);
+  border-radius: 1px;
+}
+.font-picker-families li {
+  padding: 3px 6px;
+  overflow: hidden;
+  font-size: 13px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.font-picker-families li:hover {
+  background: var(--hover-bg);
+}
+.font-picker-families li[aria-selected='true'] {
+  color: white;
+  background: var(--blue);
+}
+.font-picker-options {
+  display: grid;
+  gap: 6px;
+}
+.font-picker-options label {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+}
+.font-picker-options input:not([type='checkbox']),
+.font-picker-options select {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+}
+.font-picker-options label.comment-toggle {
+  display: flex;
+}
+.font-picker-preview {
+  display: grid;
+  gap: 4px;
+  min-height: 86px;
+  margin: 0;
+  padding: 4px 8px 8px;
+  border: 1px solid var(--border-soft);
+}
+.font-picker-preview legend {
+  padding: 0 3px;
+  font-size: 11px;
+}
+.font-picker-sample {
+  display: grid;
+  place-items: center;
+  min-height: 62px;
+  padding: 4px 8px;
+  overflow: hidden;
+  color: #000;
+  background: #fff;
+  border: 1px solid var(--border);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
 /* wxMessageBox 等价物（重名报错 / 改名询问） */
 .style-message-box {
   min-width: 340px;
@@ -2786,6 +2886,9 @@ button:disabled {
   }
   .style-dialog {
     width: 100%;
+  }
+  .font-picker-main {
+    grid-template-columns: minmax(0, 1fr);
   }
   .inspector-grid {
     grid-template-columns: 1fr 1fr;

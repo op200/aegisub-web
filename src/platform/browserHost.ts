@@ -64,7 +64,10 @@ export class BrowserHostAdapter implements HostAdapter {
 export const SUBTITLE_FILE_TYPES: FileType[] = [
   {
     description: 'Subtitle files',
-    accept: { 'text/plain': ['.ass', '.ssa', '.srt'] },
+    accept: {
+      'text/plain': ['.ass', '.ssa', '.srt', '.txt', '.ttxt', '.sub'],
+      'video/x-matroska': ['.mkv', '.mka', '.mks'],
+    },
   },
 ]
 

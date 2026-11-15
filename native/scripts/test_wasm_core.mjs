@@ -31,6 +31,15 @@ Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Hello {\\i1}world{\\i0}
 Comment: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,a comment
+
+[Aegisub Extradata]
+Data: 0,note,extradata value
+
+[Aegisub Project Garbage]
+Video File: linked-video.mkv
+
+[Custom Section]
+foo: bar
 `
 
 function cstr(s) {
@@ -81,6 +90,11 @@ console.log(
 console.log('  runtime:', state.runtime, 'canUndo:', state.canUndo)
 
 if (state.document.cues.length !== 2) throw new Error('expected 2 cues')
+if (state.document.extradata.length !== 1) throw new Error('extradata not parsed')
+if (state.document.passthroughSections.length !== 1)
+  throw new Error('unknown section not preserved')
+if (state.document.properties.videoFile !== 'linked-video.mkv')
+  throw new Error('project garbage not parsed')
 
 // 4. apply updateCue
 const cue0 = state.document.cues[0]
@@ -110,10 +124,28 @@ module_._aegisub_core_free(state3Ptr)
 console.log('undo: text ->', state3.document.cues[0].text, '| canRedo:', state3.canRedo)
 if (state3.document.cues[0].text !== 'Hello {\\i1}world{\\i0}') throw new Error('undo mismatch')
 
-// 6. export ASS
+// 5b. 附件读写（addAttachment → state → export 嵌入 [Fonts]）
+const attachCmds = JSON.stringify([
+  {
+    type: 'addAttachment',
+    attachment: { name: 'test_0.ttf', group: 'font', data: 'aGVsbG8=' },
+  },
+])
+const attachPtr = cstr(attachCmds)
+const attachLabel = cstr('attach font file')
+module_._aegisub_document_apply_json(doc, attachPtr, attachLabel, 0)
+free(attachPtr)
+free(attachLabel)
+const state4Ptr = module_._aegisub_document_state_json(doc)
+const state4 = JSON.parse(module_.UTF8ToString(state4Ptr))
+module_._aegisub_core_free(state4Ptr)
+if (state4.document.attachments.length !== 1) throw new Error('attachment not added')
+if (state4.document.attachments[0].name !== 'test_0.ttf') throw new Error('attachment name mismatch')
+
+// 6. export ASS（ABI v7：clean / saveUiState / propertiesJson 覆盖）
 const sizePtr = module_._malloc(4)
 const fmtPtr = cstr('ass')
-const exportPtr = module_._aegisub_document_export(doc, fmtPtr, sizePtr)
+const exportPtr = module_._aegisub_document_export(doc, fmtPtr, 0, 1, 0, sizePtr)
 free(fmtPtr)
 const size = module_.HEAP32[sizePtr >> 2]
 const exported = new TextDecoder().decode(module_.HEAPU8.slice(exportPtr, exportPtr + size))
@@ -126,18 +158,24 @@ console.log(
   exported.includes('Comment:'),
 )
 if (!exported.includes('Dialogue: 0,0:00:01.00')) throw new Error('export dialogue mismatch')
+if (!exported.includes('[Aegisub Extradata]')) throw new Error('extradata not exported')
+if (!exported.includes('[Custom Section]')) throw new Error('unknown section not exported')
+if (!exported.includes('[Fonts]')) throw new Error('font attachment not exported')
+if (!exported.includes('fontname: test_0.ttf')) throw new Error('font attachment name not exported')
+if (!exported.includes('Video File: linked-video.mkv'))
+  throw new Error('project garbage not exported')
 
 // 7. export SRT
 const sizePtr2 = module_._malloc(4)
 const fmtPtr2 = cstr('srt')
-const exportPtr2 = module_._aegisub_document_export(doc, fmtPtr2, sizePtr2)
+const exportPtr2 = module_._aegisub_document_export(doc, fmtPtr2, 0, 0, 0, sizePtr2)
 free(fmtPtr2)
 const size2 = module_.HEAP32[sizePtr2 >> 2]
 const srtOut = new TextDecoder().decode(module_.HEAPU8.slice(exportPtr2, exportPtr2 + size2))
 module_._aegisub_core_free(exportPtr2)
 module_._free(sizePtr2)
 console.log('srt:', JSON.stringify(srtOut.split('\r\n').slice(0, 3).join(' | ')))
-if (!srtOut.includes('Hello world')) throw new Error('srt text mismatch')
+if (!srtOut.includes('Hello <i>world</i>')) throw new Error('srt text mismatch')
 
 // 8. 搜索（text 字段，忽略大小写）
 const searchPtr = module_._aegisub_document_search(

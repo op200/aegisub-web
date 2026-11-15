@@ -1,5 +1,6 @@
 import { Captions, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { createPortal } from 'react-dom'
 
 import {
   applyLuaPayload,
@@ -39,9 +40,26 @@ import {
 } from '../config/options'
 import { hasStyleOverride } from '../core/assTags'
 import { CoreClient } from '../core/client'
-import { createDocument } from '../core/defaults'
-import { exportSubtitle } from '../core/format'
-import type { YcbcrColorspace } from '../core/resample'
+import { createDocument, createProjectProperties } from '../core/defaults'
+import { decodeWithEncoding, detectEncoding, encodeText } from '../core/encoding'
+import { attachmentBytes, attachmentFileName, makeAttachment } from '../core/format'
+import type { TextImportOptions } from '../core/formatExtra'
+import { detectFormat, exportExtension, exportSubtitle, type ParseOptions } from '../core/formats'
+import { extractMkvSubtitles, type MkvSubtitleTrack } from '../core/mkv'
+import {
+  getScriptInfo,
+  parseYcbcrHeader,
+  resampleCommands,
+  RESAMPLE_AR_ADD_BORDERS,
+  RESAMPLE_AR_REMOVE_BORDERS,
+  RESAMPLE_AR_STRETCH,
+  ycbcrHeaderToBestPractice,
+  ycbcrHeaderToBestPracticeString,
+  type YcbcrColorspace,
+  type YcbcrHeader,
+  type YcbcrMatrix,
+  type YcbcrRange,
+} from '../core/resample'
 import {
   compileMatcher,
   findNext as findNextMatch,
@@ -50,7 +68,16 @@ import {
   SEARCH_FIELDS,
   type SearchReplaceSettings,
 } from '../core/searchReplace'
-import type { CoreCommand, CoreState, SubtitleDocument } from '../core/types'
+import type {
+  CoreCommand,
+  CoreState,
+  ProjectProperties,
+  SubtitleAttachment,
+  SubtitleAttachmentGroup,
+  SubtitleCue,
+  SubtitleDocument,
+  SubtitleFormat,
+} from '../core/types'
 import {
   Framerate,
   lowerBoundIndex,
@@ -60,7 +87,13 @@ import {
   serializeTimecodes,
   serializeTimecodesKeepOffset,
 } from '../core/vfr'
-import { extractVideoKeyframes, probeVideoInfo } from '../media/demux'
+import {
+  extractVideoKeyframes,
+  listMediaTracks,
+  probeVideoInfo,
+  type MediaTrackInfo,
+  type VideoStreamInfo,
+} from '../media/demux'
 import { parseContainerColorspace } from '../media/videoColor'
 import { BrowserHostAdapter, MEDIA_FILE_TYPES, SUBTITLE_FILE_TYPES } from '../platform/browserHost'
 import { createNativeHostAdapter } from '../platform/nativeHost'
@@ -88,6 +121,7 @@ import {
   type RecentType,
   type SearchMruLists,
 } from '../storage/recentStore'
+import { fileExists, listTree, readBytes, readFile as readVfsFile, vfsDecode } from '../storage/vfs'
 import { invertLightness } from './color'
 import {
   COMMAND_REGISTRY,
@@ -103,7 +137,12 @@ import { commandForShortcut, shortcutFromKeyboardEvent, type ShortcutContext } f
 import { AudioPane } from './components/AudioPane'
 import {
   AboutDialog,
+  AspectRatioDialog,
   AttachmentDialog,
+  CharsetDialog,
+  PasteOverDialog,
+  ChoicePromptDialog,
+  type ChoicePromptState,
   AutomationManagerDialog,
   DummyVideoDialog,
   ExportSubtitlesDialog,
@@ -117,6 +156,7 @@ import {
   SelectLinesDialog,
   ShiftTimesDialog,
   StylingAssistantDialog,
+  TextImportDialog,
   TimecodesOffsetDialog,
   TimingProcessorDialog,
   ToolInfoDialog,
@@ -349,6 +389,96 @@ function measureLuaTextExtents(
   return { width, height, descent: resultDescent, externalLead: 0 }
 }
 
+/** ffmpeg AVColorSpace 名 → ycbcr_matrix（H.273 数值与 FFMS2 一致） */
+const FFMPEG_MATRIX: Record<string, YcbcrMatrix> = {
+  rgb: 'Unspecified',
+  bt709: 'BT709',
+  fcc: 'FCC',
+  bt470bg: 'BT470BG',
+  smpte170m: 'SMPTE170M',
+  bt601: 'SMPTE170M',
+  smpte240m: 'SMPTE240M',
+  ycgco: 'Unspecified',
+  bt2020nc: 'BT2020_NCL',
+  bt2020ncl: 'BT2020_NCL',
+  bt2020c: 'BT2020_CL',
+  bt2020cl: 'BT2020_CL',
+  smpte2085: 'Unspecified',
+}
+
+const FFMPEG_RANGE: Record<string, YcbcrRange> = {
+  tv: 'MPEG',
+  mpeg: 'MPEG',
+  limited: 'MPEG',
+  pc: 'JPEG',
+  jpeg: 'JPEG',
+  full: 'JPEG',
+}
+
+/** ycbcr::matrix_to_string（提示文案） */
+const MATRIX_DISPLAY: Partial<Record<YcbcrMatrix, string>> = {
+  BT709: 'BT.709',
+  FCC: 'FCC',
+  BT470BG: 'BT.470-BG',
+  SMPTE170M: 'SMPTE ST 170M',
+  SMPTE240M: 'SMPTE ST 240M',
+  BT2020_NCL: 'BT.2020 NCL',
+  BT2020_CL: 'BT.2020 CL',
+}
+
+function ffmpegColorspace(matrixName: string, rangeName: string): YcbcrColorspace {
+  const matrix = FFMPEG_MATRIX[matrixName.toLowerCase()] ?? 'Unspecified'
+  const range = FFMPEG_RANGE[rangeName.toLowerCase()] ?? 'Unspecified'
+  return { matrix, range }
+}
+
+/** ycbcr::guess_colorspace：未标记时按分辨率猜 601/709 */
+function guessVideoColorspace(
+  colorspace: YcbcrColorspace,
+  width: number,
+  height: number,
+): YcbcrColorspace {
+  const matrix =
+    colorspace.matrix !== 'Unspecified'
+      ? colorspace.matrix
+      : width > 1024 || height >= 600
+        ? 'BT709'
+        : 'SMPTE170M'
+  const range = colorspace.range !== 'Unspecified' ? colorspace.range : 'MPEG'
+  return { matrix, range }
+}
+
+/** video_provider_ffmpegsource.cpp IsHDRFrame：PQ/HLG/BT.2020/P3 视为 HDR/WCG */
+function isHdrOrWcg(colorPrimaries: string, colorTransfer: string): boolean {
+  const transfer = colorTransfer.toLowerCase()
+  if (transfer === 'smpte2084' || transfer === 'arib-std-b67') return true
+  const primaries = colorPrimaries.toLowerCase()
+  return primaries === 'bt2020' || primaries === 'smpte431' || primaries === 'smpte432'
+}
+
+/** dialog_video_properties.cpp check_ar_changed（1% 容差） */
+function scriptAspectChanged(sx: number, sy: number, vx: number, vy: number): boolean {
+  if (sy === 0 || vy === 0) return (sy === 0) !== (vy === 0)
+  const sar = sx / sy
+  const varRatio = vx / vy
+  return Math.abs(sar - varRatio) / varRatio > 0.01
+}
+
+/** 分离视频窗口：把主文档样式复制到弹出窗口（Vite 注入的 <style> 与构建后的 <link>） */
+function copyStylesToPopup(popup: Window) {
+  for (const sheet of Array.from(document.styleSheets)) {
+    const node = sheet.ownerNode
+    if (!(node instanceof HTMLElement)) continue
+    if (node.tagName === 'LINK' || node.tagName === 'STYLE')
+      popup.document.head.appendChild(node.cloneNode(true))
+  }
+  const style = popup.document.createElement('style')
+  style.textContent =
+    'html,body{margin:0;height:100%;overflow:hidden;background:#1e1e1e}' +
+    '.preview-panel{width:100%;height:100%}'
+  popup.document.head.appendChild(style)
+}
+
 export function App() {
   const optionsVersion = useOptionsVersion() // Preferences 提交后触发全应用重渲染
   const theme = useSystemTheme() // 自动主题：跟随系统深浅色
@@ -356,6 +486,8 @@ export function App() {
   const anchorRef = useRef<string | null>(null)
   const executeRef = useRef<(id: string) => void>(() => undefined)
   const [core, setCore] = useState<CoreState | null>(null)
+  const coreStateRef = useRef<CoreState | null>(null)
+  coreStateRef.current = core
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [activeId, setActiveId] = useState<string | null>(null)
   // 撤销/重做跳转计数：核心的文本选区快照需在跳转后强制回写编辑框（含光标），
@@ -436,12 +568,19 @@ export function App() {
   const [videoPlaybackMode, setVideoPlaybackMode] = useState<VideoPlaybackMode | null>(null)
   const [videoDecoderOverride, setVideoDecoderOverride] = useState<boolean | null>(null)
   const [videoAction, setVideoAction] = useState({ sequence: 0, type: '' })
-  const [audioAction, setAudioAction] = useState({ sequence: 0, type: '' })
+  const [audioAction, setAudioAction] = useState<{
+    sequence: number
+    type: string
+    startMs?: number
+    endMs?: number
+  }>({ sequence: 0, type: '' })
   // 双击网格行的音频 ScrollToActiveLine 请求（audio_box.cpp，nonce 递增触发 Waveform 滚动）
   const [audioScrollRequest, setAudioScrollRequest] = useState<{
     seq: number
     mode: 'range' | 'start' | 'end'
   }>({ seq: 0, mode: 'range' })
+  // audio/scroll/left|right：只滚动视图（audio_box.cpp ScrollAudioBy，±128px），不移动播放头
+  const [audioScrollBy, setAudioScrollBy] = useState({ seq: 0, delta: 0 })
   // 状态栏消息（CreateStatusBar(2) 右字段 = field 1）。Aegisub 所有临时消息都走
   // FrameMain::StatusTimeout(text, ms=10000)：显示后由 ID_APP_TIMER_STATUSCLEAR 定时器
   // 清空（OnStatusClear → SetStatusText("", 1)）；左字段（field 0）源码从不写入
@@ -539,12 +678,88 @@ export function App() {
             : mode,
     )
   const [dialog, setDialog] = useState<DialogKind>(null)
+  // 打开流程中的临时状态（编码选择 / 纯文本导入选项，dialog_charset + dialog_text_import）
+  const [pendingOpen, setPendingOpen] = useState<{
+    file: AppFileHandle
+    bytes: Uint8Array
+    format: SubtitleFormat
+    /** charset 对话框选定后的编码（纯文本导入阶段沿用） */
+    encoding?: string
+  } | null>(null)
+  // Paste Over：待覆盖行与目标行
+  const [pasteOver, setPasteOver] = useState<{
+    lines: Omit<SubtitleCue, 'id'>[]
+    targetIds: string[]
+  } | null>(null)
+  // Project Garbage：网格滚动位置（保存时写入 properties.scrollPosition）
+  const [gridScrollRow, setGridScrollRow] = useState(0)
+  const [gridScrollRestore, setGridScrollRestore] = useState<
+    { row: number; token: number } | undefined
+  >()
+  const gridRestoreTokenRef = useRef(0)
+  // 打开文档时等待视频/时间码就绪后再跳到 Project Garbage 的 videoPosition（帧）
+  const pendingVideoPositionRef = useRef<number | null>(null)
+  // 通用 wxGetSingleChoiceIndex / wxMessageBox 提示（视频属性校正、轨道选择）
+  const [choicePrompt, setChoicePrompt] = useState<ChoicePromptState | null>(null)
+  const videoPropertiesRunRef = useRef(0)
+  const askChoice = (title: string, message: string, choices: string[], initial = 0) =>
+    new Promise<number | null>((resolve) => {
+      setChoicePrompt({
+        title,
+        message,
+        choices,
+        initial,
+        onResolve: (index) => {
+          setChoicePrompt(null)
+          resolve(index)
+        },
+      })
+    })
+  const showMessage = (title: string, message: string) =>
+    askChoice(title, message, [], 0).then(() => undefined)
+  /**
+   * ffmpegsource_common.cpp AskForTrackSelection：
+   * 多条同类型轨道时弹出选择框；单选/探测失败时用容器默认（首条）轨道。
+   */
+  const chooseTrackIndex = async (
+    kind: 'video' | 'audio',
+    tracks: MediaTrackInfo[],
+  ): Promise<{ index?: number; cancelled: boolean }> => {
+    if (tracks.length <= 1) return { index: tracks[0]?.index, cancelled: false }
+    const descriptions = tracks.map((track) =>
+      kind === 'video'
+        ? `${track.description} (${track.width}×${track.height})`
+        : `${track.description} (${track.channels} ch, ${track.sampleRate} Hz)`,
+    )
+    const choice = await askChoice(
+      kind === 'video' ? tPlain('Select video track') : tPlain('Select audio track'),
+      kind === 'video'
+        ? tPlain('The file contains multiple video tracks. Which track would you like to load?')
+        : tPlain('The file contains multiple audio tracks. Which track would you like to load?'),
+      descriptions,
+      0,
+    )
+    if (choice === null) return { cancelled: true }
+    return { index: tracks[choice]?.index, cancelled: false }
+  }
   const [videoOverscan, setVideoOverscan] = useState(false) // Video/Overscan Mask 默认 false
+  // 分离视频窗口（video/detach）：PreviewPane 始终渲染进稳定 host，再在挂靠位与弹窗间搬运
+  const [videoDetached, setVideoDetached] = useState(false)
+  const previewHostRef = useRef<HTMLDivElement | null>(null)
+  const previewMountRef = useRef<HTMLDivElement | null>(null)
+  const previewWindowRef = useRef<Window | null>(null)
+  const detachedKeyTargetRef = useRef<HTMLDivElement | null>(null)
+  if (!previewHostRef.current) {
+    const previewHost = document.createElement('div')
+    previewHost.style.display = 'contents'
+    previewHostRef.current = previewHost
+  }
   const [aspectOverride, setAspectOverride] = useState<number | null>(null) // video/aspect/*
   const [dirty, setDirty] = useState(false) // 标题 * 前缀（FrameMain::UpdateTitle）
   // keyframes / timecodes 状态机（project.cpp：文件加载 > 视频自带 > 无）
   const [keyframes, setKeyframes] = useState<number[]>([])
   const [keyframesFromFile, setKeyframesFromFile] = useState(false)
+  const [keyframesFileName, setKeyframesFileName] = useState('')
   // 视频自带关键帧（ms；解复用扫描/WebCodecs 读流上报，帧号随帧率派生）
   const [videoKeyframeTimes, setVideoKeyframeTimes] = useState<number[]>([])
   const keyframeScanIdRef = useRef(0) // 换视频/关视频时作废旧的后台扫描
@@ -559,6 +774,7 @@ export function App() {
   } | null>(null)
   const [timecodes, setTimecodes] = useState<Framerate | null>(null)
   const [timecodesFromFile, setTimecodesFromFile] = useState(false)
+  const [timecodesFileName, setTimecodesFileName] = useState('')
   // 视频自带逐帧时间码表（ms；FFMS2 TimecodesVector 语义，解复用扫描上报）
   const [videoFrameTimes, setVideoFrameTimes] = useState<number[] | null>(null)
   // 首帧偏移感知 UI：载入提醒（每视频一次）+ 导出时间码时保留偏移选择
@@ -798,6 +1014,75 @@ export function App() {
       ),
     [aspectOverride, previewIntrinsic, previewZoom, devicePixelRatioValue],
   )
+  const videoLayoutRef = useRef(videoLayout)
+  videoLayoutRef.current = videoLayout
+
+  // video/detach：把视频面板 host 搬进/搬出独立窗口（关闭窗口即重新挂回）
+  useEffect(() => {
+    const previewHost = previewHostRef.current
+    if (!previewHost) return
+    if (!videoDetached) {
+      const mount = previewMountRef.current
+      if (mount && previewHost.parentNode !== mount) mount.appendChild(previewHost)
+      previewHost.style.display = 'contents'
+      previewWindowRef.current?.close()
+      previewWindowRef.current = null
+      return
+    }
+    const layout = videoLayoutRef.current
+    const popup = window.open(
+      '',
+      'aegisub-detached-video',
+      `popup=yes,width=${Math.round(layout.panelWidth) + 24},height=${Math.round(layout.panelHeight) + 48}`,
+    )
+    if (!popup) {
+      setStatus(tPlain('Could not open the detached video window'))
+      setVideoDetached(false)
+      return
+    }
+    previewWindowRef.current = popup
+    copyStylesToPopup(popup)
+    popup.document.title = 'Aegisub — Video'
+    // 跨文档搬运 host 节点（appendChild 会 adopt），React portal 事件仍挂在 host 上
+    previewHost.style.cssText =
+      'display:block;position:fixed;inset:0;overflow:hidden;background:#1e1e1e;'
+    popup.document.body.appendChild(previewHost)
+    // 弹窗内按键转发到主窗口 Video 上下文（热键表监听在主 window 上）
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      if (target?.matches?.('input, textarea, select, [contenteditable="true"]')) return
+      const proxy = detachedKeyTargetRef.current
+      if (!proxy) return
+      const forwarded = new KeyboardEvent('keydown', {
+        key: event.key,
+        code: event.code,
+        keyCode: event.keyCode,
+        which: event.which,
+        altKey: event.altKey,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        shiftKey: event.shiftKey,
+        repeat: event.repeat,
+        bubbles: true,
+        cancelable: true,
+      })
+      proxy.dispatchEvent(forwarded)
+      if (forwarded.defaultPrevented) event.preventDefault()
+    }
+    popup.document.addEventListener('keydown', onKeyDown)
+    const closedCheck = window.setInterval(() => {
+      if (popup.closed) setVideoDetached(false)
+    }, 400)
+    return () => {
+      window.clearInterval(closedCheck)
+      popup.document.removeEventListener('keydown', onKeyDown)
+      if (!popup.closed) popup.close()
+      if (previewWindowRef.current === popup) previewWindowRef.current = null
+      const mount = previewMountRef.current
+      if (mount) mount.appendChild(previewHost)
+      previewHost.style.display = 'contents'
+    }
+  }, [videoDetached, setStatus])
 
   // JumpToTime(ms, START)（video_controller.cpp）：FrameAtTime(start, START) 定帧后
   // 落到该帧 EXACT 时间。直接用原始行首 ms 会落到"包含行首的那一帧"（≤ 行首），
@@ -835,6 +1120,13 @@ export function App() {
     () => (frameRate.isLoaded() ? frameRate.frameAtTime(videoTimeMs) : 0),
     [frameRate, videoTimeMs],
   )
+  // Project Garbage videoPosition：视频/时间码就绪后跳到保存时的帧（project.cpp LoadSubtitles）
+  useEffect(() => {
+    const frame = pendingVideoPositionRef.current
+    if (frame === null || !videoMedia || !frameRate.isLoaded()) return
+    pendingVideoPositionRef.current = null
+    setVideoTimeMs(Math.max(0, frameRate.timeAtFrame(frame)))
+  }, [videoMedia, frameRate])
   const frameCount = useMemo(() => {
     // 源码 project.cpp：timecodes 文件只改时间↔帧映射，帧数仍是视频 provider 的
     // （GetFrameCount 不随加载的 timecodes 变；滑块长度、Save Timecodes 外推长度同理）
@@ -1299,15 +1591,33 @@ export function App() {
     if (next) selectOnly(next.id)
   }
 
-  const moveSelectionOrCreate = async () => {
+  // audio_timing_dialogue.cpp Next(ResetMode)：
+  // LINE_RESET_DEFAULT 或下一行 End==0 时，把下一行时间重置为 [上一行 End, +Default Duration]
+  const moveSelectionOrCreate = async (resetDefault = false) => {
     if (!core || !activeId) return
     const index = core.document.cues.findIndex((cue) => cue.id === activeId)
+    const active = core.document.cues[index]
     const next = core.document.cues[index + 1]
     if (next) {
+      if (active && (resetDefault || next.endMs === 0)) {
+        const startMs = active.endMs
+        await apply(
+          [
+            {
+              type: 'updateCue',
+              id: next.id,
+              patch: {
+                startMs,
+                endMs: startMs + getOptionInt('Timing/Default Duration'),
+              },
+            },
+          ],
+          tPlain('timing'),
+        )
+      }
       selectOnly(next.id)
       return
     }
-    const active = core.document.cues[index]
     if (!active) return
     const before = new Set(core.document.cues.map((cue) => cue.id))
     const state = await apply(
@@ -1414,29 +1724,161 @@ export function App() {
     }
   }
 
-  const openSubtitleHandle = async (file: AppFileHandle): Promise<boolean> => {
+  /** 把 Project Garbage 里的 UI 状态还原到网格/视频（project.cpp LoadSubtitles） */
+  const applyLoadedDocument = (state: CoreState) => {
+    setCore(state)
+    setDirty(false)
+    lastAutosaveRevisionRef.current = state.document.revision
+    const properties = state.document.properties ?? createProjectProperties()
+    const cues = state.document.cues
+    const index =
+      cues.length > 0 ? Math.max(0, Math.min(cues.length - 1, properties.activeRow)) : -1
+    const id = index >= 0 ? cues[index].id : null
+    setActiveId(id)
+    setSelectedIds(id ? new Set([id]) : new Set())
+    anchorRef.current = id
+    if (Number.isFinite(properties.videoZoom) && properties.videoZoom > 0) {
+      setVideoWindowZoom(properties.videoZoom)
+    }
+    // AspectRatio：0 Default / 1 Fullscreen / 2 Widescreen / 3 Cinematic / 4 Custom
+    if (properties.arMode === 2) setAspectOverride(16 / 9)
+    else if (properties.arMode === 3) setAspectOverride(2.35)
+    else if (properties.arMode === 4 && properties.arValue > 0)
+      setAspectOverride(properties.arValue)
+    else setAspectOverride(null)
+    setGridScrollRow(Math.max(0, properties.scrollPosition))
+    gridRestoreTokenRef.current += 1
+    setGridScrollRestore({
+      row: Math.max(0, properties.scrollPosition),
+      token: gridRestoreTokenRef.current,
+    })
+    pendingVideoPositionRef.current = properties.videoPosition > 0 ? properties.videoPosition : null
+  }
+
+  /** 关联文件：VFS 路径 → VFS 文件名 → 最近文件（Web 无原生路径，按此顺序解析） */
+  const resolveLinkedHandle = async (
+    path: string,
+    kind: RecentType,
+  ): Promise<AppFileHandle | null> => {
+    const candidates = [path, vfsDecode(path)].filter(Boolean)
+    const found = await Promise.all(
+      candidates.map(async (candidate) => {
+        if (!(await fileExists(candidate))) return null
+        const bytes = await readBytes(candidate)
+        return bytes ? { candidate, bytes } : null
+      }),
+    )
+    const hit = found.find((item) => item !== null)
+    if (hit) {
+      const name = hit.candidate.split('/').pop() || path
+      return { name, file: new File([new Uint8Array(hit.bytes)], name) }
+    }
+    const baseName = (path.split(/[\\/]/).pop() || path).toLowerCase()
+    const tree = await listTree('/')
+    const entry = tree.find((item) => !item.directory && item.name.toLowerCase() === baseName)
+    if (entry) {
+      const blob = await readVfsFile(entry.path)
+      if (blob) return { name: entry.name, file: new File([blob], entry.name) }
+    }
+    const recent = recentLists[kind].find(
+      (item) => item.name.toLowerCase() === baseName && item.file,
+    )
+    return recent?.file ? { name: recent.name, file: recent.file } : null
+  }
+
+  /** App/Auto/Load Linked Files：0=No，1=Ask，2=Yes */
+  const autoLoadLinkedFiles = async (document: SubtitleDocument) => {
+    const mode = getOptionInt('App/Auto/Load Linked Files')
+    if (mode === 0) return
+    const properties = document.properties ?? createProjectProperties()
+    const confirm = async (path: string) => {
+      if (mode === 2) return true
+      const choice = await askChoice(
+        tPlain('Load linked file'),
+        tFmt('Load "%1" now?', path),
+        [tPlain('Yes'), tPlain('No')],
+        0,
+      )
+      return choice === 0
+    }
+
+    if (properties.videoFile && !videoMedia && (await confirm(properties.videoFile))) {
+      const handle = await resolveLinkedHandle(properties.videoFile, 'video')
+      if (handle) await openVideoHandle(handle)
+      else setStatus(tFmt('Could not find linked video "%1"', properties.videoFile))
+    }
+    if (properties.audioFile && !audioMedia && (await confirm(properties.audioFile))) {
+      const handle = await resolveLinkedHandle(properties.audioFile, 'audio')
+      if (handle) await openAudioHandle(handle)
+      else setStatus(tFmt('Could not find linked audio "%1"', properties.audioFile))
+    }
+    if (
+      properties.timecodesFile &&
+      !timecodesFromFile &&
+      (await confirm(properties.timecodesFile))
+    ) {
+      const handle = await resolveLinkedHandle(properties.timecodesFile, 'timecodes')
+      if (handle) await openTimecodesHandle(handle)
+      else setStatus(tFmt('Could not find linked timecodes "%1"', properties.timecodesFile))
+    }
+    if (
+      properties.keyframesFile &&
+      !keyframesFromFile &&
+      (await confirm(properties.keyframesFile))
+    ) {
+      const handle = await resolveLinkedHandle(properties.keyframesFile, 'keyframes')
+      if (handle) await openKeyframesHandle(handle)
+      else setStatus(tFmt('Could not find linked keyframes "%1"', properties.keyframesFile))
+    }
+  }
+
+  /** dialog_charset + dialog_text_import 之后的实际载入 */
+  const finishOpenSubtitle = async (
+    file: AppFileHandle,
+    bytes: Uint8Array,
+    encoding: string,
+    format: SubtitleFormat,
+    textImport?: TextImportOptions,
+  ): Promise<boolean> => {
     if (!coreRef.current) return false
     setBusy(true)
     try {
-      const bytes = await host.readFile(file)
-      const state = await coreRef.current.open(bytes, file.name)
-      setCore(state)
-      setDirty(false)
-      // Load()：新载入文档视为已自动保存（autosaved_commit_id = commit_id）
-      lastAutosaveRevisionRef.current = state.document.revision
-      const id = state.document.cues[0]?.id ?? null
-      setActiveId(id)
-      setSelectedIds(id ? new Set([id]) : new Set())
-      anchorRef.current = id
+      let fps: number | undefined
+      if (format === 'microdvd') {
+        const first =
+          new TextDecoder('utf-8')
+            .decode(bytes)
+            .replace(/^\uFEFF/, '')
+            .split(/\r?\n/)[0] ?? ''
+        const firstBody = /^[{[]\d+[}\]][{[]\d+[}\]](.*)$/.exec(first)?.[1]?.trim() ?? ''
+        const cfr = Number.parseFloat(firstBody)
+        if (Number.isFinite(cfr) && cfr > 0) fps = cfr
+        else if (frameRate.isLoaded()) fps = frameRate.fps()
+        else {
+          const choice = await askChoice(
+            tPlain('Frame rate'),
+            tPlain('The frame rate is required to read this file:'),
+            ['23.976', '24', '25', '29.97', '30'],
+            3,
+          )
+          if (choice === null) return false
+          fps = [23.976, 24, 25, 29.97, 30][choice]
+        }
+      }
+      const options: ParseOptions = { format, textImport, fps }
+      const state = await coreRef.current.open(bytes, file.name, encoding, options)
+      applyLoadedDocument(state)
       setVideoTimeMs(0)
       // App/Auto/Backup：打开成功后把原始文件备份为 .ORIGINAL（subs_controller.cpp Load）
       if (getOptionBool('App/Auto/Backup') && file.file) {
-        void saveSubtitleBackup(file.name, decodeText(bytes)).catch(() => undefined)
+        void saveSubtitleBackup(file.name, new TextDecoder('utf-8').decode(bytes)).catch(
+          () => undefined,
+        )
       }
       setStatus(`Opened ${file.name}`)
       void recordRecent('subtitle', file)
-      // 会话恢复标记：下次打开标签页默认重新打开该文件
       saveLastSubtitleName(file.name)
+      void autoLoadLinkedFiles(state.document)
       return true
     } catch (error) {
       setStatus(error instanceof Error ? error.message : tPlain('Could not open subtitles'))
@@ -1446,10 +1888,125 @@ export function App() {
     }
   }
 
-  const openSubtitles = async () => {
+  /** charset 之后按格式继续：纯文本先经 dialog_text_import（subtitle_format_txt.cpp ReadFile） */
+  const beginSubtitleLoad = async (
+    file: AppFileHandle,
+    bytes: Uint8Array,
+    format: SubtitleFormat,
+    encoding: string,
+  ): Promise<boolean> => {
+    if (format === 'txt') {
+      setPendingOpen({ file, bytes, format, encoding })
+      setDialog('text-import')
+      return true
+    }
+    return await finishOpenSubtitle(file, bytes, encoding, format)
+  }
+
+  /**
+   * 打开字幕：charset_detect → dialog_charset（不确定/强制）→ dialog_text_import（.txt）→ Load。
+   * MKV 走内嵌轨道提取，再以 ASS 文本载入核心。
+   */
+  const openSubtitleHandle = async (
+    file: AppFileHandle,
+    overrides: { charset?: boolean; encoding?: string; format?: SubtitleFormat } = {},
+  ): Promise<boolean> => {
+    if (!coreRef.current) return false
+    setBusy(true)
+    try {
+      const bytes = await host.readFile(file)
+      if (/\.(mkv|mka|mks)$/i.test(file.name)) {
+        setBusy(false)
+        return await openExtractedSubtitles(bytes, file.name)
+      }
+      const decoded = overrides.encoding
+        ? decodeWithEncoding(bytes, overrides.encoding)
+        : detectEncoding(bytes)
+      if (decoded.binary)
+        throw new Error(tPlain('File appears to be binary and cannot be loaded as subtitles.'))
+      const format = overrides.format ?? detectFormat(file.name, decoded.text)
+      if (!overrides.encoding && (overrides.charset || !decoded.definite)) {
+        setPendingOpen({ file, bytes, format })
+        setDialog('charset')
+        setBusy(false)
+        return true
+      }
+      setBusy(false)
+      return await beginSubtitleLoad(file, bytes, format, overrides.encoding ?? decoded.encoding)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : tPlain('Could not open subtitles'))
+      setBusy(false)
+      return false
+    }
+  }
+
+  /** Matroska 内嵌字幕提取（mkv_wrap.cpp GetSubtitles） */
+  const openExtractedSubtitles = async (
+    bytes: Uint8Array,
+    sourceName: string,
+  ): Promise<boolean> => {
+    if (!coreRef.current) return false
+    setBusy(true)
+    try {
+      const tracks = extractMkvSubtitles(bytes)
+      if (!tracks.length) throw new Error(tPlain('File has no recognised subtitle tracks.'))
+      let track: MkvSubtitleTrack = tracks[0]
+      if (tracks.length > 1) {
+        const labels = tracks.map((item) => {
+          const name = item.name || item.language || 'Track'
+          return `${name} (${item.codecId}, track ${item.number})`
+        })
+        const choice = await askChoice(
+          tPlain('Select subtitle track'),
+          tPlain('File contains multiple subtitle tracks:'),
+          labels,
+          0,
+        )
+        if (choice === null) {
+          setBusy(false)
+          return false
+        }
+        track = tracks[choice]
+      }
+      const state = await coreRef.current.open(
+        new TextEncoder().encode(track.assText),
+        sourceName,
+        undefined,
+        { format: track.ssa ? 'ssa' : 'ass' },
+      )
+      applyLoadedDocument(state)
+      setVideoTimeMs(0)
+      setStatus(tFmt('Opened %1 (track %2)', sourceName, String(track.number)))
+      saveLastSubtitleName(sourceName)
+      void autoLoadLinkedFiles(state.document)
+      return true
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : tPlain('Could not extract subtitles'))
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const openSubtitles = async (options: { charset?: boolean } = {}) => {
     const file = await host.openFile(SUBTITLE_FILE_TYPES)
     if (!file) return
-    await openSubtitleHandle(file)
+    await openSubtitleHandle(file, options)
+  }
+
+  const openSubtitlesFromVideo = async () => {
+    if (!videoMedia) {
+      setStatus(tPlain('No video loaded'))
+      return
+    }
+    try {
+      const bytes = videoMedia.file
+        ? new Uint8Array(await videoMedia.file.arrayBuffer())
+        : new Uint8Array(await (await fetch(videoMedia.url)).arrayBuffer())
+      await openExtractedSubtitles(bytes, videoMedia.name)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : tPlain('Could not extract subtitles'))
+    }
   }
 
   // 会话恢复：启动后若上次关闭标签页时有打开的字幕，且 MRU 中仍能取到文件句柄，
@@ -1519,21 +2076,386 @@ export function App() {
     }
   }
 
+  /** 保存时把当前界面/媒体状态合并进 Project Garbage（不产生撤销记录） */
+  const buildProjectProperties = (document: SubtitleDocument): ProjectProperties => {
+    const base = document.properties ?? createProjectProperties()
+    const activeIndex = document.cues.findIndex((cue) => cue.id === activeId)
+    return {
+      ...base,
+      audioFile: audioMedia ? (audioMedia.file?.name ?? audioMedia.name) : '',
+      videoFile: videoMedia && !videoMedia.dummy ? (videoMedia.file?.name ?? videoMedia.name) : '',
+      timecodesFile: timecodesFromFile ? timecodesFileName : '',
+      keyframesFile: keyframesFromFile ? keyframesFileName : '',
+      videoZoom: videoWindowZoom,
+      scrollPosition: gridScrollRow,
+      activeRow: activeIndex < 0 ? 0 : activeIndex,
+      videoPosition: frameRate.isLoaded() ? frameRate.frameAtTime(videoTimeMs, 'start') : 0,
+      arMode: aspectOverride ? 4 : 0,
+      arValue: aspectOverride ?? 0,
+    }
+  }
+
   const saveSubtitles = async (format = core?.document.format) => {
     if (!coreRef.current || !core) return
-    const output = await coreRef.current.export(format)
-    const base = core.document.sourceName.replace(/\.(ass|ssa|srt)$/i, '') || 'untitled'
-    const extension = format === 'srt' ? 'srt' : 'ass'
-    await host.saveFile(`${base}.${extension}`, output, {
-      description: 'Subtitle',
-      accept: { 'text/plain': [`.${extension}`] },
-    })
-    setDirty(false)
-    // Save()：手动保存后视为已自动保存（autosaved_commit_id = saved_commit_id）
-    lastAutosaveRevisionRef.current = core.document.revision
-    // 保存后打断撤销合并链（subs_controller.cpp：saved_commit_id 使下一次提交不合并）
-    coreRef.current.markSaved()
-    setStatus(`Saved ${base}.${extension}`)
+    const writable: SubtitleFormat[] = [
+      'ass',
+      'ssa',
+      'srt',
+      'txt',
+      'ttxt',
+      'microdvd',
+      'ebu',
+      'transtation',
+      'encore',
+    ]
+    const target: SubtitleFormat = format && writable.includes(format) ? format : 'ass'
+    let rateOptions: { fps?: number; frameTimes?: number[] } = frameRate.isLoaded()
+      ? {
+          fps: frameRate.fps(),
+          frameTimes: frameRate.timecodes.length > 1 ? [...frameRate.timecodes] : undefined,
+        }
+      : {}
+    if (['microdvd', 'transtation', 'encore'].includes(target) && !rateOptions.fps) {
+      const choice = await askChoice(
+        tPlain('Frame rate'),
+        tPlain('The frame rate is required to export this format:'),
+        ['23.976', '24', '25', '29.97', '30'],
+        3,
+      )
+      if (choice === null) return
+      rateOptions = { fps: [23.976, 24, 25, 29.97, 30][choice] }
+    }
+    try {
+      const output = await coreRef.current.export(
+        target,
+        {
+          ...rateOptions,
+          saveUiState: getOptionBool('App/Save UI State'),
+          properties: buildProjectProperties(core.document),
+        },
+        getOptionString('App/Save Charset') || 'UTF-8',
+      )
+      const base =
+        core.document.sourceName
+          .replace(/\.(encore|transtation)\.txt$/i, '')
+          .replace(/\.[^.]+$/, '') || 'untitled'
+      const extension = exportExtension(target)
+      await host.saveFile(`${base}.${extension}`, output, {
+        description: 'Subtitle',
+        accept:
+          target === 'ebu'
+            ? { 'application/octet-stream': [`.${extension}`] }
+            : { 'text/plain': [`.${extension}`] },
+      })
+      setDirty(false)
+      // Save()：手动保存后视为已自动保存（autosaved_commit_id = saved_commit_id）
+      lastAutosaveRevisionRef.current = core.document.revision
+      // 保存后打断撤销合并链（subs_controller.cpp：saved_commit_id 使下一次提交不合并）
+      coreRef.current.markSaved()
+      setStatus(`Saved ${base}.${extension}`)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : tPlain('Could not save subtitles'))
+    }
+  }
+
+  /**
+   * dialog_video_properties.cpp UpdateVideoProperties：
+   * 载入视频后按 YCbCr → PlayRes → LayoutRes 顺序校正脚本属性，可提示/直接设置/忽略。
+   */
+  const runVideoProperties = async (info: VideoStreamInfo) => {
+    const runId = ++videoPropertiesRunRef.current
+    const alive = () => videoPropertiesRunRef.current === runId && Boolean(coreRef.current)
+    const scriptInfo = () => coreStateRef.current?.document.scriptInfo ?? {}
+    const atoi = (text: string) => {
+      const value = Number.parseInt(text, 10)
+      return Number.isFinite(value) ? value : 0
+    }
+    const real = ffmpegColorspace(info.colorSpace, info.colorRange)
+    const guessed = guessVideoColorspace(real, info.width, info.height)
+    const recommended: YcbcrHeader = { kind: 'colorspace', colorspace: guessed }
+    const recommendedHeader = ycbcrHeaderToBestPractice(recommended)
+    const recommendedText = ycbcrHeaderToBestPracticeString(recommended)
+    const matrixName = MATRIX_DISPLAY[guessed.matrix] ?? guessed.matrix
+
+    // 未标记矩阵 / HDR 警告
+    if (real.matrix === 'Unspecified' && getOptionBool('Video/Untagged Matrix Warning')) {
+      await showMessage(
+        tPlain('Untagged video'),
+        tPlain(
+          'The video you have loaded has no specified color matrix. ' +
+            'Aegisub will guess the color matrix to be %s, but there is no guarantee that other programs will guess the same matrix. ' +
+            'This may make the video appear with different colors in different media players and can prevent subtitle colors from matching video colors.' +
+            '\n \n' +
+            'Consider tagging your video with a color matrix to ensure that your video displays consistently in all players and that subtitle colors can reliably match video colors.',
+        ).replace('%s', matrixName),
+      )
+      if (!alive()) return
+    }
+    if (
+      isHdrOrWcg(info.colorPrimaries, info.colorTransfer) &&
+      getOptionBool('Video/HDR Video Warning')
+    ) {
+      await showMessage(
+        tPlain('HDR and/or WCG video'),
+        tPlain(
+          'The video you have loaded has HDR and/or WCG colors. ' +
+            'While ordinary dialogue subtitles will work fine on such videos, ' +
+            'matching video colors using subtitles will not be possible on HDR and/or WCG footage.',
+        ),
+      )
+      if (!alive()) return
+    }
+
+    // ---- YCbCr Matrix ----
+    const scriptMatrix = parseYcbcrHeader(getScriptInfo(scriptInfo(), 'YCbCr Matrix'))
+    if (scriptMatrix.kind === 'missing' || scriptMatrix.kind === 'invalid') {
+      let action = getOptionInt('Video/No YCbCr Matrix in Script') // 0 Ignore / 1 Prompt / 2 Set
+      if (action === 1) {
+        const choice = await askChoice(
+          tPlain("Set script's YCbCr Matrix?"),
+          tPlain(
+            'The current subtitle file has no YCbCr Matrix set.\n\n' +
+              'If you plan to use this subtitle file on this newly loaded video file,\nyou should set the subtitle file\'s YCbCr Matrix to the video\'s color space ("%s").\n\n' +
+              'If you plan to use a different video file, you may want to\nleave the YCbCr Matrix unset until you load the correct video file.\n\n' +
+              'This prompt can be configured in the preferences.',
+          ).replace('%s', recommendedText),
+          [
+            tPlain('Leave YCbCr Matrix unset'),
+            tPlain('Set script\'s YCbCr Matrix to the video\'s ("%s")').replace(
+              '%s',
+              recommendedText,
+            ),
+          ],
+          getOptionInt('Video/Last No YCbCr Matrix in Script Choice'),
+        )
+        if (!alive()) return
+        if (choice === null) action = 0
+        else {
+          setOption('Video/Last No YCbCr Matrix in Script Choice', choice)
+          action = choice === 1 ? 2 : 0
+        }
+      }
+      if (action === 2) {
+        await apply(
+          [{ type: 'updateScriptInfo', patch: { 'YCbCr Matrix': recommendedText } }],
+          'change ycbcr matrix',
+        )
+        return
+      }
+    } else if (scriptMatrix.kind === 'colorspace') {
+      const same =
+        recommendedHeader.kind === 'colorspace' &&
+        scriptMatrix.colorspace.matrix === recommendedHeader.colorspace.matrix &&
+        scriptMatrix.colorspace.range === recommendedHeader.colorspace.range
+      if (!same) {
+        let action = getOptionInt('Video/YCbCr Matrix Mismatch') // 0 Ignore / 1 Prompt / 2 Set
+        const scriptText = ycbcrHeaderToBestPracticeString(scriptMatrix)
+        if (action === 1) {
+          const choice = await askChoice(
+            tPlain('YCbCr Matrix mismatch'),
+            tPlain(
+              'This video\'s recommended YCbCr Matrix ("%s") differs from the subtitle file\'s YCbCr Matrix ("%s").\n\n' +
+                "If this new video's colors look identical to the video the subtitle file was originally authored for,\n" +
+                "then the subtitle file's YCbCr Matrix should be set to the video's YCbCr Matrix.",
+            )
+              .replace('%s', recommendedText)
+              .replace('%s', scriptText),
+            [
+              tPlain('Leave script\'s YCbCr Matrix as it is ("%s")').replace('%s', scriptText),
+              tPlain('Set script\'s YCbCr Matrix to the video\'s ("%s")').replace(
+                '%s',
+                recommendedText,
+              ),
+            ],
+            getOptionInt('Video/Last YCbCr Matrix Mismatch Choice'),
+          )
+          if (!alive()) return
+          if (choice === null) action = 0
+          else {
+            setOption('Video/Last YCbCr Matrix Mismatch Choice', choice)
+            action = choice === 1 ? 2 : 0
+          }
+        }
+        if (action === 2) {
+          await apply(
+            [{ type: 'updateScriptInfo', patch: { 'YCbCr Matrix': recommendedText } }],
+            'change ycbcr matrix',
+          )
+          return
+        }
+      }
+    }
+
+    // ---- PlayRes ----
+    const playResX = atoi(getScriptInfo(scriptInfo(), 'PlayResX'))
+    const playResY = atoi(getScriptInfo(scriptInfo(), 'PlayResY'))
+    const vx = info.displayWidth
+    const vy = info.displayHeight
+    if (!vx || !vy) return
+    if (playResX === 0 && playResY === 0) {
+      await apply(
+        [{ type: 'updateScriptInfo', patch: { PlayResX: String(vx), PlayResY: String(vy) } }],
+        'change script resolution',
+      )
+    } else if (!(playResX % vx === 0 && playResY % vy === 0)) {
+      const arChanged = scriptAspectChanged(playResX, playResY, vx, vy)
+      const action = getOptionInt('Video/PlayRes Mismatch') // 0 Ignore / 1 Prompt / 2 Resample
+      let resampleMode: number | null = null
+      if (action === 2 && !arChanged) resampleMode = RESAMPLE_AR_STRETCH
+      else if (action === 2 || action === 1) {
+        const choices = arChanged
+          ? [
+              tPlain('Leave resolution as it is'),
+              tPlain('Resample script (stretch to new aspect ratio)'),
+              tPlain('Resample script (add borders)'),
+              tPlain('Resample script (remove borders)'),
+            ]
+          : [tPlain('Leave resolution as it is'), tPlain('Resample script')]
+        const choice = await askChoice(
+          tPlain('Resolution mismatch'),
+          tPlain(
+            "The resolution of the loaded video and the resolution specified for the subtitles don't match.\n\n" +
+              'Video resolution:\t%d × %d\n' +
+              'Script resolution:\t%d × %d\n\n' +
+              'Change subtitles resolution to match video?',
+          )
+            .replace('%d', String(vx))
+            .replace('%d', String(vy))
+            .replace('%d', String(playResX))
+            .replace('%d', String(playResY)),
+          choices,
+          getOptionInt('Video/Last PlayRes Mismatch Choice'),
+        )
+        if (!alive()) return
+        if (choice !== null && choice > 0) {
+          setOption('Video/Last PlayRes Mismatch Choice', choice)
+          resampleMode = arChanged
+            ? [RESAMPLE_AR_STRETCH, RESAMPLE_AR_ADD_BORDERS, RESAMPLE_AR_REMOVE_BORDERS][choice - 1]
+            : RESAMPLE_AR_STRETCH
+        }
+      }
+      if (resampleMode !== null && coreStateRef.current) {
+        const document = coreStateRef.current.document
+        await apply(
+          resampleCommands(document, {
+            sourceX: playResX,
+            sourceY: playResY,
+            destX: vx,
+            destY: vy,
+            margin: [0, 0, 0, 0],
+            arMode: resampleMode,
+            matrixConversion: null,
+          }),
+          'change script resolution',
+        )
+      }
+    }
+    if (!alive()) return
+
+    // ---- LayoutRes ----
+    const playResX2 = atoi(getScriptInfo(scriptInfo(), 'PlayResX'))
+    const playResY2 = atoi(getScriptInfo(scriptInfo(), 'PlayResY'))
+    const layoutX = atoi(getScriptInfo(scriptInfo(), 'LayoutResX'))
+    const layoutY = atoi(getScriptInfo(scriptInfo(), 'LayoutResY'))
+    if (layoutX === 0 || layoutY === 0) {
+      let action = getOptionInt('Video/No LayoutRes in Script') // 0 Ignore / 1 Prompt / 2 Set / 3 SetToPlayRes
+      if (action === 1) {
+        const choice = await askChoice(
+          tPlain("Set script's layout resolution?"),
+          tPlain(
+            'The current subtitle file has no layout resolution set.\n\n' +
+              "If you plan to use this subtitle file on this newly loaded video file,\nyou should set the subtitle file's layout resolution to the video's display resolution.\n\n" +
+              'If you plan to use a different video file, you may want to leave\nthe layout resolution unset until you load the correct video file.\n\n' +
+              'If you are adapting an existing old subtitle file that does not yet have\na layout resolution set, you should set its layout resolution to the resolution\nof the video the subtitle file was intended to be played back on.\n' +
+              "Often, this is the same as the file's script resolution. (%d × %d)\n\n" +
+              'This prompt can be configured in the preferences.',
+          )
+            .replace('%d', String(playResX2))
+            .replace('%d', String(playResY2)),
+          [
+            tPlain('Leave layout resolution unset'),
+            tPlain("Set script's layout resolution to the video's (%d × %d)")
+              .replace('%d', String(vx))
+              .replace('%d', String(vy)),
+            tPlain("Set script's layout resolution to its script resolution (%d × %d)")
+              .replace('%d', String(playResX2))
+              .replace('%d', String(playResY2)),
+          ],
+          getOptionInt('Video/Last No LayoutRes in Script Choice'),
+        )
+        if (!alive()) return
+        if (choice === null) action = 0
+        else {
+          setOption('Video/Last No LayoutRes in Script Choice', choice)
+          action = [0, 2, 3][choice] ?? 0
+        }
+      }
+      if (action === 2) {
+        await apply(
+          [{ type: 'updateScriptInfo', patch: { LayoutResX: String(vx), LayoutResY: String(vy) } }],
+          'change layout resolution',
+        )
+        return
+      }
+      if (action === 3) {
+        await apply(
+          [
+            {
+              type: 'updateScriptInfo',
+              patch: { LayoutResX: String(playResX2), LayoutResY: String(playResY2) },
+            },
+          ],
+          'change layout resolution',
+        )
+        return
+      }
+    } else if (layoutX !== vx || layoutY !== vy) {
+      const condition = getOptionInt('Video/LayoutRes Mismatch') // 0 Never / 1 OnAR / 2 Always
+      if (condition === 0) return
+      const arChanged = scriptAspectChanged(layoutX, layoutY, vx, vy)
+      if (!arChanged && condition === 1) return
+      const choice = await askChoice(
+        tPlain('Layout resolution mismatch'),
+        (arChanged
+          ? tPlain(
+              'The resolution of the loaded video and the layout resolution specified for the subtitles differ in aspect ratios.\n\n' +
+                'Video resolution:    %d × %d\n' +
+                'Subtitle layout resolution:    %d × %d\n\n' +
+                'Change layout resolution of subtitles to match video?',
+            )
+          : tPlain(
+              "The resolution of the loaded video and the layout resolution specified for the subtitles don't match.\n\n" +
+                'Video resolution:    %d × %d\n' +
+                'Subtitle layout resolution:    %d × %d\n\n' +
+                "Usually, this is not an issue, and you may leave the subtitle file's layout resolution as it is.\n" +
+                'If your subtitle file does not contain any significant formatting and you now intend to perform\n' +
+                "formatting on the newly loaded video, you may want to set the script's layout resolution\n" +
+                "to the video's display resolution.",
+            )
+        )
+          .replace('%d', String(vx))
+          .replace('%d', String(vy))
+          .replace('%d', String(layoutX))
+          .replace('%d', String(layoutY)),
+        [
+          tPlain('Leave layout resolution as it is (%d × %d)')
+            .replace('%d', String(layoutX))
+            .replace('%d', String(layoutY)),
+          tPlain("Set script's layout resolution to the video's (%d × %d)")
+            .replace('%d', String(vx))
+            .replace('%d', String(vy)),
+        ],
+        getOptionInt('Video/Last LayoutRes Mismatch Choice'),
+      )
+      if (!alive()) return
+      if (choice === 1) {
+        setOption('Video/Last LayoutRes Mismatch Choice', choice)
+        await apply(
+          [{ type: 'updateScriptInfo', patch: { LayoutResX: String(vx), LayoutResY: String(vy) } }],
+          'change layout resolution',
+        )
+      }
+    }
   }
 
   const openVideoHandle = async (file: AppFileHandle) => {
@@ -1544,17 +2466,48 @@ export function App() {
       return
     }
     const previousVideo = videoMedia
-    // Video/Open Audio（Preferences → Video → Options）：打开视频时是否自动挂载音轨
-    const openAudio = getOptionBool('Video/Open Audio')
+    videoPropertiesRunRef.current += 1 // 旧视频的属性提示失效
+    // 多轨道：FFMS2 在 LoadVideo/LoadAudio 时询问轨道（AskForTrackSelection）
+    let videoStreamIndex: number | undefined
+    let audioStreamIndex: number | undefined
+    let audioSelected = !file.file // 无法探测（如本地原生句柄）时沿用默认音轨
+    if (file.file) {
+      try {
+        const tracks = await listMediaTracks(file.file)
+        const videoTrack = await chooseTrackIndex('video', tracks.videos)
+        if (videoTrack.cancelled) {
+          URL.revokeObjectURL(source.url)
+          setStatus(tPlain('Video track selection cancelled'))
+          return
+        }
+        videoStreamIndex = videoTrack.index
+        // Video/Open Audio（Preferences → Video → Options）：打开视频时是否自动挂载音轨
+        if (getOptionBool('Video/Open Audio')) {
+          const audioTrack = await chooseTrackIndex('audio', tracks.audios)
+          if (!audioTrack.cancelled) {
+            audioStreamIndex = audioTrack.index
+            audioSelected = tracks.audios.length > 0
+          }
+        }
+      } catch {
+        // 探测失败不阻止播放：使用容器默认轨道
+      }
+    }
+    const videoSource: MediaSource =
+      videoStreamIndex === undefined ? source : { ...source, videoStreamIndex }
+    const audioSource: MediaSource =
+      audioStreamIndex === undefined ? source : { ...source, audioStreamIndex }
+    const openAudio = getOptionBool('Video/Open Audio') && audioSelected
     if (openAudio) {
       const previousAudio = audioMedia
-      setAudioMedia(source)
+      setAudioMedia(audioSource)
       setAudioTimeMs(0)
       setAudioDurationMs(0)
       setDisplayModeAudio(true)
-      if (previousAudio && previousAudio !== previousVideo) URL.revokeObjectURL(previousAudio.url)
+      if (previousAudio && previousAudio !== previousVideo && previousAudio.url !== source.url)
+        URL.revokeObjectURL(previousAudio.url)
     }
-    setVideoMedia(source)
+    setVideoMedia(videoSource)
     setVideoSizeReady(false)
     // FrameMain::OnVideoOpen 的减档等真实尺寸上报后结算（见 setIntrinsicSizeStable）
     pendingZoomFitRef.current = true
@@ -1584,10 +2537,12 @@ export function App() {
     if (scanFile) {
       // 视频流头信息（容器标称帧率 + 色彩空间）：源码的帧率/矩阵来自 FFMS2 索引读到的流属性。
       // 不在此播放采样——否则载入时会"自动播放约一秒再回第一帧"
-      void probeVideoInfo(scanFile).then((info) => {
+      void probeVideoInfo(scanFile, videoStreamIndex).then((info) => {
         if (keyframeScanIdRef.current !== scanId || !info) return
         if (info.fps >= 5 && info.fps <= 240) setDetectedFps(info.fps)
         setVideoColorspace(parseContainerColorspace(info.colorSpace, info.colorRange))
+        // UpdateVideoProperties：YCbCr / PlayRes / LayoutRes 校正与提示
+        void runVideoProperties(info)
       })
       const scan: NonNullable<typeof videoScanRef.current> = {
         id: scanId,
@@ -1600,7 +2555,7 @@ export function App() {
       scan.promise = (async () => {
         let latest: number[] = []
         let latestFrames: number[] | null = null
-        const cached = await loadCachedKeyframes(scanFile)
+        const cached = await loadCachedKeyframes(scanFile, videoStreamIndex)
         if (keyframeScanIdRef.current !== scanId) return
         if (cached) {
           latest = cached.keyframeTimesMs ?? []
@@ -1631,19 +2586,23 @@ export function App() {
               maybeNoticeVideoOffset(frames)
             }
           },
+          videoStreamIndex,
         ).catch((error: unknown) => {
           // 容器打不开（罕见封装）时保持无关键帧/无表，不影响视频播放；日志便于诊断
           console.error('keyframe scan failed:', error)
         })
         if (keyframeScanIdRef.current !== scanId) return
-        if (latest.length > 0) void storeCachedKeyframes(scanFile, latest, latestFrames ?? [])
+        if (latest.length > 0)
+          void storeCachedKeyframes(scanFile, latest, latestFrames ?? [], videoStreamIndex)
         scan.done = true
         scan.keyframeTimes = latest
         scan.frameTimes = latestFrames
       })()
     }
     // 旧视频 URL 若仍被保留的音频引用（Video/Open Audio 关闭时）不能释放
-    if (previousVideo && previousVideo !== audioMedia) URL.revokeObjectURL(previousVideo.url)
+    // 注意比较 URL：多轨选择会为音轨创建同 URL 的独立 MediaSource
+    if (previousVideo && previousVideo.url !== audioMedia?.url)
+      URL.revokeObjectURL(previousVideo.url)
     setStatus(`Video: ${file.name}`)
     void recordRecent('video', file)
   }
@@ -1655,7 +2614,8 @@ export function App() {
   }
 
   const closeVideo = () => {
-    if (videoMedia && videoMedia !== audioMedia) URL.revokeObjectURL(videoMedia.url)
+    if (videoMedia && videoMedia.url !== audioMedia?.url) URL.revokeObjectURL(videoMedia.url)
+    setVideoDetached(false) // dialog_detached_video.cpp：关闭视频时一并关闭分离窗口
     setVideoMedia(null)
     setVideoSizeReady(false)
     pendingZoomFitRef.current = false
@@ -1680,6 +2640,7 @@ export function App() {
       const list = parseKeyframes(decodeText(await host.readFile(file)))
       setKeyframes(list)
       setKeyframesFromFile(true)
+      setKeyframesFileName(file.name)
       setStatus(`Keyframes: ${file.name} (${list.length} keyframes)`)
       void recordRecent('keyframes', file)
     } catch (error) {
@@ -1733,6 +2694,7 @@ export function App() {
   const closeKeyframes = () => {
     // project.cpp CloseKeyframes：回退到视频自带（activeKeyframes 派生自动切换）
     setKeyframesFromFile(false)
+    setKeyframesFileName('')
     setStatus(tPlain('Keyframes closed'))
   }
 
@@ -1741,6 +2703,7 @@ export function App() {
       const rate = parseTimecodes(decodeText(await host.readFile(file)))
       setTimecodes(rate)
       setTimecodesFromFile(true)
+      setTimecodesFileName(file.name)
       setStatus(`Timecodes: ${file.name} (${rate.frameCount()} frames)`)
       void recordRecent('timecodes', file)
     } catch (error) {
@@ -1797,6 +2760,7 @@ export function App() {
   const closeTimecodes = () => {
     setTimecodes(null)
     setTimecodesFromFile(false)
+    setTimecodesFileName('')
     setFrameMode(false)
     setStatus(tPlain('Timecodes closed'))
   }
@@ -1810,6 +2774,7 @@ export function App() {
       const rate = parseTimecodes(decodeText(new Uint8Array(await file.arrayBuffer())))
       setTimecodes(rate)
       setTimecodesFromFile(true)
+      setTimecodesFileName(file.name)
       setStatus(`Timecodes: ${file.name} (${rate.frameCount()} frames)`)
       void recordRecent('timecodes', { name: file.name, file })
       return true
@@ -1823,6 +2788,7 @@ export function App() {
       const list = parseKeyframes(decodeText(new Uint8Array(await file.arrayBuffer())))
       setKeyframes(list)
       setKeyframesFromFile(true)
+      setKeyframesFileName(file.name)
       setStatus(`Keyframes: ${file.name} (${list.length} keyframes)`)
       void recordRecent('keyframes', { name: file.name, file })
       return true
@@ -2049,12 +3015,42 @@ export function App() {
         filtered,
         options.filters.map((filter) => filter.displayName),
       )
-      const output = exportSubtitle(written, options.format)
-      const base = core.document.sourceName.replace(/\.(ass|ssa|srt)$/i, '') || 'untitled'
-      const extension = options.format === 'srt' ? 'srt' : 'ass'
-      void host.saveFile(`${base}.${extension}`, new TextEncoder().encode(output), {
+      let rateOptions: { fps?: number; frameTimes?: number[] } = frameRate.isLoaded()
+        ? {
+            fps: frameRate.fps(),
+            frameTimes: frameRate.timecodes.length > 1 ? [...frameRate.timecodes] : undefined,
+          }
+        : {}
+      if (['microdvd', 'transtation', 'encore'].includes(options.format) && !rateOptions.fps) {
+        const choice = await askChoice(
+          tPlain('Frame rate'),
+          tPlain('The frame rate is required to export this format:'),
+          ['23.976', '24', '25', '29.97', '30'],
+          3,
+        )
+        if (choice === null) return
+        rateOptions = { fps: [23.976, 24, 25, 29.97, 30][choice] }
+      }
+      const output = exportSubtitle(written, options.format, {
+        clean: true,
+        saveUiState: getOptionBool('App/Save UI State'),
+        ...rateOptions,
+      })
+      const base =
+        core.document.sourceName
+          .replace(/\.(encore|transtation)\.txt$/i, '')
+          .replace(/\.[^.]+$/, '') || 'untitled'
+      const extension = exportExtension(options.format)
+      const bytes =
+        output instanceof Uint8Array
+          ? output
+          : encodeText(output, getOptionString('App/Save Charset') || 'UTF-8')
+      void host.saveFile(`${base}.${extension}`, bytes, {
         description: 'Subtitle',
-        accept: { 'text/plain': [`.${extension}`] },
+        accept:
+          options.format === 'ebu'
+            ? { 'application/octet-stream': [`.${extension}`] }
+            : { 'text/plain': [`.${extension}`] },
       })
       setStatus(`Exported ${base}.${extension}`)
     } finally {
@@ -2065,8 +3061,24 @@ export function App() {
 
   const openAudioHandle = async (file: AppFileHandle) => {
     // 音频命令可以打开含音轨的视频文件（<audio> 元素可播视频容器的音轨）
-    const source = await host.openMedia(file)
-    if (audioMedia && audioMedia !== videoMedia) URL.revokeObjectURL(audioMedia.url)
+    const opened = await host.openMedia(file)
+    let source: MediaSource = opened
+    if (file.file) {
+      try {
+        const tracks = await listMediaTracks(file.file)
+        const audioTrack = await chooseTrackIndex('audio', tracks.audios)
+        if (audioTrack.cancelled) {
+          URL.revokeObjectURL(opened.url)
+          setStatus(tPlain('Audio track selection cancelled'))
+          return
+        }
+        if (audioTrack.index !== undefined)
+          source = { ...opened, audioStreamIndex: audioTrack.index }
+      } catch {
+        // 探测失败沿用默认音轨
+      }
+    }
+    if (audioMedia && audioMedia.url !== videoMedia?.url) URL.revokeObjectURL(audioMedia.url)
     setAudioMedia(source)
     setAudioTimeMs(0)
     setAudioDurationMs(0)
@@ -2081,13 +3093,25 @@ export function App() {
     await openAudioHandle(file)
   }
 
-  const openAudioFromVideo = () => {
+  const openAudioFromVideo = async () => {
     if (!videoMedia) {
       setStatus(tPlain('Open a video first'))
       return
     }
-    if (audioMedia && audioMedia !== videoMedia) URL.revokeObjectURL(audioMedia.url)
-    setAudioMedia(videoMedia)
+    let source = videoMedia
+    if (videoMedia.file) {
+      try {
+        const tracks = await listMediaTracks(videoMedia.file)
+        const audioTrack = await chooseTrackIndex('audio', tracks.audios)
+        if (audioTrack.cancelled) return
+        if (audioTrack.index !== undefined)
+          source = { ...videoMedia, audioStreamIndex: audioTrack.index }
+      } catch {
+        // 探测失败沿用默认音轨
+      }
+    }
+    if (audioMedia && audioMedia.url !== videoMedia.url) URL.revokeObjectURL(audioMedia.url)
+    setAudioMedia(source)
     setAudioTimeMs(0)
     setAudioDurationMs(videoDurationMs)
     setDisplayModeAudio(true)
@@ -2095,7 +3119,7 @@ export function App() {
   }
 
   const closeAudio = () => {
-    if (audioMedia && audioMedia !== videoMedia) URL.revokeObjectURL(audioMedia.url)
+    if (audioMedia && audioMedia.url !== videoMedia?.url) URL.revokeObjectURL(audioMedia.url)
     setAudioMedia(null)
     setAudioDurationMs(0)
     setAudioTimeMs(0)
@@ -2105,8 +3129,8 @@ export function App() {
 
   const sendVideoAction = (type: string) =>
     setVideoAction((current) => ({ sequence: current.sequence + 1, type }))
-  const sendAudioAction = (type: string) =>
-    setAudioAction((current) => ({ sequence: current.sequence + 1, type }))
+  const sendAudioAction = (type: string, range?: { startMs: number; endMs: number }) =>
+    setAudioAction((current) => ({ sequence: current.sequence + 1, type, ...range }))
 
   // 设置项局部更新（查找/替换对话框）
   const patchFindSettings = (patch: Partial<SearchReplaceSettings>) =>
@@ -2264,6 +3288,47 @@ export function App() {
     setStatus(tFmt(tPlural('One match was replaced.', '%d matches were replaced.', count), count))
   }
 
+  /** dialog_paste_over.cpp / command/edit.cpp paste_over：按勾选字段覆盖目标行 */
+  const applyPasteOver = async (
+    target: { lines: Omit<SubtitleCue, 'id'>[]; targetIds: string[] },
+    fields: boolean[],
+  ) => {
+    const count = Math.min(target.lines.length, target.targetIds.length)
+    const commands: CoreCommand[] = []
+    for (let index = 0; index < count; index += 1) {
+      const source = target.lines[index]
+      const patch: Partial<Omit<SubtitleCue, 'id'>> = {}
+      if (fields[0]) patch.comment = source.comment
+      if (fields[1]) patch.layer = source.layer
+      if (fields[2]) patch.startMs = source.startMs
+      if (fields[3]) patch.endMs = source.endMs
+      if (fields[4]) patch.style = source.style
+      if (fields[5]) patch.actor = source.actor
+      if (fields[6]) patch.marginL = source.marginL
+      if (fields[7]) patch.marginR = source.marginR
+      if (fields[8]) patch.marginV = source.marginV
+      if (fields[9]) patch.effect = source.effect
+      if (fields[10]) patch.text = source.text
+      commands.push({ type: 'updateCue', id: target.targetIds[index], patch })
+    }
+    if (commands.length) await apply(commands, 'paste')
+  }
+
+  /** dialog_attachments.cpp AttachFile：读取本地文件加入附件（同名同组替换） */
+  const addAttachments = async (files: File[], group: SubtitleAttachmentGroup) => {
+    if (!files.length) return
+    const attachments: SubtitleAttachment[] = await Promise.all(
+      files.map(async (file) =>
+        makeAttachment(file.name, new Uint8Array(await file.arrayBuffer()), group),
+      ),
+    )
+    const label = group === 'font' ? 'attach font file' : 'attach graphics file'
+    await apply(
+      attachments.map((attachment) => ({ type: 'addAttachment' as const, attachment })),
+      label,
+    )
+  }
+
   const api: CommandApi = {
     apply,
     undo: async () => {
@@ -2288,6 +3353,11 @@ export function App() {
       setHistoryNonce((value) => value + 1)
     },
     openSubtitles,
+    openSubtitlesFromVideo: () => openSubtitlesFromVideo(),
+    openPasteOver: (lines, targetIds) => {
+      setPasteOver({ lines, targetIds })
+      setDialog('paste-over')
+    },
     newSubtitles,
     saveSubtitles: (format) => saveSubtitles(format),
     openVideo,
@@ -2328,11 +3398,13 @@ export function App() {
     setAudioTime: setAudioTimeMs,
     scrollAudioToSelection: (mode) =>
       setAudioScrollRequest((current) => ({ seq: current.seq + 1, mode })),
+    scrollAudioBy: (deltaMs) =>
+      setAudioScrollBy((current) => ({ seq: current.seq + 1, delta: deltaMs })),
     setStatus,
     sendVideoAction,
     sendAudioAction,
     moveSelection,
-    moveSelectionOrCreate: () => void moveSelectionOrCreate(),
+    moveSelectionOrCreate: (resetDefault) => void moveSelectionOrCreate(resetDefault),
     selectLines: (ids) => {
       setActiveId(ids[0] ?? null)
       setSelectedIds(new Set(ids))
@@ -2370,6 +3442,7 @@ export function App() {
     },
     setDisplayMode,
     setVideoOverscan,
+    setVideoDetached,
     setAspectOverride,
     restoreAutosave: () => void restoreAutosave(),
     toggleLog: () => setLogWindowOpen((open) => !open),
@@ -2409,6 +3482,7 @@ export function App() {
       displayMode,
       toolbarVisible,
       videoOverscan,
+      videoDetached,
       aspectOverride,
       frameRate,
       currentFrame,
@@ -2539,6 +3613,13 @@ export function App() {
         if (event.dataTransfer?.files?.length) void handleDroppedFiles(event.dataTransfer.files)
       }}
     >
+      {/* 分离窗口按键代理：把弹窗 keydown 派发到此元素，命中 Video 快捷键上下文 */}
+      <div
+        ref={detachedKeyTargetRef}
+        data-shortcut-context="Video"
+        aria-hidden="true"
+        style={{ display: 'none' }}
+      />
       <MenuBar
         projectName={core.document.sourceName}
         recentLists={recentLists}
@@ -2579,79 +3660,100 @@ export function App() {
       >
         <div className="top-workspace">
           {(displayMode === 'full' || displayMode === 'video_subs') && (
-            <PreviewPane
-              document={core.document}
-              media={videoMedia}
-              currentTimeMs={videoTimeMs}
-              activeCue={selectedCue}
-              onTimeChange={setVideoTimeMs}
-              onDurationChange={setVideoDurationMs}
-              onOpenMedia={() => void openVideo()}
-              mediaAction={videoAction}
-              onCommand={executeCommand}
-              onPatchCue={(id, patch, label, amend) =>
-                apply([{ type: 'updateCue', id, patch }], label, amend)
-              }
-              onPatchCues={(patches, label, amend) =>
-                apply(
-                  patches.map(({ id, patch }) => ({ type: 'updateCue', id, patch })),
-                  label,
-                  amend,
-                )
-              }
-              selectedCues={selectedCues}
-              onVisualSelect={visualSelectCue}
-              onVisualSetActive={visualSetActiveCue}
-              onVisualDeselect={visualDeselectCue}
-              onPatchStyle={(id, patch, label) =>
-                void apply([{ type: 'updateStyle', id, patch }], label)
-              }
-              isCommandEnabled={isCommandEnabled}
-              isCommandChecked={isCommandChecked}
-              windowZoom={previewZoom}
-              devicePixelRatio={devicePixelRatioValue}
-              onWindowZoomChange={setVideoWindowZoom}
-              onIntrinsicSizeChange={setIntrinsicSizeStable}
-              localFontsEpoch={localFontsEpoch}
-              onLocalFontsAuthorize={() => setLocalFontsEpoch((epoch) => epoch + 1)}
-              intrinsicWidth={previewIntrinsic.width}
-              intrinsicHeight={previewIntrinsic.height}
-              overscan={videoOverscan}
-              keyframes={activeKeyframes}
-              currentFrame={currentFrame}
-              frameRate={frameRate}
-              frameCount={frameCount}
-              onDetectedFps={setDetectedFps}
-              onPlaybackModeChange={setVideoPlaybackMode}
-              decoderOverride={videoDecoderOverride}
-              videoColorspace={videoColorspace}
-              playbackGain={playbackGain}
-              onKeyframesChange={(list) => {
-                // WebCodecs 读流上报的也是时间（ms）；统一走派生换算，文件关键帧优先。
-                // 后台解复用扫描是全量索引（ffms2 语义）：进行中或已有完整结果时，
-                // 不得被 WebCodecs 渐进列表（只覆盖已读流片段）覆盖——扫描失败才作回退
-                if (keyframesFromFile) return
-                const scan = videoScanRef.current
-                if (scan && scan.id === keyframeScanIdRef.current) {
-                  if (!scan.done || scan.keyframeTimes.length > 0) return
-                }
-                setVideoKeyframeTimes(list)
-                // 写入关键帧缓存（覆盖解复用扫描未覆盖的 WebCodecs-only 路径）
-                if (videoMedia?.file && list.length > 0)
-                  void storeCachedKeyframes(videoMedia.file, list)
+            <div
+              className="preview-host-mount"
+              style={videoDetached ? { display: 'none' } : { display: 'contents' }}
+              ref={(node) => {
+                previewMountRef.current = node
+                const previewHost = previewHostRef.current
+                if (node && previewHost && !videoDetached && previewHost.parentNode !== node)
+                  node.appendChild(previewHost)
               }}
-              // video_display.cpp FitClientSizeToVideo：SetMinClientSize = SetMaxClientSize =
-              // video×zoom → 显示框锁定尺寸，窗口变窄也不收缩（flex-shrink: 0），溢出由窗口裁剪。
-              // 无视频的占位面板保持可收缩（basis 撑开、shrink 挤压）；移动端走 styles.css 的
-              // 固定高度预览布局（@media 覆盖），不传内联尺寸
-              style={
-                isNarrowViewport
-                  ? undefined
-                  : videoMedia
-                    ? { flexBasis: `${videoLayout.panelWidth}px`, flexShrink: 0 }
-                    : { flexBasis: `${videoLayout.panelWidth}px` }
-              }
-            />
+            >
+              {createPortal(
+                // video/detach 时该 portal host 被搬进独立窗口；挂靠时 display:contents
+                // 让 .preview-panel 继续直接作为 top-workspace 的 flex 子项
+                <PreviewPane
+                  document={core.document}
+                  media={videoMedia}
+                  currentTimeMs={videoTimeMs}
+                  activeCue={selectedCue}
+                  onTimeChange={setVideoTimeMs}
+                  onDurationChange={setVideoDurationMs}
+                  onOpenMedia={() => void openVideo()}
+                  mediaAction={videoAction}
+                  onCommand={executeCommand}
+                  onPatchCue={(id, patch, label, amend) =>
+                    apply([{ type: 'updateCue', id, patch }], label, amend)
+                  }
+                  onPatchCues={(patches, label, amend) =>
+                    apply(
+                      patches.map(({ id, patch }) => ({ type: 'updateCue', id, patch })),
+                      label,
+                      amend,
+                    )
+                  }
+                  selectedCues={selectedCues}
+                  onVisualSelect={visualSelectCue}
+                  onVisualSetActive={visualSetActiveCue}
+                  onVisualDeselect={visualDeselectCue}
+                  onPatchStyle={(id, patch, label) =>
+                    void apply([{ type: 'updateStyle', id, patch }], label)
+                  }
+                  isCommandEnabled={isCommandEnabled}
+                  isCommandChecked={isCommandChecked}
+                  windowZoom={previewZoom}
+                  devicePixelRatio={devicePixelRatioValue}
+                  onWindowZoomChange={setVideoWindowZoom}
+                  onIntrinsicSizeChange={setIntrinsicSizeStable}
+                  localFontsEpoch={localFontsEpoch}
+                  onLocalFontsAuthorize={() => setLocalFontsEpoch((epoch) => epoch + 1)}
+                  intrinsicWidth={previewIntrinsic.width}
+                  intrinsicHeight={previewIntrinsic.height}
+                  overscan={videoOverscan}
+                  keyframes={activeKeyframes}
+                  currentFrame={currentFrame}
+                  frameRate={frameRate}
+                  frameCount={frameCount}
+                  onDetectedFps={setDetectedFps}
+                  onPlaybackModeChange={setVideoPlaybackMode}
+                  decoderOverride={videoDecoderOverride}
+                  videoColorspace={videoColorspace}
+                  playbackGain={playbackGain}
+                  onKeyframesChange={(list) => {
+                    // WebCodecs 读流上报的也是时间（ms）；统一走派生换算，文件关键帧优先。
+                    // 后台解复用扫描是全量索引（ffms2 语义）：进行中或已有完整结果时，
+                    // 不得被 WebCodecs 渐进列表（只覆盖已读流片段）覆盖——扫描失败才作回退
+                    if (keyframesFromFile) return
+                    const scan = videoScanRef.current
+                    if (scan && scan.id === keyframeScanIdRef.current) {
+                      if (!scan.done || scan.keyframeTimes.length > 0) return
+                    }
+                    setVideoKeyframeTimes(list)
+                    // 写入关键帧缓存（覆盖解复用扫描未覆盖的 WebCodecs-only 路径）
+                    if (videoMedia?.file && list.length > 0)
+                      void storeCachedKeyframes(
+                        videoMedia.file,
+                        list,
+                        undefined,
+                        videoMedia.videoStreamIndex,
+                      )
+                  }}
+                  // video_display.cpp FitClientSizeToVideo：SetMinClientSize = SetMaxClientSize =
+                  // video×zoom → 显示框锁定尺寸，窗口变窄也不收缩（flex-shrink: 0），溢出由窗口裁剪。
+                  // 无视频的占位面板保持可收缩（basis 撑开、shrink 挤压）；移动端走 styles.css 的
+                  // 固定高度预览布局（@media 覆盖），不传内联尺寸
+                  style={
+                    videoDetached || isNarrowViewport
+                      ? undefined
+                      : videoMedia
+                        ? { flexBasis: `${videoLayout.panelWidth}px`, flexShrink: 0 }
+                        : { flexBasis: `${videoLayout.panelWidth}px` }
+                  }
+                />,
+                previewHostRef.current,
+              )}
+            </div>
           )}
           <div
             className="right-workspace"
@@ -2664,9 +3766,11 @@ export function App() {
                 currentTimeMs={audioTimeMs}
                 videoTimeMs={videoMedia ? videoTimeMs : null}
                 selectedCue={selectedCue}
+                selectedCues={selectedCues}
                 cues={core.document.cues}
                 keyframes={activeKeyframes}
                 fps={frameRate.isLoaded() ? frameRate.fps() : DEFAULT_FPS}
+                frameRate={frameRate}
                 karaokeMode={audioOptions.karaoke}
                 view={audioView}
                 options={audioOptions}
@@ -2680,6 +3784,7 @@ export function App() {
                 mediaAction={audioAction}
                 scrollToActiveLine={audioScrollRequest.seq}
                 scrollToActiveLineMode={audioScrollRequest.mode}
+                scrollBy={audioScrollBy}
                 onDurationChange={setAudioDurationMs}
                 onCommand={executeCommand}
                 onPlaybackGainChange={setPlaybackGain}
@@ -2793,6 +3898,8 @@ export function App() {
           }}
           onCommand={executeCommand}
           isCommandEnabled={isCommandEnabled}
+          scrollRestore={gridScrollRestore}
+          onScrollRowChange={setGridScrollRow}
         />
       </div>
       {logWindowOpen && <LogPanel onClose={() => setLogWindowOpen(false)} />}
@@ -3048,6 +4155,78 @@ export function App() {
         />
       )}
       {dialog === 'about' && <AboutDialog onClose={() => setDialog(null)} />}
+      {choicePrompt && <ChoicePromptDialog {...choicePrompt} />}
+      {dialog === 'charset' && pendingOpen && (
+        <CharsetDialog
+          encoding={pendingOpen.encoding ?? detectEncoding(pendingOpen.bytes).encoding}
+          onApply={(encoding) => {
+            const pending = pendingOpen
+            setPendingOpen(null)
+            setDialog(null)
+            void beginSubtitleLoad(pending.file, pending.bytes, pending.format, encoding)
+          }}
+          onClose={() => {
+            setPendingOpen(null)
+            setDialog(null)
+          }}
+        />
+      )}
+      {dialog === 'text-import' && pendingOpen && (
+        <TextImportDialog
+          actorSeparator={getOptionString('Tool/Import/Text/Actor Separator')}
+          commentStarter={getOptionString('Tool/Import/Text/Comment Starter')}
+          includeBlank={getOptionBool('Tool/Import/Text/Include Blank')}
+          onApply={(options) => {
+            setOption('Tool/Import/Text/Actor Separator', options.actorSeparator)
+            setOption('Tool/Import/Text/Comment Starter', options.commentStarter)
+            setOption('Tool/Import/Text/Include Blank', options.includeBlank)
+            const pending = pendingOpen
+            setPendingOpen(null)
+            setDialog(null)
+            if (pending.encoding) {
+              void finishOpenSubtitle(
+                pending.file,
+                pending.bytes,
+                pending.encoding,
+                pending.format,
+                options,
+              )
+            }
+          }}
+          onClose={() => {
+            setPendingOpen(null)
+            setDialog(null)
+          }}
+        />
+      )}
+      {dialog === 'paste-over' && pasteOver && (
+        <PasteOverDialog
+          lineCount={pasteOver.lines.length}
+          targetCount={pasteOver.targetIds.length}
+          onApply={(fields) => {
+            const target = pasteOver
+            setPasteOver(null)
+            setDialog(null)
+            void applyPasteOver(target, fields)
+          }}
+          onClose={() => {
+            setPasteOver(null)
+            setDialog(null)
+          }}
+        />
+      )}
+      {dialog === 'aspect-ratio' && (
+        <AspectRatioDialog
+          initial={
+            aspectOverride ??
+            (previewIntrinsic.width > 0
+              ? previewIntrinsic.width / Math.max(1, previewIntrinsic.height)
+              : null)
+          }
+          onApply={(ratio) => setAspectOverride(ratio)}
+          onClose={() => setDialog(null)}
+        />
+      )}
       {dialog === 'video-details' && videoMedia && (
         <VideoDetailsDialog
           media={videoMedia}
@@ -3097,7 +4276,41 @@ export function App() {
           onCommand={executeCommand}
         />
       )}
-      {dialog === 'attachments' && <AttachmentDialog onClose={() => setDialog(null)} />}
+      {dialog === 'attachments' && core && (
+        <AttachmentDialog
+          attachments={core.document.attachments}
+          onAdd={(files, group) => void addAttachments(files, group)}
+          onDelete={(attachments) =>
+            void apply(
+              attachments.map((attachment) => ({
+                type: 'deleteAttachment' as const,
+                name: attachment.name,
+                group: attachment.group,
+              })),
+              'remove attachment',
+            )
+          }
+          onExtract={(attachments) => {
+            for (const attachment of attachments) {
+              // 去掉目录成分，避免存档内的路径穿越到下载名
+              const name = attachmentFileName(attachment).split(/[\\/]/).pop() || 'attachment'
+              const dot = name.lastIndexOf('.')
+              const extension = dot > 0 ? name.slice(dot) : ''
+              void host.saveFile(
+                name,
+                attachmentBytes(attachment),
+                extension
+                  ? {
+                      description: 'All Supported Formats',
+                      accept: { 'application/octet-stream': [extension] },
+                    }
+                  : undefined,
+              )
+            }
+          }}
+          onClose={() => setDialog(null)}
+        />
+      )}
       {dialog === 'font-collector' && core && (
         <FontCollectorDialog
           styles={core.document.styles}

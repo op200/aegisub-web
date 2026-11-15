@@ -2054,7 +2054,8 @@ export function PreviewPane({
   // 当前接线的视频元素（wcActive 切换/媒体更换会替换元素，替换时拆掉旧节点路由）
   const gainVideoRef = useRef<HTMLMediaElement | null>(null)
   // 实际生效的解码通道：状态栏覆盖（手动切换）优先，否则自动（<video> onError）
-  const wcActive = decoderOverride ?? wcMode
+  // 多轨选择：<video> 无法切换轨道，指定了视频流索引时强制 WebCodecs 解码
+  const wcActive = decoderOverride ?? (media?.videoStreamIndex !== undefined ? true : wcMode)
   // 状态栏解码通道指示（原生 / WebCodecs；无视频为 null）
   const onPlaybackModeChangeRef = useRef(onPlaybackModeChange)
   useEffect(() => {
@@ -3426,24 +3427,29 @@ export function PreviewPane({
     }
     void ensureFile().then((file) => {
       if (cancelled || !file) return
-      void WebCodecsVideoSource.create(file, canvas, {
-        onDurationChange: (value) => {
-          // oxlint-disable-next-line react/set-state-in-effect
-          setDurationMs(value)
-          onDurationChange(value)
+      void WebCodecsVideoSource.create(
+        file,
+        canvas,
+        {
+          onDurationChange: (value) => {
+            // oxlint-disable-next-line react/set-state-in-effect
+            setDurationMs(value)
+            onDurationChange(value)
+          },
+          onIntrinsicSize: (width, height) => onIntrinsicSizeChange(width, height),
+          onFrameRate: (fps) => {
+            if (fps >= 5 && fps <= 240) onDetectedFpsRef.current(fps)
+          },
+          onPlaying: setPlaying,
+          onTimeUpdate: onTimeChange,
+          onKeyframes: (list) => onKeyframesChangeRef.current?.(list),
+          onError: (message) => {
+            logError('video', `WebCodecs 解码器错误：${message}`)
+            setWcError(message)
+          },
         },
-        onIntrinsicSize: (width, height) => onIntrinsicSizeChange(width, height),
-        onFrameRate: (fps) => {
-          if (fps >= 5 && fps <= 240) onDetectedFpsRef.current(fps)
-        },
-        onPlaying: setPlaying,
-        onTimeUpdate: onTimeChange,
-        onKeyframes: (list) => onKeyframesChangeRef.current?.(list),
-        onError: (message) => {
-          logError('video', `WebCodecs 解码器错误：${message}`)
-          setWcError(message)
-        },
-      })
+        media.videoStreamIndex,
+      )
         .then((opened) => {
           if (cancelled) {
             opened.source?.destroy()
@@ -3655,7 +3661,14 @@ export function PreviewPane({
     if (!mediaAction.sequence) return
     const video = videoRef.current
     const wcSource = wcSourceRef.current
+    // video_controller.cpp JumpToFrame：按精确帧时间步进（支持 VFR timecodes）
     const frame = 1000 / 24
+    const stepFrameTo = (target: number) =>
+      actionSeek(frameRate.isLoaded() ? frameRate.timeAtFrame(target, 'exact') : target * frame)
+    const currentFrameNumber = () =>
+      frameRate.isLoaded()
+        ? frameRate.frameAtTime(currentTime())
+        : Math.max(0, Math.round(currentTime() / frame))
     // video_context 命令（video_display.cpp）：命令层/热键经 mediaAction 送到预览区，
     // 与右键菜单的本地路径共用同一实现
     if (mediaAction.type.startsWith('video/frame/')) {
@@ -3763,10 +3776,10 @@ export function PreviewPane({
         else if (video) video.pause()
         break
       case 'frame-prev':
-        actionSeek(currentTime() - frame)
+        if (currentFrameNumber() > 0) stepFrameTo(currentFrameNumber() - 1)
         break
       case 'frame-next':
-        actionSeek(currentTime() + frame)
+        if (currentFrameNumber() < frameCount - 1) stepFrameTo(currentFrameNumber() + 1)
         break
       case 'start':
         actionSeek(0)
@@ -3780,7 +3793,7 @@ export function PreviewPane({
     // saveFrame/copyFrame/copyCoordinates 每轮重建，同理不入依赖
     // oxlint-disable-next-line react/exhaustive-effect-dependencies
     // oxlint-disable-next-line react-hooks/exhaustive-deps
-  }, [durationMs, media, mediaAction, onTimeChange, requestVideoSeek])
+  }, [durationMs, frameCount, frameRate, media, mediaAction, onTimeChange, requestVideoSeek])
 
   const hitTest = (x: number, y: number): HitBox | null => {
     const stage = stageRef.current

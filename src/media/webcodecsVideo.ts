@@ -7,7 +7,13 @@
  */
 import type { WebAVStream } from 'web-demuxer'
 
-import { AVSEEK_FLAG_BACKWARD, openDemuxer, parseFraction, type DemuxProbe } from './demux'
+import {
+  AVSEEK_FLAG_BACKWARD,
+  openDemuxer,
+  parseFraction,
+  readEncodedChunks,
+  type DemuxProbe,
+} from './demux'
 import { parseContainerColorspace, resolveDecoderColorSpace } from './videoColor'
 
 export interface WebCodecsVideoEvents {
@@ -112,10 +118,18 @@ export class WebCodecsVideoSource {
   private keyframeMs: number[] = []
   private keyframeReported = 0
 
-  private constructor(probe: DemuxProbe, canvas: HTMLCanvasElement, events: WebCodecsVideoEvents) {
+  private videoStreamIndex?: number
+
+  private constructor(
+    probe: DemuxProbe,
+    canvas: HTMLCanvasElement,
+    events: WebCodecsVideoEvents,
+    videoStreamIndex?: number,
+  ) {
     this.probe = probe
     this.canvas = canvas
     this.events = events
+    this.videoStreamIndex = videoStreamIndex
     const context = canvas.getContext('2d')
     if (!context) throw new Error('Canvas 2D is unavailable')
     this.context = context
@@ -138,6 +152,7 @@ export class WebCodecsVideoSource {
     file: File,
     canvas: HTMLCanvasElement,
     events: WebCodecsVideoEvents,
+    videoStreamIndex?: number,
   ): Promise<WebCodecsVideoOpenResult> {
     if (typeof VideoDecoder === 'undefined' || typeof VideoFrame === 'undefined') {
       return {
@@ -147,7 +162,7 @@ export class WebCodecsVideoSource {
     }
     let probe: DemuxProbe
     try {
-      probe = await openDemuxer(file)
+      probe = await openDemuxer(file, { videoStreamIndex })
     } catch (error) {
       return {
         source: null,
@@ -159,7 +174,10 @@ export class WebCodecsVideoSource {
         probe.demuxer.destroy()
         return { source: null, reason: '容器中没有视频轨' }
       }
-      const config = await probe.demuxer.getDecoderConfig('video')
+      const config =
+        videoStreamIndex === undefined
+          ? await probe.demuxer.getDecoderConfig('video')
+          : probe.demuxer.genDecoderConfig('video', probe.videoStream)
       if (!config || !config.codec) {
         probe.demuxer.destroy()
         return { source: null, reason: '无法获取视频解码配置' }
@@ -173,7 +191,7 @@ export class WebCodecsVideoSource {
           reason: `此浏览器不支持解码 ${config.codec}（Firefox 的 WebCodecs 未开放 HEVC，即使原生 <video> 可播；10bit H.264 多数浏览器也不支持）`,
         }
       }
-      const source = new WebCodecsVideoSource(probe, canvas, events)
+      const source = new WebCodecsVideoSource(probe, canvas, events, videoStreamIndex)
       await source.open(decoderConfig, probe)
       return { source, reason: '' }
     } catch (error) {
@@ -406,12 +424,16 @@ export class WebCodecsVideoSource {
         READER_CANCEL_TIMEOUT_MS,
       )
     }
-    const stream = this.probe.demuxer.read(
-      'video',
-      Math.max(0, startSec),
-      undefined,
-      AVSEEK_FLAG_BACKWARD,
-    )
+    const stream =
+      this.videoStreamIndex === undefined
+        ? this.probe.demuxer.read('video', Math.max(0, startSec), undefined, AVSEEK_FLAG_BACKWARD)
+        : (readEncodedChunks(
+            this.probe.demuxer,
+            'video',
+            startSec,
+            this.videoStreamIndex,
+            AVSEEK_FLAG_BACKWARD,
+          ) as ReadableStream<EncodedVideoChunk>)
     this.reader = stream.getReader()
     this.streamDone = false
   }

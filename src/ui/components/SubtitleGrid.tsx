@@ -34,6 +34,10 @@ interface SubtitleGridProps {
   onSetActive: (id: string) => void
   onCommand: (id: string) => void
   isCommandEnabled: (id: string) => boolean
+  /** 打开文档时恢复 Project Garbage 的滚动位置（token 变化触发） */
+  scrollRestore?: { row: number; token: number }
+  /** 当前首行行号（Project Garbage 保存用） */
+  onScrollRowChange?: (row: number) => void
 }
 
 interface GridColumnDef {
@@ -504,6 +508,8 @@ export function SubtitleGrid({
   onSetActive,
   onCommand,
   isCommandEnabled,
+  scrollRestore,
+  onScrollRowChange,
 }: SubtitleGridProps) {
   const viewportRef = useRef<HTMLDivElement>(null)
   // 外层容器（承接滚轮事件；纯 JS 模式下需非 passive 监听以 preventDefault 阻止外层滚动）
@@ -579,6 +585,13 @@ export function SubtitleGrid({
   heightRef.current = height
   const cuesLengthRef = useRef(cues.length)
   cuesLengthRef.current = cues.length
+  const onScrollRowChangeRef = useRef(onScrollRowChange)
+  onScrollRowChangeRef.current = onScrollRowChange
+
+  const notifyScrollRow = useCallback((value: number) => {
+    const rowHeightValue = rowHeightRef.current || 1
+    onScrollRowChangeRef.current?.(Math.max(0, Math.round(value / rowHeightValue)))
+  }, [])
 
   /** 当前滚动偏移（像素）：JS 模式读真源，native 模式读视口（滚动事件可能晚一拍） */
   const getScrollTop = useCallback(
@@ -591,18 +604,30 @@ export function SubtitleGrid({
 
   /** 统一滚动入口：钳制到 [0, (rows-1)*rowHeight]（源码 yPos 上限 rows-1），
       JS 模式写入真源并重渲染，native 模式写入视口（scroll 事件回填状态） */
-  const setScroll = useCallback((value: number) => {
-    const max = Math.max(0, (cuesLengthRef.current - 1) * rowHeightRef.current)
-    const clamped = Math.max(0, Math.min(max, value))
-    if (nativeScrollRef.current) {
-      const viewport = viewportRef.current
-      if (viewport && viewport.scrollTop !== clamped) viewport.scrollTop = clamped
-      return
-    }
-    if (clamped === scrollTopRef.current) return
-    scrollTopRef.current = clamped
-    setScrollTop(clamped)
-  }, [])
+  const setScroll = useCallback(
+    (value: number) => {
+      const max = Math.max(0, (cuesLengthRef.current - 1) * rowHeightRef.current)
+      const clamped = Math.max(0, Math.min(max, value))
+      if (nativeScrollRef.current) {
+        const viewport = viewportRef.current
+        if (viewport && viewport.scrollTop !== clamped) viewport.scrollTop = clamped
+        notifyScrollRow(clamped)
+        return
+      }
+      if (clamped === scrollTopRef.current) return
+      scrollTopRef.current = clamped
+      setScrollTop(clamped)
+      notifyScrollRow(clamped)
+    },
+    [notifyScrollRow],
+  )
+
+  // 打开文档后恢复 Project Garbage 的滚动位置（LoadSubtitles 的 scroll_position）
+  useEffect(() => {
+    if (!scrollRestore) return
+    setScroll(scrollRestore.row * rowHeightRef.current)
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- 仅在有新 token 时恢复，行高变化不重放
+  }, [scrollRestore?.token, setScroll])
 
   // 切换滚动实现时迁移当前偏移：JS 模式把偏移从原生视口搬到真源（并清零原生滚动），
   // native 模式从真源恢复到原生视口
@@ -1022,6 +1047,7 @@ export function SubtitleGrid({
               if (!nativeScroll) return
               scrollTopRef.current = event.currentTarget.scrollTop
               setScrollTop(event.currentTarget.scrollTop)
+              notifyScrollRow(event.currentTarget.scrollTop)
             }}
             role="grid"
             aria-rowcount={cues.length}

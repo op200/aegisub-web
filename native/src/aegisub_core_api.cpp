@@ -24,7 +24,9 @@
 #include "ass_info.h"
 
 #include <libaegisub/ass/time.h>
+#include <libaegisub/ass/uuencode.h>
 #include <libaegisub/cajun/elements.h>
+#include <libaegisub/cajun/reader.h>
 #include <libaegisub/cajun/writer.h>
 #include <libaegisub/json.h>
 #include <libaegisub/of_type_adaptor.h>
@@ -60,6 +62,12 @@ struct UndoEntry {
 	int text_sel_end = 0;
 };
 
+/// 未知段（不参与 AssFile 模型，但与 TS parseAss 一致地保存/回写）
+struct RawSection {
+	std::string name;
+	std::vector<std::string> lines;
+};
+
 struct AegisubDocument {
 	std::unique_ptr<AssFile> file;
 	std::vector<UndoEntry> undo_stack;
@@ -67,6 +75,8 @@ struct AegisubDocument {
 	int revision = 0;
 	std::string format = "ass";
 	std::string source_name = "untitled.ass";
+	/// [Fonts]/[Graphics]/... 之外的未知段原样保留（Web 侧要求不丢未知数据）
+	std::vector<RawSection> passthrough_sections;
 	// --- 撤销栈语义对齐 subs_controller.cpp ---
 	// 栈结构：栈底为初始状态、栈顶为当前状态（源码 OnCommit 在提交后快照入栈）；
 	// Undo 要求栈内 >1 个条目（subs_controller.cpp:undo_stack.size() <= 1 直接返回）。
@@ -78,9 +88,54 @@ std::string g_last_error;
 
 void set_error(std::string const& msg) { g_last_error = msg; }
 
+std::vector<std::string> split_lines(std::string_view text);
+
 bool is_srt_name(std::string const& name) {
 	return name.size() >= 4 &&
 	       (name.compare(name.size() - 4, 4, ".srt") == 0 || name.compare(name.size() - 4, 4, ".SRT") == 0);
+}
+
+bool is_ssa_name(std::string const& name) {
+	return name.size() >= 4 &&
+	       (name.compare(name.size() - 4, 4, ".ssa") == 0 || name.compare(name.size() - 4, 4, ".SSA") == 0);
+}
+
+std::string trim_ascii(std::string const& value) {
+	size_t begin = 0;
+	while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) ++begin;
+	size_t end = value.size();
+	while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+	return value.substr(begin, end - begin);
+}
+
+bool is_known_section(std::string const& name) {
+	static const char* known[] = {
+		"Script Info", "V4+ Styles", "V4 Styles", "Events", "Fonts", "Graphics",
+		"Aegisub Extradata", "Aegisub Project Garbage"
+	};
+	for (auto const* item : known)
+		if (name == item) return true;
+	return false;
+}
+
+/// 扫描未知段（ass_parser.cpp 会丢弃，Web 侧选择原样保留）
+std::vector<RawSection> scan_unknown_sections(std::string_view text) {
+	std::vector<RawSection> sections;
+	RawSection current;
+	bool active = false;
+	for (auto const& line : split_lines(text)) {
+		std::string trimmed = trim_ascii(line);
+		if (trimmed.size() >= 2 && trimmed.front() == '[' && trimmed.back() == ']') {
+			if (active) sections.push_back(std::move(current));
+			std::string name = trimmed.substr(1, trimmed.size() - 2);
+			active = !is_known_section(name);
+			current = RawSection{name, {}};
+			continue;
+		}
+		if (active) current.lines.push_back(line);
+	}
+	if (active) sections.push_back(std::move(current));
+	return sections;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +224,13 @@ std::string obj_get(json::UnknownElement const& el, char const* key) {
 	return json_str(it->second);
 }
 
+/// Object 重载：避免 json::UnknownElement(Object) 按值形参复制 Object（UnknownElement 仅可 move）
+std::string obj_get(json::Object const& obj, char const* key) {
+	auto it = obj.find(key);
+	if (it == obj.end()) return "";
+	return json_str(it->second);
+}
+
 int obj_int(json::UnknownElement const& el, char const* key) {
 	json::Object const* obj = as_object(el);
 	if (!obj) return 0;
@@ -192,6 +254,8 @@ int obj_int(json::UnknownElement const& el, char const* key) {
 /// 重建——该构造函数不重发 Id。这里等价处理：拷贝后按位置把 Id 还原。
 std::unique_ptr<AssFile> clone_file(AssFile const& src) {
 	auto out = std::make_unique<AssFile>(src);
+	// AssFile 拷贝构造不含 ProjectProperties（上游由 ProjectContext 单独持有），撤销快照需自行复制
+	out->Properties = src.Properties;
 	auto src_it = src.Events.begin();
 	auto dst_it = out->Events.begin();
 	for (; src_it != src.Events.end() && dst_it != out->Events.end(); ++src_it, ++dst_it)
@@ -304,6 +368,122 @@ bool parse_srt(AegisubDocument& doc, std::string_view text) {
 }
 
 // ---------------------------------------------------------------------------
+// base64 / 附件
+// ---------------------------------------------------------------------------
+
+std::string base64_encode(const unsigned char* data, size_t size) {
+	static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	std::string out;
+	out.reserve((size + 2) / 3 * 4);
+	for (size_t i = 0; i < size; i += 3) {
+		unsigned a = data[i];
+		unsigned b = i + 1 < size ? data[i + 1] : 0;
+		unsigned c = i + 2 < size ? data[i + 2] : 0;
+		out += table[a >> 2];
+		out += table[((a & 0x03) << 4) | (b >> 4)];
+		out += i + 1 < size ? table[((b & 0x0f) << 2) | (c >> 6)] : '=';
+		out += i + 2 < size ? table[c & 0x3f] : '=';
+	}
+	return out;
+}
+
+std::vector<unsigned char> base64_decode(std::string const& input) {
+	auto value = [](char c) -> int {
+		if (c >= 'A' && c <= 'Z') return c - 'A';
+		if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+		if (c >= '0' && c <= '9') return c - '0' + 52;
+		if (c == '+') return 62;
+		if (c == '/') return 63;
+		return -1;
+	};
+	std::vector<unsigned char> out;
+	int buffer = 0;
+	int bits = 0;
+	for (char c : input) {
+		int digit = value(c);
+		if (digit < 0) continue;
+		buffer = (buffer << 6) | digit;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out.push_back(static_cast<unsigned char>((buffer >> bits) & 0xff));
+		}
+	}
+	return out;
+}
+
+std::vector<char> attachment_raw(AssAttachment const& attachment) {
+	std::string const& data = attachment.GetEntryData();
+	size_t newline = data.find('\n');
+	std::string body = newline == std::string::npos ? std::string() : data.substr(newline + 1);
+	return agi::ass::UUDecode(body);
+}
+
+std::string attachment_entry_data(std::string const& name, bool font, std::vector<unsigned char> const& raw) {
+	std::string data = font ? "fontname: " + name : "filename: " + name;
+	data += "\r\n";
+	std::string body(raw.begin(), raw.end());
+	data += agi::ass::UUEncode(body);
+	return data;
+}
+
+bool same_attachment(AssAttachment const& attachment, std::string const& name, bool font) {
+	std::string left = attachment.GetFileName(true);
+	std::string right = name;
+	std::transform(left.begin(), left.end(), left.begin(), [](unsigned char c) { return std::tolower(c); });
+	std::transform(right.begin(), right.end(), right.begin(), [](unsigned char c) { return std::tolower(c); });
+	bool is_font = attachment.Group() == AssEntryGroup::FONT;
+	return left == right && is_font == font;
+}
+
+json::Array attachments_to_json(AssFile const& file) {
+	json::Array items;
+	for (auto const& attachment : file.Attachments) {
+		json::Object item;
+		item["name"] = attachment.GetFileName(true);
+		item["group"] = attachment.Group() == AssEntryGroup::FONT ? "font" : "graphic";
+		auto raw = attachment_raw(attachment);
+		item["data"] = base64_encode(reinterpret_cast<unsigned char const*>(raw.data()), raw.size());
+		items.push_back(std::move(item));
+	}
+	return items;
+}
+
+json::Array extradata_to_json(AssFile const& file) {
+	json::Array items;
+	for (auto const& entry : file.Extradata) {
+		json::Object item;
+		item["id"] = static_cast<int64_t>(entry.id);
+		item["key"] = entry.key;
+		item["value"] = entry.value;
+		items.push_back(std::move(item));
+	}
+	return items;
+}
+
+json::Object properties_to_json(ProjectProperties const& properties) {
+	json::Object out;
+	out["automationScripts"] = properties.automation_scripts;
+	out["exportFilters"] = properties.export_filters;
+	out["exportEncoding"] = properties.export_encoding;
+	out["styleStorage"] = properties.style_storage;
+	out["audioFile"] = properties.audio_file;
+	out["videoFile"] = properties.video_file;
+	out["timecodesFile"] = properties.timecodes_file;
+	out["keyframesFile"] = properties.keyframes_file;
+	json::Object settings;
+	for (auto const& [key, value] : properties.automation_settings) settings[key] = value;
+	out["automationSettings"] = std::move(settings);
+	out["videoZoom"] = properties.video_zoom;
+	out["arValue"] = properties.ar_value;
+	out["scrollPosition"] = static_cast<int64_t>(properties.scroll_position);
+	out["activeRow"] = static_cast<int64_t>(properties.active_row);
+	out["arMode"] = static_cast<int64_t>(properties.ar_mode);
+	out["videoPosition"] = static_cast<int64_t>(properties.video_position);
+	return out;
+}
+
+// ---------------------------------------------------------------------------
 // JSON 投影（对齐 TS 的 SubtitleStyle / SubtitleCue / SubtitleDocument）
 // ---------------------------------------------------------------------------
 
@@ -408,6 +588,16 @@ json::Object document_to_json(AegisubDocument const& doc) {
 	json::Array cues;
 	for (auto const& cue : doc.file->Events) cues.push_back(cue_to_json(cue));
 
+	json::Array passthrough;
+	for (auto const& section : doc.passthrough_sections) {
+		json::Object entry;
+		entry["name"] = section.name;
+		json::Array lines;
+		for (auto const& line : section.lines) lines.push_back(line);
+		entry["lines"] = std::move(lines);
+		passthrough.push_back(std::move(entry));
+	}
+
 	json::Object document;
 	document["format"] = doc.format;
 	document["sourceName"] = doc.source_name;
@@ -415,8 +605,10 @@ json::Object document_to_json(AegisubDocument const& doc) {
 	document["scriptInfo"] = std::move(script_info);
 	document["styles"] = std::move(styles);
 	document["cues"] = std::move(cues);
-	document["passthroughSections"] = json::Array();
-
+	document["passthroughSections"] = std::move(passthrough);
+	document["attachments"] = attachments_to_json(*doc.file);
+	document["extradata"] = extradata_to_json(*doc.file);
+	document["properties"] = properties_to_json(doc.file->Properties);
 	json::Object state;
 	state["document"] = std::move(document);
 	// 栈底为初始状态：只有存在可撤销提交（>1 条目）时才可撤销
@@ -742,6 +934,67 @@ void apply_update_script_info(AegisubDocument& doc, json::UnknownElement const& 
 	} catch (...) {}
 }
 
+void apply_add_attachment(AegisubDocument& doc, json::UnknownElement const& cmd) {
+	try {
+		json::Object const& cmd_obj = static_cast<json::Object const&>(cmd);
+		auto item_it = cmd_obj.find("attachment");
+		if (item_it == cmd_obj.end()) return;
+		json::Object const& item = static_cast<json::Object const&>(item_it->second);
+		std::string name = obj_get(item, "name");
+		if (name.empty()) return;
+		bool font = obj_get(item, "group") == "font";
+		auto raw = base64_decode(obj_get(item, "data"));
+		std::string data = attachment_entry_data(name, font, raw);
+		AssEntryGroup group = font ? AssEntryGroup::FONT : AssEntryGroup::GRAPHIC;
+		for (auto& attachment : doc.file->Attachments) {
+			if (same_attachment(attachment, name, font)) {
+				attachment = AssAttachment(data, group);
+				return;
+			}
+		}
+		doc.file->Attachments.emplace_back(data, group);
+	} catch (...) {}
+}
+
+void apply_delete_attachment(AegisubDocument& doc, json::UnknownElement const& cmd) {
+	std::string name = obj_get(cmd, "name");
+	bool font = obj_get(cmd, "group") == "font";
+	auto& attachments = doc.file->Attachments;
+	attachments.erase(
+		std::remove_if(attachments.begin(), attachments.end(), [&](AssAttachment const& attachment) {
+			return same_attachment(attachment, name, font);
+		}),
+		attachments.end());
+}
+
+void merge_properties_object(ProjectProperties& p, json::Object const& patch) {
+	for (auto const& [key, value] : patch) {
+		if (key == "automationScripts") p.automation_scripts = json_str(value);
+		else if (key == "exportFilters") p.export_filters = json_str(value);
+		else if (key == "exportEncoding") p.export_encoding = json_str(value);
+		else if (key == "styleStorage") p.style_storage = json_str(value);
+		else if (key == "audioFile") p.audio_file = json_str(value);
+		else if (key == "videoFile") p.video_file = json_str(value);
+		else if (key == "timecodesFile") p.timecodes_file = json_str(value);
+		else if (key == "keyframesFile") p.keyframes_file = json_str(value);
+		else if (key == "videoZoom") p.video_zoom = json_double(value);
+		else if (key == "arValue") p.ar_value = json_double(value);
+		else if (key == "scrollPosition") p.scroll_position = json_int(value);
+		else if (key == "activeRow") p.active_row = json_int(value);
+		else if (key == "arMode") p.ar_mode = json_int(value);
+		else if (key == "videoPosition") p.video_position = json_int(value);
+	}
+}
+
+void apply_update_properties(AegisubDocument& doc, json::UnknownElement const& cmd) {
+	try {
+		json::Object const& cmd_obj = static_cast<json::Object const&>(cmd);
+		auto patch_it = cmd_obj.find("patch");
+		if (patch_it == cmd_obj.end()) return;
+		merge_properties_object(doc.file->Properties, static_cast<json::Object const&>(patch_it->second));
+	} catch (...) {}
+}
+
 void apply_sort_cues(AegisubDocument& doc) {
 	// boost::intrusive list 原地排序（避免 clear+重建造成 use-after-free）
 	doc.file->Events.sort([](AssDialogue const& a, AssDialogue const& b) {
@@ -850,6 +1103,9 @@ void apply_commands(AegisubDocument& doc, json::Array const& commands) {
 		else if (type == "deleteStyle") apply_delete_style(doc, cmd);
 		else if (type == "reorderStyles") apply_reorder_styles(doc, cmd);
 		else if (type == "updateScriptInfo") apply_update_script_info(doc, cmd);
+		else if (type == "addAttachment") apply_add_attachment(doc, cmd);
+		else if (type == "deleteAttachment") apply_delete_attachment(doc, cmd);
+		else if (type == "updateProperties") apply_update_properties(doc, cmd);
 		else if (type == "sortCues") apply_sort_cues(doc);
 		else if (type == "sortCuesBy") apply_sort_cues_by(doc, cmd);
 		else if (type == "replaceDocument") apply_replace_document(doc, cmd);
@@ -1008,16 +1264,104 @@ std::string apply_replacements(std::string const& src, std::vector<SearchMatch> 
 // 导出
 // ---------------------------------------------------------------------------
 
-std::string export_ass(AegisubDocument const& doc) {
+std::string inline_string_encode(std::string const& input) {
+	std::string out;
+	out.reserve(input.size());
+	static const char* hex = "0123456789ABCDEF";
+	for (unsigned char c : input) {
+		if (c <= 0x1f || c == '#' || c == ',' || c == ':' || c == '|') {
+			out += '#';
+			out += hex[(c >> 4) & 0x0f];
+			out += hex[c & 0x0f];
+		} else {
+			out += static_cast<char>(c);
+		}
+	}
+	return out;
+}
+
+/// AssSubtitleFormat::Write(ProjectProperties) 的文本行（不含 section 头）
+std::vector<std::string> project_garbage_lines(ProjectProperties const& p, bool save_ui_state) {
+	std::vector<std::string> lines;
+	auto add = [&](char const* key, std::string const& value) {
+		if (!value.empty()) lines.push_back(std::string(key) + ": " + value);
+	};
+	auto add_int = [&](char const* key, int value) {
+		if (value != 0) lines.push_back(std::string(key) + ": " + std::to_string(value));
+	};
+	add("Automation Scripts", p.automation_scripts);
+	add("Export Filters", p.export_filters);
+	add("Export Encoding", p.export_encoding);
+	add("Last Style Storage", p.style_storage);
+	add("Audio File", p.audio_file);
+	add("Video File", p.video_file);
+	add("Timecodes File", p.timecodes_file);
+	add("Keyframes File", p.keyframes_file);
+	add_int("Video AR Mode", p.ar_mode);
+	if (p.ar_value != 0) lines.push_back("Video AR Value: " + std::to_string(p.ar_value));
+	if (save_ui_state) {
+		if (p.video_zoom != 0) lines.push_back("Video Zoom Percent: " + std::to_string(static_cast<int>(p.video_zoom)));
+		add_int("Scroll Position", p.scroll_position);
+		add_int("Active Line", p.active_row);
+		add_int("Video Position", p.video_position);
+	}
+	return lines;
+}
+
+std::vector<std::string> extradata_lines(AssFile const& file) {
+	std::vector<std::string> lines;
+	for (auto const& entry : file.Extradata) {
+		std::string key = inline_string_encode(entry.key);
+		std::string encoded = inline_string_encode(entry.value);
+		std::string prefix = "Data: " + std::to_string(entry.id) + "," + key + ",";
+		if (4 * entry.value.size() < 3 * encoded.size())
+			lines.push_back(prefix + "u" + agi::ass::UUEncode(entry.value, false));
+		else
+			lines.push_back(prefix + "e" + encoded);
+	}
+	return lines;
+}
+
+std::string export_ass(AegisubDocument const& doc, bool clean, bool save_ui_state, ProjectProperties const* override_properties = nullptr) {
 	std::string out;
 	out += "[Script Info]\r\n";
+	out += "; Script generated by Aegisub\r\n";
+	out += "; https://aegisub.org/\r\n";
 	for (auto const& info : doc.file->Info) out += std::string(info.GetEntryData()) + "\r\n";
+
+	if (!clean) {
+		out += "\r\n[Aegisub Project Garbage]\r\n";
+		auto const& properties = override_properties ? *override_properties : doc.file->Properties;
+		for (auto const& line : project_garbage_lines(properties, save_ui_state))
+			out += line + "\r\n";
+	}
+
 	out += "\r\n[V4+ Styles]\r\n";
 	out += "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\n";
 	for (auto const& style : doc.file->Styles) out += style.GetEntryData() + "\r\n";
+
+	AssEntryGroup last_group = AssEntryGroup::GROUP_MAX;
+	for (auto const& attachment : doc.file->Attachments) {
+		if (attachment.Group() != last_group) {
+			out += attachment.Group() == AssEntryGroup::FONT ? "\r\n[Fonts]\r\n" : "\r\n[Graphics]\r\n";
+			last_group = attachment.Group();
+		}
+		out += attachment.GetEntryData() + "\r\n";
+	}
+
 	out += "\r\n[Events]\r\n";
 	out += "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n";
 	for (auto const& cue : doc.file->Events) out += cue.GetEntryData() + "\r\n";
+
+	if (!clean && !doc.file->Extradata.empty()) {
+		out += "\r\n[Aegisub Extradata]\r\n";
+		for (auto const& line : extradata_lines(*doc.file)) out += line + "\r\n";
+	}
+
+	for (auto const& section : doc.passthrough_sections) {
+		out += "\r\n[" + section.name + "]\r\n";
+		for (auto const& line : section.lines) out += line + "\r\n";
+	}
 	return out;
 }
 
@@ -1031,17 +1375,72 @@ std::string srt_time(int ms) {
 	return buf;
 }
 
+/// SRTSubtitleFormat::ConvertTags 的 C++ 版：b/i/s/u 覆写 → SRT 标签
+std::string srt_convert_tags(std::string const& text) {
+	std::string out;
+	bool bold = false, italic = false, strike = false, underline = false;
+	size_t pos = 0;
+	while (pos < text.size()) {
+		if (text[pos] != '{') {
+			out += text[pos++];
+			continue;
+		}
+		size_t end = text.find('}', pos);
+		if (end == std::string::npos) {
+			out += text.substr(pos);
+			break;
+		}
+		std::string block = text.substr(pos + 1, end - pos - 1);
+		size_t tag_pos = 0;
+		while (tag_pos < block.size()) {
+			size_t start = block.find('\\', tag_pos);
+			if (start == std::string::npos) break;
+			size_t next = block.find('\\', start + 1);
+			std::string tag = block.substr(start + 1, next == std::string::npos ? std::string::npos : next - start - 1);
+			tag_pos = next == std::string::npos ? block.size() : next;
+			if (tag.size() < 2) continue;
+			bool* state = nullptr;
+			char name = tag[0];
+			if (name == 'b') state = &bold;
+			else if (name == 'i') state = &italic;
+			else if (name == 's') state = &strike;
+			else if (name == 'u') state = &underline;
+			if (!state) continue;
+			std::string param = tag.substr(1);
+			auto comma = param.find(',');
+			if (comma != std::string::npos) param = param.substr(0, comma);
+			bool value = !param.empty() && param != "0";
+			std::string name_str(1, name);
+			if (value && !*state) out += "<" + name_str + ">";
+			if (!value && *state) out += "</" + name_str + ">";
+			*state = value;
+		}
+		pos = end + 1;
+	}
+	if (bold) out += "</b>";
+	if (italic) out += "</i>";
+	if (strike) out += "</s>";
+	if (underline) out += "</u>";
+	return out;
+}
+
 std::string export_srt(AegisubDocument const& doc) {
+	std::vector<AssDialogue const*> events;
+	for (auto const& cue : doc.file->Events) events.push_back(&cue);
+	std::stable_sort(events.begin(), events.end(), [](AssDialogue const* a, AssDialogue const* b) {
+		return static_cast<int>(a->Start) < static_cast<int>(b->Start);
+	});
+
 	std::string out;
 	int index = 1;
-	for (auto const& cue : doc.file->Events) {
-		if (cue.Comment) continue;
+	for (auto const* cue : events) {
+		if (cue->Comment || cue->Text.get().empty()) continue;
 		out += std::to_string(index++) + "\r\n";
-		out += srt_time(static_cast<int>(cue.Start)) + " --> " + srt_time(static_cast<int>(cue.End)) + "\r\n";
-		std::string text = cue.GetStrippedText();
+		out += srt_time(static_cast<int>(cue->Start)) + " --> " + srt_time(static_cast<int>(cue->End)) + "\r\n";
+		std::string text = srt_convert_tags(cue->Text.get());
 		std::string clean;
 		for (size_t i = 0; i < text.size(); ++i) {
-			if (text[i] == '\\' && i + 1 < text.size() && (text[i + 1] == 'N' || text[i + 1] == 'n')) {
+			if (text[i] == '\\' && i + 1 < text.size() && std::tolower(static_cast<unsigned char>(text[i + 1])) == 'n') {
 				clean += "\r\n";
 				++i;
 			} else clean += text[i];
@@ -1059,7 +1458,7 @@ std::string export_srt(AegisubDocument const& doc) {
 
 extern "C" {
 
-uint32_t aegisub_core_abi_version(void) { return 6; }
+uint32_t aegisub_core_abi_version(void) { return 7; }
 
 aegisub_document_t aegisub_document_create(void) {
 	try {
@@ -1088,8 +1487,9 @@ int32_t aegisub_document_open(aegisub_document_t document, const uint8_t* data, 
 			return -1;
 		}
 		doc->source_name = source_name ? source_name : "untitled.ass";
-		doc->format = is_srt_name(doc->source_name) ? "srt" : "ass";
+		doc->format = is_srt_name(doc->source_name) ? "srt" : (is_ssa_name(doc->source_name) ? "ssa" : "ass");
 		std::string text(reinterpret_cast<const char*>(data), size);
+		doc->passthrough_sections = scan_unknown_sections(text);
 		doc->file = std::make_unique<AssFile>();
 		if (doc->format == "srt") {
 			if (!parse_srt(*doc, text)) {
@@ -1279,14 +1679,27 @@ int32_t aegisub_document_configure(aegisub_document_t document, int32_t undo_lev
 	return 0;
 }
 
-const uint8_t* aegisub_document_export(aegisub_document_t document, const char* format, size_t* size) {
+const uint8_t* aegisub_document_export(aegisub_document_t document, const char* format, int32_t clean, int32_t save_ui_state, const char* properties_json, size_t* size) {
 	try {
 		auto* doc = reinterpret_cast<AegisubDocument*>(document);
 		if (!doc) {
 			set_error("null document");
 			return nullptr;
 		}
-		std::string out = (format && std::string_view(format) == "srt") ? export_srt(*doc) : export_ass(*doc);
+		ProjectProperties override_properties = doc->file->Properties;
+		bool has_override = false;
+		if (properties_json && *properties_json) {
+			try {
+				std::istringstream stream{std::string(properties_json)};
+				json::UnknownElement parsed;
+				json::Reader::Read(parsed, stream);
+				merge_properties_object(override_properties, static_cast<json::Object const&>(parsed));
+				has_override = true;
+			} catch (...) {}
+		}
+		std::string out = (format && std::string_view(format) == "srt")
+			? export_srt(*doc)
+			: export_ass(*doc, clean != 0, save_ui_state != 0, has_override ? &override_properties : nullptr);
 		uint8_t* buf = static_cast<uint8_t*>(malloc(out.size()));
 		memcpy(buf, out.data(), out.size());
 		if (size) *size = out.size();

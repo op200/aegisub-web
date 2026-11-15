@@ -11,6 +11,7 @@ import {
 } from '../../automation/luaDialog'
 import type { AutomationFilterDisplayInfo } from '../../automation/luaEngine'
 import {
+  getOption,
   getOptionBool,
   getOptionDouble,
   getOptionInt,
@@ -24,6 +25,8 @@ import {
   stepDialogueBlock,
   type DialogueBlock,
 } from '../../core/dialogueBlocks'
+import { CHARSET_CHOICES, charsetName } from '../../core/encoding'
+import { attachmentFileName } from '../../core/format'
 import {
   MATRIX_OPTIONS,
   RESAMPLE_AR_MANUAL,
@@ -39,7 +42,15 @@ import {
 } from '../../core/resample'
 import { formatEditorTime, formatVideoTime, parseEditorTime } from '../../core/time'
 import { processTiming } from '../../core/timingProcessor'
-import type { CoreCommand, SubtitleCue, SubtitleDocument, SubtitleStyle } from '../../core/types'
+import type {
+  CoreCommand,
+  SubtitleAttachment,
+  SubtitleAttachmentGroup,
+  SubtitleCue,
+  SubtitleDocument,
+  SubtitleFormat,
+  SubtitleStyle,
+} from '../../core/types'
 import { Framerate } from '../../core/vfr'
 import type { DummyVideoOptions, MediaSource } from '../../platform/types'
 import {
@@ -1400,45 +1411,306 @@ export function ToolInfoDialog({
   )
 }
 
-export function AttachmentDialog({ onClose }: { onClose: () => void }) {
-  const [files, setFiles] = useState<File[]>([])
+export function AttachmentDialog({
+  attachments,
+  onAdd,
+  onDelete,
+  onExtract,
+  onClose,
+}: {
+  attachments: SubtitleAttachment[]
+  onAdd: (files: File[], group: SubtitleAttachmentGroup) => void
+  onDelete: (attachments: SubtitleAttachment[]) => void
+  onExtract: (attachments: SubtitleAttachment[]) => void
+  onClose: () => void
+}) {
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const fontInput = useRef<HTMLInputElement>(null)
+  const graphicsInput = useRef<HTMLInputElement>(null)
+
+  const toggle = (index: number) => {
+    setSelected((current) => {
+      const next = new Set(current)
+      if (next.has(index)) next.delete(index)
+      else next.add(index)
+      return next
+    })
+  }
+  const selectedAttachments = [...selected]
+    .sort((a, b) => a - b)
+    .map((index) => attachments[index])
+    .filter(Boolean)
+
+  const sizeLabel = (attachment: SubtitleAttachment) => {
+    const padding = attachment.data.endsWith('==') ? 2 : attachment.data.endsWith('=') ? 1 : 0
+    const bytes = Math.max(0, Math.floor((attachment.data.length * 3) / 4) - padding)
+    if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+    return `${Math.max(1, Math.ceil(bytes / 1024))} KB`
+  }
+
   return (
     <Dialog
-      title={tPlain('Attachments')}
+      title={tPlain('Attachment List')}
       onClose={onClose}
-      footer={<button onClick={onClose}>{tPlain('Close')}</button>}
+      className="attachment-dialog"
+      footer={
+        <>
+          <button onClick={() => fontInput.current?.click()}>{tPlain('Attach Font')}</button>
+          <button onClick={() => graphicsInput.current?.click()}>
+            {tPlain('Attach Graphics')}
+          </button>
+          <button
+            disabled={!selectedAttachments.length}
+            onClick={() => onExtract(selectedAttachments)}
+          >
+            {tPlain('Extract')}
+          </button>
+          <button
+            disabled={!selectedAttachments.length}
+            onClick={() => {
+              onDelete(selectedAttachments)
+              setSelected(new Set())
+            }}
+          >
+            {tPlain('Delete')}
+          </button>
+          <button onClick={onClose}>{tPlain('Close')}</button>
+        </>
+      }
     >
+      <input
+        ref={fontInput}
+        type="file"
+        accept=".ttf"
+        multiple
+        hidden
+        onChange={(event) => {
+          onAdd([...(event.target.files ?? [])], 'font')
+          event.target.value = ''
+        }}
+      />
+      <input
+        ref={graphicsInput}
+        type="file"
+        accept=".bmp,.gif,.jpg,.jpeg,.ico,.wmf"
+        multiple
+        hidden
+        onChange={(event) => {
+          onAdd([...(event.target.files ?? [])], 'graphic')
+          event.target.value = ''
+        }}
+      />
       <div className="attachment-dialog-body">
-        <input
-          type="file"
-          multiple
-          onChange={(event) => setFiles([...(event.target.files ?? [])])}
-        />
         <table>
           <thead>
             <tr>
-              <th>{tPlain('Name')}</th>
+              <th />
+              <th>{tPlain('Attachment name')}</th>
               <th>{tPlain('Size')}</th>
               <th>{tPlain('Group')}</th>
             </tr>
           </thead>
           <tbody>
-            {files.map((file) => (
-              <tr key={`${file.name}-${file.size}`}>
-                <td>{file.name}</td>
-                <td>{Math.ceil(file.size / 1024)} KB</td>
+            {attachments.map((attachment, index) => (
+              <tr
+                key={`${attachment.group}-${attachment.name}-${index}`}
+                className={selected.has(index) ? 'selected' : undefined}
+                onClick={() => toggle(index)}
+              >
                 <td>
-                  {/\.(ttf|ttc|otf|pfb)$/i.test(file.name) ? tPlain('Fonts') : tPlain('Graphics')}
+                  <input type="checkbox" checked={selected.has(index)} readOnly />
                 </td>
+                <td>{attachmentFileName(attachment)}</td>
+                <td>{sizeLabel(attachment)}</td>
+                <td>{attachment.group === 'font' ? tPlain('Fonts') : tPlain('Graphics')}</td>
               </tr>
             ))}
+            {!attachments.length && (
+              <tr>
+                <td colSpan={4} className="muted">
+                  {tPlain('No attachments')}
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
+      </div>
+    </Dialog>
+  )
+}
+
+/** dialog_text_import.cpp：纯文本导入选项 */
+export function TextImportDialog({
+  actorSeparator,
+  commentStarter,
+  includeBlank,
+  onApply,
+  onClose,
+}: {
+  actorSeparator: string
+  commentStarter: string
+  includeBlank: boolean
+  onApply: (options: {
+    actorSeparator: string
+    commentStarter: string
+    includeBlank: boolean
+  }) => void
+  onClose: () => void
+}) {
+  const [actor, setActor] = useState(actorSeparator)
+  const [comment, setComment] = useState(commentStarter)
+  const [blank, setBlank] = useState(includeBlank)
+  return (
+    <Dialog
+      title={tPlain('Text import options')}
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            onClick={() =>
+              onApply({ actorSeparator: actor, commentStarter: comment, includeBlank: blank })
+            }
+          >
+            {tPlain('OK')}
+          </button>
+          <button onClick={onClose}>{tPlain('Cancel')}</button>
+        </>
+      }
+    >
+      <div className="form-grid text-import-dialog">
+        <label>
+          <span>{tPlain('Actor separator:')}</span>
+          <input value={actor} onChange={(event) => setActor(event.target.value)} />
+        </label>
+        <label>
+          <span>{tPlain('Comment starter:')}</span>
+          <input value={comment} onChange={(event) => setComment(event.target.value)} />
+        </label>
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={blank}
+            onChange={(event) => setBlank(event.target.checked)}
+          />
+          <span>{tPlain('Include blank lines')}</span>
+        </label>
+      </div>
+    </Dialog>
+  )
+}
+
+/** charset_detect.cpp：无法自动确定编码时的选择框 */
+export function CharsetDialog({
+  encoding,
+  onApply,
+  onClose,
+}: {
+  encoding: string
+  onApply: (encoding: string) => void
+  onClose: () => void
+}) {
+  const [value, setValue] = useState(encoding)
+  const choices = CHARSET_CHOICES.some((choice) => choice.label === value)
+    ? CHARSET_CHOICES
+    : [{ label: value, name: charsetName(value) }, ...CHARSET_CHOICES]
+  return (
+    <Dialog
+      title={tPlain('Choose character set')}
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={() => onApply(value)}>{tPlain('OK')}</button>
+          <button onClick={onClose}>{tPlain('Cancel')}</button>
+        </>
+      }
+    >
+      <div className="form-grid charset-dialog">
         <p>
           {tPlain(
-            'Browser attachment storage is limited to this dialog session. ASS export attachment embedding will be added with the binary document store.',
+            'Aegisub could not narrow down the character set to a single one.\nPlease pick one below:',
           )}
         </p>
+        <select value={value} onChange={(event) => setValue(event.target.value)}>
+          {choices.map((choice) => (
+            <option key={choice.label} value={choice.label}>
+              {choice.name}
+            </option>
+          ))}
+        </select>
+      </div>
+    </Dialog>
+  )
+}
+
+const PASTE_OVER_FIELDS = [
+  'Comment',
+  'Layer',
+  'Start Time',
+  'End Time',
+  'Style',
+  'Actor',
+  'Margin Left',
+  'Margin Right',
+  'Margin Vertical',
+  'Effect',
+  'Text',
+]
+
+/** dialog_paste_over.cpp：选择要覆盖的字段（11 项，缺失时全不勾选） */
+export function PasteOverDialog({
+  lineCount,
+  targetCount,
+  onApply,
+  onClose,
+}: {
+  lineCount: number
+  targetCount: number
+  onApply: (fields: boolean[]) => void
+  onClose: () => void
+}) {
+  const [fields, setFields] = useState<boolean[]>(() => {
+    // dialog_paste_over.cpp L79-81：长度不符时 resize(choices.size(), false)
+    const stored = getOption<boolean[]>('Tool/Paste Lines Over/Fields')
+    const values = stored.slice(0, PASTE_OVER_FIELDS.length)
+    while (values.length < PASTE_OVER_FIELDS.length) values.push(false)
+    return values
+  })
+  return (
+    <Dialog
+      title={tPlain('Paste Lines Over')}
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            onClick={() => {
+              setOption('Tool/Paste Lines Over/Fields', fields)
+              onApply(fields)
+            }}
+          >
+            {tPlain('OK')}
+          </button>
+          <button onClick={onClose}>{tPlain('Cancel')}</button>
+        </>
+      }
+    >
+      <div className="form-grid paste-over-dialog">
+        <p>{tFmt('Paste %1 line(s) over %2 line(s)?', lineCount, targetCount)}</p>
+        <div className="paste-over-fields">
+          {PASTE_OVER_FIELDS.map((label, index) => (
+            <label key={label} className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={fields[index]}
+                onChange={(event) => {
+                  const next = [...fields]
+                  next[index] = event.target.checked
+                  setFields(next)
+                }}
+              />
+              <span>{tPlain(label)}</span>
+            </label>
+          ))}
+        </div>
       </div>
     </Dialog>
   )
@@ -2248,6 +2520,152 @@ export function AboutDialog({ onClose }: { onClose: () => void }) {
       <footer>
         <button onClick={onClose}>{tPlain('Close')}</button>
       </footer>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Custom Aspect Ratio（command/video.cpp video_aspect_ratio）
+// ---------------------------------------------------------------------------
+/** ParseAspectRatio：小数 / 分数（: 或 /） / WxH 分辨率 */
+function parseAspectRatioText(text: string): number {
+  const input = text.trim()
+  for (const separator of [':', '/']) {
+    const index = input.indexOf(separator)
+    if (index < 0) continue
+    const numerator = Number(input.slice(0, index).trim())
+    const denominator = Number(input.slice(index + 1).trim())
+    if (Number.isFinite(numerator) && Number.isFinite(denominator) && denominator !== 0)
+      return numerator / denominator
+  }
+  const resolution = input.split(/[xX]/)
+  if (
+    resolution.length === 2 &&
+    /^\d+$/.test(resolution[0].trim()) &&
+    /^\d+$/.test(resolution[1].trim())
+  ) {
+    const width = Math.trunc(Number(resolution[0]))
+    const height = Math.trunc(Number(resolution[1]))
+    if (width > 0 && height > 0) return width / height
+    throw new Error(tPlain('Width and height must both be positive integers'))
+  }
+  const value = Number(input)
+  if (!Number.isFinite(value)) throw new Error(tPlain('Invalid aspect ratio'))
+  return value
+}
+
+export function AspectRatioDialog({
+  initial,
+  onApply,
+  onClose,
+}: {
+  /** 当前有效宽高比（强制值或视频原始值） */
+  initial: number | null
+  onApply: (ratio: number) => void
+  onClose: () => void
+}) {
+  const [text, setText] = useState(() =>
+    initial ? initial.toFixed(6).replace(/0+$/, '').replace(/\.$/, '') : '',
+  )
+  const [error, setError] = useState('')
+  const apply = () => {
+    try {
+      const ratio = parseAspectRatioText(text)
+      if (!(ratio >= 0.5 && ratio <= 5.0)) {
+        setError(tPlain('Custom aspect ratio must be between 0.5 and 5.0'))
+        return
+      }
+      onApply(ratio)
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+  return (
+    <Dialog
+      title={tPlain('Custom Aspect Ratio')}
+      onClose={onClose}
+      footer={
+        <>
+          <button onClick={onClose}>{tPlain('Cancel')}</button>
+          <button onClick={apply}>{tPlain('OK')}</button>
+        </>
+      }
+    >
+      <div className="dialog-fields">
+        <label>
+          {tPlain('Aspect ratio')}
+          <input
+            autoFocus
+            value={text}
+            placeholder="16:9 / 1.85 / 1920x1080"
+            onChange={(event) => {
+              setText(event.target.value)
+              setError('')
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') apply()
+            }}
+          />
+        </label>
+        {error && <p className="dialog-error">{error}</p>}
+      </div>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 通用选择/提示对话框（wxGetSingleChoiceIndex / wxMessageBox）
+// ---------------------------------------------------------------------------
+export interface ChoicePromptState {
+  title: string
+  message: string
+  /** 空数组 = 纯提示（只有 OK） */
+  choices: string[]
+  initial: number
+  onResolve: (index: number | null) => void
+}
+
+export function ChoicePromptDialog({
+  title,
+  message,
+  choices,
+  initial,
+  onResolve,
+}: ChoicePromptState) {
+  const [selected, setSelected] = useState(initial)
+  const confirm = () => onResolve(choices.length > 0 ? selected : 0)
+  return (
+    <Dialog
+      title={title}
+      onClose={() => onResolve(null)}
+      footer={
+        <>
+          {choices.length > 0 && (
+            <button onClick={() => onResolve(null)}>{tPlain('Cancel')}</button>
+          )}
+          <button onClick={confirm}>{tPlain('OK')}</button>
+        </>
+      }
+    >
+      <div className="dialog-fields">
+        <p style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{message}</p>
+        {choices.length > 0 && (
+          <select
+            autoFocus
+            size={Math.min(10, Math.max(2, choices.length))}
+            value={selected}
+            onChange={(event) => setSelected(Number(event.target.value))}
+            onDoubleClick={confirm}
+          >
+            {choices.map((choice, index) => (
+              <option key={choice} value={index}>
+                {choice}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
     </Dialog>
   )
 }
@@ -3265,11 +3683,24 @@ export function TimingProcessorDialog({
 // Export Subtitles（对应 Aegisub dialog_export.cpp 的 Web 版子集）
 // ---------------------------------------------------------------------------
 export interface ExportOptions {
-  format: 'ass' | 'srt'
+  format: SubtitleFormat
   includeComments: boolean
   /** 勾选的导出过滤器（当前列表序 = 执行顺序，见 AssExporter::AddFilter/Export） */
   filters: AutomationFilterDisplayInfo[]
 }
+
+/** 导出格式列表（subtitle_format.cpp 的可写格式；EBU/Encore/TranStation 仅写出） */
+const EXPORT_FORMAT_CHOICES: { format: SubtitleFormat; label: string }[] = [
+  { format: 'ass', label: 'Advanced SubStation Alpha (ASS)' },
+  { format: 'ssa', label: 'SubStation Alpha (SSA)' },
+  { format: 'srt', label: 'SubRip (SRT)' },
+  { format: 'txt', label: 'Plain-Text (TXT)' },
+  { format: 'ttxt', label: 'MPEG-4 Streaming Text (TTXT)' },
+  { format: 'microdvd', label: 'MicroDVD (SUB)' },
+  { format: 'ebu', label: 'EBU STL (STL)' },
+  { format: 'transtation', label: 'TranStation (TXT)' },
+  { format: 'encore', label: 'Adobe Encore (TXT)' },
+]
 
 interface ExportSubtitlesDialogProps {
   /** 全部已注册过滤器（链序，AssExportFilterChain::GetFilterList） */
@@ -3386,24 +3817,17 @@ export function ExportSubtitlesDialog({
         </fieldset>
         <fieldset className="dialog-fieldset">
           <legend>{tPlain('Format')}</legend>
-          <label className="dialog-check">
-            <input
-              type="radio"
-              name="export-format"
-              checked={format === 'ass'}
-              onChange={() => setFormat('ass')}
-            />{' '}
-            {tPlain('Advanced SubStation Alpha (ASS)')}
-          </label>
-          <label className="dialog-check">
-            <input
-              type="radio"
-              name="export-format"
-              checked={format === 'srt'}
-              onChange={() => setFormat('srt')}
-            />{' '}
-            {tPlain('SubRip (SRT)')}
-          </label>
+          {EXPORT_FORMAT_CHOICES.map((choice) => (
+            <label className="dialog-check" key={choice.format}>
+              <input
+                type="radio"
+                name="export-format"
+                checked={format === choice.format}
+                onChange={() => setFormat(choice.format)}
+              />{' '}
+              {tPlain(choice.label)}
+            </label>
+          ))}
         </fieldset>
         <label className="dialog-check">
           <input

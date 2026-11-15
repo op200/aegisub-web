@@ -24,7 +24,10 @@ const char *aegisub_document_state_json(aegisub_document_t document);
 int32_t aegisub_document_apply_json(aegisub_document_t document, const char *commands_json, const char *label, int32_t amend);
 int32_t aegisub_document_undo(aegisub_document_t document);
 int32_t aegisub_document_redo(aegisub_document_t document);
-const uint8_t *aegisub_document_export(aegisub_document_t document, const char *format, size_t *size);
+/// 导出：format = "ass" | "srt"；clean 非 0 时省略 Project Garbage / Extradata（导出对话框语义），
+/// save_ui_state 对应 App/Save UI State（0 时不写滚动位置/活动行/缩放等 UI 字段），
+/// properties_json 为 Project Garbage 增量（保存时用界面/媒体实时状态覆盖，空串表示不覆盖）
+const uint8_t *aegisub_document_export(aegisub_document_t document, const char *format, int32_t clean, int32_t save_ui_state, const char *properties_json, size_t *size);
 /// 搜索：settings_json 形如 {"find":"...","field":"text|style|actor|effect","matchCase":true,"useRegex":true,"exactMatch":false,"skipTags":true}
 /// 返回 JSON 数组 [{ "id": "行id", "start": 0, "end": 5, "field": "..." }, ...]，无匹配返回空数组
 const char *aegisub_document_search(aegisub_document_t document, const char *settings_json);

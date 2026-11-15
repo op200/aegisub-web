@@ -1,8 +1,16 @@
 /// <reference lib="webworker" />
 // WASM ABI 函数名（_aegisub_*、_malloc 等）必须以下划线开头
 /* eslint-disable no-underscore-dangle */
-import { createDocument } from '../core/defaults'
-import { exportSubtitle } from '../core/format'
+import { createDocument, createProjectProperties } from '../core/defaults'
+import { decodeWithEncoding, detectEncoding, encodeText } from '../core/encoding'
+import {
+  detectFormat,
+  exportSubtitle,
+  isAssLike,
+  parseSubtitle,
+  type ExportOptions,
+  type ParseOptions,
+} from '../core/formats'
 import { TypeScriptCoreRuntime } from '../core/runtime'
 import type { CoreCommand, CoreState, SubtitleDocument, SubtitleFormat } from '../core/types'
 import type {
@@ -31,7 +39,14 @@ interface AegisubCoreModule {
   ): number
   _aegisub_document_undo(document: number): number
   _aegisub_document_redo(document: number): number
-  _aegisub_document_export(document: number, format: number, sizePtr: number): number
+  _aegisub_document_export(
+    document: number,
+    format: number,
+    clean: number,
+    saveUiState: number,
+    propertiesJson: number,
+    sizePtr: number,
+  ): number
   _aegisub_document_search(document: number, settings: number): number
   _aegisub_document_replace_all(document: number, settings: number): number
   _aegisub_document_mark_saved?(document: number): number
@@ -58,12 +73,12 @@ interface AegisubCoreModule {
 }
 
 interface CoreRuntime {
-  open(bytes: Uint8Array, sourceName: string): CoreState
+  open(bytes: Uint8Array, sourceName: string, options?: ParseOptions): CoreState
   restore(document: SubtitleDocument): CoreState
   apply(commands: CoreCommand[], label: string, amend?: boolean): CoreState
   undo(): CoreState
   redo(): CoreState
-  export(format?: SubtitleFormat): Uint8Array
+  export(format?: SubtitleFormat, options?: ExportOptions): Uint8Array
   search(settings: SearchSettings): SearchMatch[]
   replaceAll(settings: SearchSettings): number
   getState(): CoreState
@@ -95,7 +110,7 @@ class WasmCoreRuntime implements CoreRuntime {
     return JSON.parse(json) as CoreState
   }
 
-  open(bytes: Uint8Array, sourceName: string): CoreState {
+  open(bytes: Uint8Array, sourceName: string, _options?: ParseOptions): CoreState {
     const m = this.module
     const data = m._malloc(bytes.length)
     m.HEAPU8.set(bytes, data)
@@ -108,9 +123,18 @@ class WasmCoreRuntime implements CoreRuntime {
   }
 
   restore(document: SubtitleDocument): CoreState {
-    // 把 TS 文档模型序列化回 ASS 文本再载入 WASM（保证 autosave 恢复一致）
-    const text = new TextEncoder().encode(exportSubtitle(document, document.format ?? 'ass'))
-    return this.open(text, document.sourceName || 'untitled.ass')
+    // 恢复一律走 ASS 序列化：WASM 核心只需 AssParser 一条读入路径；
+    // 附件/Extradata/Project Garbage 由 export_ass 一并写出，不会在恢复时丢失
+    const text = new TextEncoder().encode(exportSubtitle(document, 'ass') as string)
+    const state = this.open(text, 'restored.ass')
+    return {
+      ...state,
+      document: {
+        ...state.document,
+        format: document.format ?? 'ass',
+        sourceName: document.sourceName || 'untitled.ass',
+      },
+    }
   }
 
   apply(commands: CoreCommand[], label: string, amend = false): CoreState {
@@ -135,12 +159,21 @@ class WasmCoreRuntime implements CoreRuntime {
     return this.state()
   }
 
-  export(format?: SubtitleFormat): Uint8Array {
+  export(format?: SubtitleFormat, options: ExportOptions = {}): Uint8Array {
     const m = this.module
     const sizePtr = m._malloc(4)
     const fmt = m.allocateUTF8(format ?? 'ass')
-    const dataPtr = m._aegisub_document_export(this.document, fmt, sizePtr)
+    const properties = m.allocateUTF8(options.properties ? JSON.stringify(options.properties) : '')
+    const dataPtr = m._aegisub_document_export(
+      this.document,
+      fmt,
+      options.clean ? 1 : 0,
+      options.saveUiState === false ? 0 : 1,
+      properties,
+      sizePtr,
+    )
     m._free(fmt)
+    m._free(properties)
     if (!dataPtr) {
       m._free(sizePtr)
       throw new Error(this.error)
@@ -283,6 +316,62 @@ function textOnlyDelta(commands: CoreCommand[], state: CoreState): CoreTextDelta
   }
 }
 
+function normalizeDocument(document: SubtitleDocument): SubtitleDocument {
+  return {
+    ...document,
+    passthroughSections: document.passthroughSections ?? [],
+    attachments: document.attachments ?? [],
+    extradata: document.extradata ?? [],
+    properties: { ...createProjectProperties(), ...(document.properties ?? {}) },
+  }
+}
+
+function openDocument(
+  active: CoreRuntime,
+  bytes: Uint8Array,
+  sourceName: string,
+  encoding: string | undefined,
+  options: ParseOptions | undefined,
+): CoreState {
+  const decoded = encoding ? decodeWithEncoding(bytes, encoding) : detectEncoding(bytes)
+  if (decoded.binary)
+    throw new Error('File appears to be binary and cannot be loaded as subtitles.')
+  const format = options?.format ?? detectFormat(sourceName, decoded.text)
+  const parseOptions: ParseOptions = { ...options, format }
+  let state: CoreState
+  if (format === 'ass' || format === 'ssa' || isAssLike(sourceName)) {
+    // ASS/SSA 走核心自带的 AssParser（附件/Extradata/Project Garbage 与源码一致）
+    state = active.open(new TextEncoder().encode(decoded.text), sourceName, parseOptions)
+  } else {
+    const document = normalizeDocument(parseSubtitle(decoded.text, sourceName, parseOptions))
+    state = active.restore(document)
+  }
+  return {
+    ...state,
+    document: { ...state.document, format, sourceName },
+  }
+}
+
+function exportDocument(
+  active: CoreRuntime,
+  format: SubtitleFormat | undefined,
+  options: ExportOptions,
+  encoding: string,
+): Uint8Array {
+  const state = active.getState()
+  const target = format ?? state.document.format
+  // ASS 保存走核心 C++ 写出（保持 Aegisub 的字段/顺序/附件完全一致）；
+  // 其余格式在 TS 层转换（WASM 核心不链接 wx 的格式模块）
+  if (state.runtime === 'wasm' && target === 'ass') {
+    const bytes = active.export('ass', options)
+    const text = new TextDecoder('utf-8').decode(bytes).replace(/^\uFEFF/, '')
+    return encodeText(text, encoding)
+  }
+  const output = exportSubtitle(state.document, target, options)
+  if (output instanceof Uint8Array) return output
+  return encodeText(output, encoding)
+}
+
 self.onmessage = (event: MessageEvent<CoreRequest>) => {
   const request = event.data
   // init：记录绝对 base 并触发 WASM 加载（CoreClient 构造后首条消息，无响应）
@@ -322,10 +411,16 @@ self.onmessage = (event: MessageEvent<CoreRequest>) => {
           response.result = active.getState()
           break
         case 'open':
-          response.result = active.open(request.bytes, request.sourceName)
+          response.result = openDocument(
+            active,
+            request.bytes,
+            request.sourceName,
+            request.encoding,
+            request.options,
+          )
           break
         case 'restore':
-          response.result = active.restore(request.document)
+          response.result = active.restore(normalizeDocument(request.document))
           break
         case 'apply': {
           const state = active.apply(request.commands, request.label, request.amend ?? false)
@@ -341,7 +436,12 @@ self.onmessage = (event: MessageEvent<CoreRequest>) => {
           response.result = active.redo()
           break
         case 'export':
-          response.result = active.export(request.format)
+          response.result = exportDocument(
+            active,
+            request.format,
+            request.options ?? {},
+            request.encoding ?? 'UTF-8',
+          )
           break
         case 'search':
           response.result = active.search(request.settings)

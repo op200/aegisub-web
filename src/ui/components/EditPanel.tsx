@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
 } from 'react'
 
@@ -25,6 +26,7 @@ import {
   tagBool,
   tagColorHex,
 } from '../../core/assTags'
+import { parseCueEntryLines } from '../../core/format'
 import { formatEditorTime, parseEditorTime } from '../../core/time'
 import type { SubtitleCue, SubtitleStyle } from '../../core/types'
 import { Framerate } from '../../core/vfr'
@@ -38,12 +40,12 @@ import {
   type AssSyntaxType,
 } from '../assHighlight'
 import { assColorToHex } from '../color'
-import { editBoxActions, editCursorState } from '../commandRegistry'
+import { editBoxActions, editCursorState, setPendingPasteText } from '../commandRegistry'
 import { COMMANDS, commandTooltip } from '../commands'
 import { tPlain } from '../i18n'
 import { LUA_BLOCK_BACKGROUND, LUA_BLOCK_CARET } from '../luaHighlight'
 import { useSystemTheme } from '../theme'
-import { Dialog } from './dialogs'
+import { Dialog, probeLocalFonts } from './dialogs'
 import { MenuPopup } from './MenuPopup'
 
 const EDIT_ICON = (name: string) => aegisubIconUrl(`${name}_64`)
@@ -86,6 +88,55 @@ const DEFAULT_FONT: EffectiveFont = {
   bold: false,
   italic: false,
   underline: false,
+}
+
+/** 字体对话框 Font style 列表（Windows 字体对话框的四项组合，写回 \b/\i）
+ *  源码 wxGetFontFromUser 的 style 列表只有 Regular/Italic/Bold/Bold Italic */
+const FONT_STYLE_OPTIONS = [
+  { label: 'Regular', bold: false, italic: false },
+  { label: 'Italic', bold: false, italic: true },
+  { label: 'Bold', bold: true, italic: false },
+  { label: 'Bold Italic', bold: true, italic: true },
+] as const
+
+/** 字体对话框 Script（书写系统）列表：决定预览样本文字。ASS 的 \fn 不含 charset，
+ *  选择不写回任何标签（与原生字体对话框的 Script 下拉同语义：仅预览/编码提示） */
+const FONT_SCRIPTS: ReadonlyArray<readonly [string, string]> = [
+  ['Western', 'AaBbYyZz'],
+  ['Central European', 'AaBbCcĆćĘęŁłŃńÓóŚśŹź'],
+  ['Cyrillic', 'АаБбВвГгДдЕе'],
+  ['Greek', 'ΑαΒβΓγΔδΕε'],
+  ['Turkish', 'AaBbÇçĞğİıŞş'],
+  ['Hebrew', 'אבגדהוזח'],
+  ['Arabic', 'ابتثجحخد'],
+  ['Baltic', 'AaBbĀāČčĒēĢģĪī'],
+  ['Vietnamese', 'ẤấẦầẨẩẪẫẬậẮắ'],
+  ['Thai', 'กขคงจฉชซ'],
+  ['Japanese', 'あいうえおアイウエオ'],
+  ['Chinese Simplified', '汉字示例'],
+  ['Chinese Traditional', '漢字範例'],
+  ['Korean', '가나다라마바사'],
+]
+
+/** bold/italic → Font style 列表项标签 */
+function fontStyleLabel(bold: boolean, italic: boolean): string {
+  return (
+    FONT_STYLE_OPTIONS.find((option) => option.bold === bold && option.italic === italic)?.label ??
+    FONT_STYLE_OPTIONS[0].label
+  )
+}
+
+/** 字体名合并（大小写不敏感去重 + 字典序） */
+function mergeFontFamilies(current: string[], extra: string[]): string[] {
+  const seen = new Set(current.map((family) => family.toLowerCase()))
+  const merged = [...current]
+  for (const family of extra) {
+    const trimmed = family.trim()
+    if (!trimmed || seen.has(trimmed.toLowerCase())) continue
+    seen.add(trimmed.toLowerCase())
+    merged.push(trimmed)
+  }
+  return merged.sort((a, b) => a.localeCompare(b))
 }
 
 /** 字符计数（Subtitle/Character Counter：Ignore Whitespace / Ignore Punctuation） */
@@ -150,6 +201,53 @@ function lastTextLineBottom(pre: HTMLPreElement): number {
       bottom = Math.max(bottom, rect.bottom - preRect.top - pre.clientTop + pre.scrollTop)
   }
   return bottom
+}
+
+/**
+ * TimeEditCtrl 覆盖模式（timeedit_ctrl.cpp OnChar/OnKeyDown）：
+ * 数字覆盖光标处字符（插入模式仍是普通输入）；Backspace/Delete 只移动光标；
+ * `:` `.` `,` `;` 只把光标右移一位。
+ * 返回处理后的完整文本（null = 该按键不由覆盖模式接管）。
+ */
+function overwriteTimeKey(
+  event: ReactKeyboardEvent<HTMLInputElement>,
+  value: string,
+): { text: string; caret: number } | null {
+  const input = event.currentTarget
+  const start = input.selectionStart ?? value.length
+  const end = input.selectionEnd ?? start
+  if (event.key === 'Backspace') {
+    event.preventDefault()
+    const caret = Math.max(0, start - 1)
+    requestAnimationFrame(() => input.setSelectionRange(caret, caret))
+    return null
+  }
+  if (event.key === 'Delete') {
+    event.preventDefault()
+    return null
+  }
+  if (event.key.length === 1 && ':,.;'.includes(event.key)) {
+    event.preventDefault()
+    const caret = Math.min(value.length, start + 1)
+    requestAnimationFrame(() => input.setSelectionRange(caret, caret))
+    return null
+  }
+  if (!/^\d$/.test(event.key)) return null
+  event.preventDefault()
+  let text: string
+  let caret: number
+  if (end > start) {
+    text = value.slice(0, start) + event.key + value.slice(end)
+    caret = start + 1
+  } else if (start >= value.length) {
+    text = value + event.key
+    caret = value.length + 1
+  } else {
+    text = value.slice(0, start) + event.key + value.slice(start + 1)
+    caret = start + 1
+  }
+  requestAnimationFrame(() => input.setSelectionRange(caret, caret))
+  return { text, caret }
 }
 
 /** 选区覆盖色（CSS 变量）：与 textarea 的半透明选区叠色后恰为 VS Code 选区色 (39,80,119) */
@@ -653,6 +751,29 @@ const EditTimesRow = memo(
       1,
       frameRate.frameAtTime(endMs, 'end') - frameRate.frameAtTime(startMs, 'start') + 1,
     )
+    const commitDurationText = (text: string) => {
+      if (frameTiming) {
+        const frames = Number(text.trim())
+        if (!Number.isInteger(frames) || frames < 1) return
+        const nextEndMs = frameRate.timeAtFrame(
+          frameRate.frameAtTime(startMs, 'start') + frames - 1,
+          'end',
+        )
+        // CommitTimes TIME_DURATION：End=Start+时长，更新会话初值 End，不钳制 Start
+        const session = handlers.current.timeSession()
+        session.endMs = nextEndMs
+        handlers.current.patchDraft({ endMs: nextEndMs })
+        handlers.current.commitTimes({ endMs: nextEndMs }, 'duration')
+        return
+      }
+      const parsed = parseEditorTime(text)
+      if (parsed === null) return
+      const nextEndMs = startMs + parsed
+      const session = handlers.current.timeSession()
+      session.endMs = nextEndMs
+      handlers.current.patchDraft({ endMs: nextEndMs })
+      handlers.current.commitTimes({ endMs: nextEndMs }, 'duration')
+    }
     return (
       <div className="edit-row edit-row-times">
         <input
@@ -676,6 +797,14 @@ const EditTimesRow = memo(
           title={tPlain('Start time')}
           value={toStartText(startMs)}
           onFocus={() => handlers.current.setEditingField('startMs')}
+          onKeyDown={(event) => {
+            // Subtitle/Time Edit/Insert Mode：勾选 = 覆盖模式（TimeEditCtrl::OnChar）
+            if (!getOptionBool('Subtitle/Time Edit/Insert Mode')) return
+            const result = overwriteTimeKey(event, event.currentTarget.value)
+            if (!result) return
+            const parsed = parseStartInput(result.text)
+            if (parsed !== null) handlers.current.commitTimeKeystroke('startMs', parsed)
+          }}
           onChange={(event) => {
             const parsed = parseStartInput(event.target.value)
             if (parsed !== null) handlers.current.commitTimeKeystroke('startMs', parsed)
@@ -692,6 +821,13 @@ const EditTimesRow = memo(
           title={tPlain('End time')}
           value={toEndText(endMs)}
           onFocus={() => handlers.current.setEditingField('endMs')}
+          onKeyDown={(event) => {
+            if (!getOptionBool('Subtitle/Time Edit/Insert Mode')) return
+            const result = overwriteTimeKey(event, event.currentTarget.value)
+            if (!result) return
+            const parsed = parseEndInput(result.text)
+            if (parsed !== null) handlers.current.commitTimeKeystroke('endMs', parsed)
+          }}
           onChange={(event) => {
             const parsed = parseEndInput(event.target.value)
             if (parsed !== null) handlers.current.commitTimeKeystroke('endMs', parsed)
@@ -710,40 +846,17 @@ const EditTimesRow = memo(
             frameTiming ? String(durationFrames) : formatEditorTime(Math.max(0, endMs - startMs))
           }
           onFocus={() => handlers.current.setEditingField('endMs')}
-          onChange={(event) => {
-            if (frameTiming) {
-              const frames = Number(event.target.value.trim())
-              if (Number.isInteger(frames) && frames >= 1) {
-                const nextEndMs = frameRate.timeAtFrame(
-                  frameRate.frameAtTime(startMs, 'start') + frames - 1,
-                  'end',
-                )
-                // CommitTimes TIME_DURATION：End=Start+时长，更新会话初值 End，不钳制 Start
-                const session = handlers.current.timeSession()
-                session.endMs = nextEndMs
-                handlers.current.patchDraft({ endMs: nextEndMs })
-                handlers.current.commitTimes({ endMs: nextEndMs }, 'duration')
-              }
-              return
-            }
-            const parsed = parseEditorTime(event.target.value)
-            if (parsed !== null) {
-              const nextEndMs = startMs + parsed
-              const session = handlers.current.timeSession()
-              session.endMs = nextEndMs
-              handlers.current.patchDraft({ endMs: nextEndMs })
-              handlers.current.commitTimes({ endMs: nextEndMs }, 'duration')
-            }
+          onKeyDown={(event) => {
+            if (!getOptionBool('Subtitle/Time Edit/Insert Mode')) return
+            const result = overwriteTimeKey(event, event.currentTarget.value)
+            if (!result) return
+            commitDurationText(result.text)
           }}
+          onChange={(event) => commitDurationText(event.target.value)}
           onBlur={(event) => {
             handlers.current.setEditingField(null)
             if (frameTiming) return // 帧模式在 onChange 即时提交
-            const parsed = parseEditorTime(event.target.value)
-            if (parsed !== null) {
-              const nextEndMs = startMs + parsed
-              handlers.current.patchDraft({ endMs: nextEndMs })
-              handlers.current.commitTimes({ endMs: nextEndMs }, 'duration')
-            }
+            commitDurationText(event.target.value)
             handlers.current.clearTimeSession()
           }}
         />
@@ -1026,6 +1139,8 @@ export function EditPanel({
   // edit/font 字体选择弹窗（wxGetFontFromUser）
   const [fontDraft, setFontDraft] = useState<EffectiveFont | null>(null)
   const [fontFamilies, setFontFamilies] = useState<string[]>([])
+  // 字体对话框 Script 下拉（只影响样本，见 FONT_SCRIPTS 注释）
+  const [fontScript, setFontScript] = useState<string>(FONT_SCRIPTS[0][0])
   // 时间框编辑会话起点（subs_edit_box.cpp initial_times：焦点获得时快照，
   // 改 Start 时 End=max(Start, 会话初值)、改 End 时 Start=min(End, 会话初值)）
   const initialTimesRef = useRef<{ id: string; startMs: number; endMs: number } | null>(null)
@@ -1447,13 +1562,33 @@ export function EditPanel({
     const selStart = editor ? editor.selectionStart : draft.text.length
     const font = effectiveFontAt(draft.text, normalizePos(draft.text, selStart))
     setFontDraft({ ...font })
+    setFontScript(FONT_SCRIPTS[0][0])
+    // 列表初始内容：当前字体 + 脚本内样式引用的字体（原生字体对话框列举全部
+    // 已安装字体；web 端再异步合并已导入字体与已授权的本机字体名）
+    setFontFamilies((current) =>
+      mergeFontFamilies(current, [font.family, ...styles.map((style) => style.fontName)]),
+    )
     void listFontFaces()
       .then((faces) => {
         const imported = faces.flatMap((face) => face.families)
-        setFontFamilies((current) => {
-          const merged = new Set([...current, ...imported, ...styles.map((s) => s.fontName)])
-          return [...merged].sort((a, b) => a.localeCompare(b))
-        })
+        setFontFamilies((current) => mergeFontFamilies(current, imported))
+      })
+      .catch(() => undefined)
+    // 已授权（预览区/字体收集器授权过）时附带本机字体名；此处不主动弹授权框
+    void probeLocalFonts()
+      .then(async ({ supported, permission }) => {
+        if (!supported || permission !== 'granted') return
+        const api = window as Window & {
+          queryLocalFonts?: () => Promise<Array<{ family: string }>>
+        }
+        const faces = await api.queryLocalFonts?.()
+        if (faces)
+          setFontFamilies((current) =>
+            mergeFontFamilies(
+              current,
+              faces.map((face) => face.family),
+            ),
+          )
       })
       .catch(() => undefined)
   }
@@ -1547,21 +1682,23 @@ export function EditPanel({
     editor.setSelectionRange(editor.value.length, editor.value.length)
     trackCursor(editor)
   }
-  const pasteIntoEditor = async () => {
+  const insertIntoEditor = (insert: string) => {
     const editor = editorRef.current
     if (!editor) return
+    const start = editor.selectionStart
+    const end = editor.selectionEnd
+    const nextText = `${draft.text.slice(0, start)}${insert}${draft.text.slice(end)}`
+    commitText(nextText, 'modify text')
+    requestAnimationFrame(() =>
+      editor.setSelectionRange(start + insert.length, start + insert.length),
+    )
+  }
+  const pasteIntoEditor = async () => {
     try {
       // subs_edit_ctrl Paste：换行统一替换为 \N
       const clipboard = await navigator.clipboard?.readText()
       if (!clipboard) return
-      const text = clipboard.replace(/\r\n|\n|\r/g, '\\N')
-      const start = editor.selectionStart
-      const end = editor.selectionEnd
-      const nextText = `${draft.text.slice(0, start)}${text}${draft.text.slice(end)}`
-      commitText(nextText, 'modify text')
-      requestAnimationFrame(() =>
-        editor.setSelectionRange(start + text.length, start + text.length),
-      )
+      insertIntoEditor(clipboard.replace(/\r\n|\n|\r/g, '\\N'))
     } catch {
       // 剪贴板读取被拒绝时静默忽略
     }
@@ -1702,6 +1839,21 @@ export function EditPanel({
             trackCursor(event.currentTarget)
             setTextMenu({ x: event.clientX, y: event.clientY })
           }}
+          onPaste={(event) => {
+            const data = event.clipboardData?.getData('text/plain')
+            if (!data) return
+            // command/edit.cpp edit_line_paste：整段 ASS 行优先按行插入
+            if (data.trimStart().startsWith('Dialogue:') && parseCueEntryLines(data)) {
+              event.preventDefault()
+              setPendingPasteText(data)
+              onCommand('edit/line/paste')
+              return
+            }
+            // subs_edit_ctrl.cpp Paste：换行统一替换为 \N
+            if (!/[\r\n]/.test(data)) return
+            event.preventDefault()
+            insertIntoEditor(data.replace(/\r\n|\n|\r/g, '\\N'))
+          }}
           onScroll={syncScroll}
           onKeyDown={(event) => {
             if (
@@ -1789,59 +1941,112 @@ export function EditPanel({
             </>
           }
         >
-          <div className="dialog-fields">
-            <label>
-              {tPlain('Font face')}
-              <input
-                list="edit-font-families"
-                value={fontDraft.family}
-                onChange={(event) => setFontDraft({ ...fontDraft, family: event.target.value })}
-                autoFocus
-              />
-              <datalist id="edit-font-families">
-                {fontFamilies.map((family) => (
-                  <option key={family} value={family} />
-                ))}
-              </datalist>
-            </label>
-            <label>
-              {tPlain('Font size')}
-              <input
-                type="number"
-                min={1}
-                max={2000}
-                value={fontDraft.size}
-                onChange={(event) =>
-                  setFontDraft({ ...fontDraft, size: Number(event.target.value) })
-                }
-              />
-            </label>
-            <label className="comment-toggle">
-              <input
-                type="checkbox"
-                checked={fontDraft.bold}
-                onChange={(event) => setFontDraft({ ...fontDraft, bold: event.target.checked })}
-              />
-              {tPlain('Bold')}
-            </label>
-            <label className="comment-toggle">
-              <input
-                type="checkbox"
-                checked={fontDraft.italic}
-                onChange={(event) => setFontDraft({ ...fontDraft, italic: event.target.checked })}
-              />
-              {tPlain('Italics')}
-            </label>
-            <label className="comment-toggle">
-              <input
-                type="checkbox"
-                checked={fontDraft.underline}
-                onChange={(event) =>
-                  setFontDraft({ ...fontDraft, underline: event.target.checked })
-                }
-              />
-              {tPlain('Underline')}
-            </label>
+          {/* 原生字体对话框布局（wxGetFontFromUser）：字体列表 + Font style / Size /
+              Script + 样本预览；Font style 取代原 Bold/Italic 两个勾选框 */}
+          <div className="font-picker">
+            <div className="font-picker-main">
+              <div className="font-picker-list-column">
+                <label className="font-picker-caption" htmlFor="edit-font-face">
+                  {tPlain('Font face')}
+                </label>
+                <input
+                  id="edit-font-face"
+                  value={fontDraft.family}
+                  onChange={(event) => setFontDraft({ ...fontDraft, family: event.target.value })}
+                  autoFocus
+                />
+                <ul
+                  className="font-picker-families"
+                  role="listbox"
+                  aria-label={tPlain('Font face')}
+                >
+                  {fontFamilies.map((family) => (
+                    <li
+                      key={family}
+                      role="option"
+                      aria-selected={family.toLowerCase() === fontDraft.family.toLowerCase()}
+                      style={{ fontFamily: `"${family}", sans-serif` }}
+                      title={family}
+                      onClick={() => setFontDraft({ ...fontDraft, family })}
+                    >
+                      {family}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="font-picker-options">
+                <label>
+                  {tPlain('Font style')}
+                  <select
+                    value={fontStyleLabel(fontDraft.bold, fontDraft.italic)}
+                    onChange={(event) => {
+                      const option = FONT_STYLE_OPTIONS.find(
+                        (item) => item.label === event.target.value,
+                      )
+                      if (option)
+                        setFontDraft({ ...fontDraft, bold: option.bold, italic: option.italic })
+                    }}
+                  >
+                    {FONT_STYLE_OPTIONS.map((option) => (
+                      <option key={option.label} value={option.label}>
+                        {tPlain(option.label)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  {tPlain('Font size')}
+                  <input
+                    type="number"
+                    min={1}
+                    max={2000}
+                    value={fontDraft.size}
+                    onChange={(event) =>
+                      setFontDraft({ ...fontDraft, size: Number(event.target.value) })
+                    }
+                  />
+                </label>
+                <label>
+                  {tPlain('Script')}
+                  <select
+                    value={fontScript}
+                    onChange={(event) => setFontScript(event.target.value)}
+                  >
+                    {FONT_SCRIPTS.map(([label]) => (
+                      <option key={label} value={label}>
+                        {tPlain(label, 'Font script')}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="comment-toggle">
+                  <input
+                    type="checkbox"
+                    checked={fontDraft.underline}
+                    onChange={(event) =>
+                      setFontDraft({ ...fontDraft, underline: event.target.checked })
+                    }
+                  />
+                  {tPlain('Underline')}
+                </label>
+              </div>
+            </div>
+            <fieldset className="font-picker-preview">
+              <legend>{tPlain('Sample')}</legend>
+              <div className="font-picker-sample">
+                <span
+                  style={{
+                    fontFamily: `"${fontDraft.family}", sans-serif`,
+                    fontSize: `${Math.max(8, Math.min(48, fontDraft.size || 8))}px`,
+                    fontWeight: fontDraft.bold ? 'bold' : 'normal',
+                    fontStyle: fontDraft.italic ? 'italic' : 'normal',
+                    textDecoration: fontDraft.underline ? 'underline' : 'none',
+                  }}
+                >
+                  {FONT_SCRIPTS.find(([label]) => label === fontScript)?.[1] ?? 'AaBbYyZz'}
+                </span>
+              </div>
+            </fieldset>
           </div>
         </Dialog>
       )}

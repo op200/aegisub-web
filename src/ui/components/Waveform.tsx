@@ -7,7 +7,9 @@ import {
   getOptionString,
   useOptionsVersion,
 } from '../../config/options'
+import { parseKaraokeSyllables } from '../../core/karaoke'
 import type { SubtitleCue } from '../../core/types'
+import type { Framerate } from '../../core/vfr'
 import { extractAudioPeaks } from '../../media/audioPeaks'
 import type { MediaSource } from '../../platform/types'
 import { tPlain } from '../i18n'
@@ -19,12 +21,16 @@ interface WaveformProps {
   currentTimeMs: number
   videoTimeMs: number | null
   selectedCue: SubtitleCue | null
+  /** 全部选中行（吸附目标包含选中行标记） */
+  selectedCues: SubtitleCue[]
   /** 全部行（Audio/Inactive Lines Display Mode 的非活动行边界绘制） */
   cues: SubtitleCue[]
   /** 关键帧列表（Audio/Display/Draw/Keyframes in * Mode 与标记拖动吸附） */
   keyframes: number[]
   /** 视频帧率（关键帧帧号 → 时间换算） */
   fps: number
+  /** 精确帧率/时间码（VFR 下用 TimeAtFrame，而不是按 fps 近似） */
+  frameRate: Framerate
   /** audio/karaoke 开关（决定用哪个关键帧显示开关） */
   karaokeMode: boolean
   /** 播放状态（Audio/Lock Scroll on Cursor 跟随光标） */
@@ -34,6 +40,8 @@ interface WaveformProps {
   scrollToActiveLine: number
   /** 滚动目标（audio_box.cpp ScrollMode）：range=行范围，start/end=时间点居中 */
   scrollToActiveLineMode: 'range' | 'start' | 'end'
+  /** audio/scroll/left|right：按像素滚动视图（audio_box.cpp ScrollAudioBy） */
+  scrollBy: { seq: number; delta: number }
   view: 'waveform' | 'spectrum'
   /** AudioDisplay::zoom_level（= -HorizontalZoom 滑块值），约 -30..50 */
   zoomLevel?: number
@@ -131,6 +139,7 @@ async function createAudioData(
     await extractAudioPeaks(
       file,
       onProgress ? (peaks) => onProgress(toAudioData(peaks)) : undefined,
+      media.audioStreamIndex,
     ),
   )
 }
@@ -246,14 +255,17 @@ export function Waveform({
   currentTimeMs,
   videoTimeMs,
   selectedCue,
+  selectedCues,
   cues,
   keyframes,
   fps,
+  frameRate,
   karaokeMode,
   playing,
   autoScroll,
   scrollToActiveLine,
   scrollToActiveLineMode,
+  scrollBy,
   view,
   zoomLevel = 0,
   amplitude = 1,
@@ -294,6 +306,18 @@ export function Waveform({
     )
   const scrollThrottleRef = useRef<RafThrottled | null>(null)
   if (!scrollThrottleRef.current) scrollThrottleRef.current = rafThrottle()
+
+  // Framerate 包装：VFR 时用 TimeAtFrame/FrameAtTime（精确 timecodes），否则按 fps 近似
+  const frameMsFallback = fps > 0 ? 1000 / fps : 1000 / 24
+  const frameTime = (frame: number, kind: 'exact' | 'start' | 'end' = 'exact') => {
+    if (frameRate.isLoaded()) return frameRate.timeAtFrame(frame, kind)
+    const ms = frame * frameMsFallback
+    return kind === 'start' ? Math.round(ms) : ms
+  }
+  const frameIndexAt = (timeMs: number) =>
+    frameRate.isLoaded()
+      ? frameRate.frameAtTime(timeMs)
+      : Math.max(0, Math.floor(timeMs / frameMsFallback))
 
   // ---- 音频数据加载（合成音频走 worker；真实媒体走 extractAudioPeaks，流式渐进上报） ----
   useEffect(() => {
@@ -414,6 +438,15 @@ export function Waveform({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scrollToActiveLine])
 
+  // audio/scroll/left|right：audio_box.cpp OnScrollLeft → ScrollAudioBy(±128px)，
+  // 只移动视图，不动播放头
+  const lastScrollBySeqRef = useRef(0)
+  useEffect(() => {
+    if (scrollBy.seq === lastScrollBySeqRef.current) return
+    lastScrollBySeqRef.current = scrollBy.seq
+    setScrollLeft((current) => Math.min(Math.max(0, current + scrollBy.delta), maxScroll))
+  }, [scrollBy.seq, scrollBy.delta, maxScroll])
+
   // 播放光标不自动滚动（Audio/Lock Scroll on Cursor 默认关闭）
 
   // ---- 频谱调色板 LUT（AudioColorScheme：2^12 级 HSL 调色板，audio_colorscheme.cpp） ----
@@ -496,7 +529,8 @@ export function Waveform({
     const inactiveMode = getOptionInt('Audio/Inactive Lines Display Mode')
     const inactiveComments = getOptionBool('Audio/Display/Draw/Inactive Comments')
     const waveformStyle = getOptionInt('Audio/Display/Waveform Style') // 0 Maximum / 1 Maximum + Average
-    const frameMs = fps > 0 ? 1000 / fps : 1000 / 24
+    const syllableColor = getOptionString('Colour/Audio Display/Syllable Boundaries')
+    const cursorFontFace = getOptionString('Audio/Track Cursor/Font Face')
 
     const audioTop = TIMELINE_H
     const audioHeight = Math.max(1, size.h - TIMELINE_H - SCROLLBAR_H)
@@ -789,7 +823,8 @@ export function Waveform({
       ctx.lineWidth = 1
       ctx.beginPath()
       for (const keyframe of keyframes) {
-        const x = Math.round(absXFromTime(keyframe * frameMs) - scroll)
+        // AudioMarkerProviderKeyframes：TimeAtFrame(frame, START)
+        const x = Math.round(absXFromTime(frameTime(keyframe, 'start')) - scroll)
         if (x < 0 || x >= size.w) continue
         ctx.moveTo(x + 0.5, audioTop)
         ctx.lineTo(x + 0.5, audioTop + audioHeight)
@@ -830,10 +865,10 @@ export function Waveform({
 
     // ================= 视频帧范围（VideoPositionMarkerProvider） =================
     if (drawVideoPosition && videoTimeMs !== null && durationMs > 0) {
-      const frame = Math.max(0, Math.floor(videoTimeMs / frameMs))
-      const frameStart = frame * frameMs
-      const frameEnd = (frame + 1) * frameMs
-      const previousStart = Math.max(0, (frame - 1) * frameMs)
+      const frame = frameIndexAt(videoTimeMs)
+      const frameStart = frameTime(frame)
+      const frameEnd = frameTime(frame + 1)
+      const previousStart = Math.max(0, frameTime(frame - 1))
       const drawFrameRange = (startMs: number, endMs: number, color: string) => {
         const x1 = Math.round(absXFromTime(startMs) - scroll) + 1
         const x2 = Math.round(absXFromTime(endMs) - scroll)
@@ -851,6 +886,47 @@ export function Waveform({
         ctx.moveTo(videoX, audioTop)
         ctx.lineTo(videoX, audioTop + audioHeight)
         ctx.stroke()
+      }
+    }
+
+    // ================= 卡拉OK音节边界/标签（KaraokeMarkerProvider + PaintLabels） =================
+    if (karaokeMode && selectedCue && durationMs > 0) {
+      const syllables = parseKaraokeSyllables(selectedCue.text, selectedCue.startMs)
+      // 音节分隔线：Colour/Audio Display/Syllable Boundaries + 点线
+      ctx.strokeStyle = syllableColor
+      ctx.lineWidth = boundaryWidth
+      ctx.setLineDash([2, 2])
+      ctx.beginPath()
+      for (let i = 1; i < syllables.length; i++) {
+        const x = Math.round(absXFromTime(syllables[i].startMs) - scroll)
+        if (x < 0 || x >= size.w) continue
+        ctx.moveTo(x, audioTop)
+        ctx.lineTo(x, audioTop + audioHeight)
+      }
+      ctx.stroke()
+      ctx.setLineDash([])
+      // 音节文本：粗体白色，放不下则裁剪（audio_display.cpp PaintLabels）
+      ctx.fillStyle = '#ffffff'
+      ctx.font = 'bold 10px "Segoe UI", sans-serif'
+      ctx.textBaseline = 'top'
+      ctx.textAlign = 'left'
+      for (const syllable of syllables) {
+        const label = syllable.text.replace(/\{[^}]*\}/g, '')
+        if (!label) continue
+        const left = Math.round(absXFromTime(syllable.startMs) - scroll)
+        const width = Math.max(1, Math.round(syllable.durationMs / msPerPixel))
+        if (left + width < 0 || left > size.w) continue
+        const extent = ctx.measureText(label).width
+        if (width < extent) {
+          ctx.save()
+          ctx.beginPath()
+          ctx.rect(left, audioTop + 4, width, 14)
+          ctx.clip()
+          ctx.fillText(label, left, audioTop + 4)
+          ctx.restore()
+        } else {
+          ctx.fillText(label, left + (width - extent) / 2, audioTop + 4)
+        }
       }
     }
 
@@ -897,7 +973,9 @@ export function Waveform({
         // Audio/Display/Draw/Cursor Time：光标处时间标签
         if (drawCursorTime) {
           const label = `${(currentTimeMs / 1000).toFixed(3)}`
-          ctx.font = '10px "Segoe UI", sans-serif'
+          ctx.font = cursorFontFace
+            ? `bold 10px "${cursorFontFace}", "Segoe UI", sans-serif`
+            : '10px "Segoe UI", sans-serif'
           const labelWidth = ctx.measureText(label).width + 6
           const labelX = cx + 4 + labelWidth > size.w ? cx - labelWidth - 4 : cx + 4
           ctx.fillStyle = UI_DARK
@@ -997,6 +1075,7 @@ export function Waveform({
     data,
     durationMs,
     fps,
+    frameRate,
     karaokeMode,
     keyframes,
     media,
@@ -1004,6 +1083,7 @@ export function Waveform({
     optionsVersion,
     pixelAudioWidth,
     selectedCue,
+    selectedCues,
     size,
     unavailable,
     videoTimeMs,
@@ -1112,20 +1192,67 @@ export function Waveform({
     const x = event.clientX - bounds.left
     if (drag.mode === 'marker' && selectedCue) {
       let time = Math.max(0, Math.min(durationMs, Math.round((clampedScroll + x) * msPerPixel)))
-      // Audio/Snap/Enable + Audio/Snap/Distance：拖动标记吸附最近关键帧
-      if (getOptionBool('Audio/Snap/Enable') && keyframes.length && fps > 0) {
+      // AudioTimingControllerDialogue::SnapMarkers：
+      // 吸附目标 = 选中行/活动行另一侧标记 + 非活动行 + 关键帧 + 视频帧边界。
+      // Audio/Snap/Distance 像素范围；Shift 反转 Audio/Snap/Enable（audio_display.cpp）
+      const snapEnabled = getOptionBool('Audio/Snap/Enable') !== event.shiftKey
+      if (snapEnabled) {
         const snapDistanceMs = getOptionInt('Audio/Snap/Distance') * msPerPixel
+        const candidates: number[] = []
+        // 活动行另一侧标记 + 其他选中行标记
+        if (drag.marker === 'start') candidates.push(selectedCue.endMs)
+        else candidates.push(selectedCue.startMs)
+        for (const cue of selectedCues) {
+          if (cue.id === selectedCue.id) continue
+          candidates.push(cue.startMs, cue.endMs)
+        }
+        // 非活动行（Audio/Inactive Lines Display Mode；排除所有选中行）
+        const inactiveMode = getOptionInt('Audio/Inactive Lines Display Mode')
+        if (inactiveMode > 0) {
+          const inactiveComments = getOptionBool('Audio/Display/Draw/Inactive Comments')
+          const selectedIds = new Set(selectedCues.map((cue) => cue.id))
+          selectedIds.add(selectedCue.id)
+          const usable = (cue: SubtitleCue) =>
+            (inactiveComments || !cue.comment) && !selectedIds.has(cue.id)
+          let targets: SubtitleCue[] = []
+          if (inactiveMode === 3) targets = cues.filter(usable)
+          else {
+            const index = cues.findIndex((cue) => cue.id === selectedCue.id)
+            const previous = [...cues.slice(0, Math.max(0, index))].reverse().find(usable)
+            const next = cues.slice(index + 1).find(usable)
+            targets =
+              inactiveMode === 1
+                ? previous
+                  ? [previous]
+                  : []
+                : [previous, next].filter((item): item is SubtitleCue => Boolean(item))
+          }
+          for (const cue of targets) candidates.push(cue.startMs, cue.endMs)
+        }
+        // 关键帧（受对应显示开关约束）
+        const drawKeyframes = getOptionBool(
+          karaokeMode
+            ? 'Audio/Display/Draw/Keyframes in Karaoke Mode'
+            : 'Audio/Display/Draw/Keyframes in Dialogue Mode',
+        )
+        if (drawKeyframes) {
+          for (const keyframe of keyframes) candidates.push(frameTime(keyframe, 'start'))
+        }
+        // 视频帧边界（VideoPositionMarkerProvider::GetSnapMarkers → START/END）
+        if (getOptionBool('Audio/Display/Draw/Video Position') && videoTimeMs !== null) {
+          const frame = frameIndexAt(videoTimeMs)
+          candidates.push(frameTime(frame, 'start'), frameTime(frame, 'end'))
+        }
         let best: number | null = null
         let bestDistance = snapDistanceMs
-        for (const keyframe of keyframes) {
-          const keyframeMs = keyframe * (1000 / fps)
-          const distance = Math.abs(keyframeMs - time)
+        for (const candidate of candidates) {
+          const distance = Math.abs(candidate - time)
           if (distance <= bestDistance) {
-            best = keyframeMs
+            best = candidate
             bestDistance = distance
           }
         }
-        if (best !== null) time = Math.round(best)
+        if (best !== null) time = Math.max(0, Math.min(durationMs, Math.round(best)))
       }
       if (drag.marker === 'start') {
         markerCommitRef.current!(

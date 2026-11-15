@@ -1,4 +1,56 @@
-export type SubtitleFormat = 'ass' | 'srt'
+/**
+ * 字幕格式标识（与 Aegisub SubtitleFormat 注册表对应）。
+ * mkv 仅作为打开容器（提取内嵌字幕轨），不作为文档保存格式。
+ * ebu/transtation/encore 与源码一致：只能写出，不能读入。
+ */
+export type SubtitleFormat =
+  | 'ass'
+  | 'ssa'
+  | 'srt'
+  | 'txt'
+  | 'ttxt'
+  | 'microdvd'
+  | 'ebu'
+  | 'transtation'
+  | 'encore'
+
+export type SubtitleAttachmentGroup = 'font' | 'graphic'
+
+/**
+ * ASS 附件（ass_attachment.h）。
+ * data 为原始文件字节的 base64（跨 worker/WASM JSON 传输）；name 保留 SSA 字体名改写。
+ */
+export interface SubtitleAttachment {
+  name: string
+  group: SubtitleAttachmentGroup
+  data: string
+}
+
+/** [Aegisub Extradata] 条目（ass_file.h ExtradataEntry） */
+export interface SubtitleExtradata {
+  id: number
+  key: string
+  value: string
+}
+
+/** [Aegisub Project Garbage]（ass_file.h ProjectProperties） */
+export interface ProjectProperties {
+  automationScripts: string
+  exportFilters: string
+  exportEncoding: string
+  styleStorage: string
+  audioFile: string
+  videoFile: string
+  timecodesFile: string
+  keyframesFile: string
+  automationSettings: Record<string, string>
+  videoZoom: number
+  arValue: number
+  scrollPosition: number
+  activeRow: number
+  arMode: number
+  videoPosition: number
+}
 
 export interface SubtitleStyle {
   id: string
@@ -57,6 +109,9 @@ export interface SubtitleDocument {
   styles: SubtitleStyle[]
   cues: SubtitleCue[]
   passthroughSections: RawSection[]
+  attachments: SubtitleAttachment[]
+  extradata: SubtitleExtradata[]
+  properties: ProjectProperties
 }
 
 export type SortColumn = 'start' | 'end' | 'style' | 'actor' | 'effect' | 'layer'
@@ -74,6 +129,11 @@ export type CoreCommand =
   | { type: 'deleteStyle'; id: string }
   | { type: 'reorderStyles'; ids: string[] }
   | { type: 'updateScriptInfo'; patch: Record<string, string> }
+  /** ass_attachment：附件管理器添加/删除（name+group 唯一定位；data 为 base64） */
+  | { type: 'addAttachment'; attachment: SubtitleAttachment }
+  | { type: 'deleteAttachment'; name: string; group: SubtitleAttachmentGroup }
+  /** [Aegisub Project Garbage] 增量写入 */
+  | { type: 'updateProperties'; patch: Partial<ProjectProperties> }
   | { type: 'sortCues' }
   | { type: 'sortCuesBy'; column: SortColumn }
   /**

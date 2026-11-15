@@ -1,7 +1,28 @@
-import type { SubtitleCue, SubtitleDocument, SubtitleStyle } from './types'
+import type { ProjectProperties, SubtitleCue, SubtitleDocument, SubtitleStyle } from './types'
 
 export function makeId(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`
+}
+
+/** ProjectProperties 默认值（ass_file.h 成员初值：空串/0） */
+export function createProjectProperties(): ProjectProperties {
+  return {
+    automationScripts: '',
+    exportFilters: '',
+    exportEncoding: '',
+    styleStorage: '',
+    audioFile: '',
+    videoFile: '',
+    timecodesFile: '',
+    keyframesFile: '',
+    automationSettings: {},
+    videoZoom: 0,
+    arValue: 0,
+    scrollPosition: 0,
+    activeRow: 0,
+    arMode: 0,
+    videoPosition: 0,
+  }
 }
 
 export function createDefaultStyle(name = 'Default'): SubtitleStyle {
@@ -77,5 +98,8 @@ export function createDocument(
     styles: [createDefaultStyle()],
     cues: [cue],
     passthroughSections: [],
+    attachments: [],
+    extradata: [],
+    properties: createProjectProperties(),
   }
 }

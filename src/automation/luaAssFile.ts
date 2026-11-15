@@ -534,6 +534,10 @@ const EXPORT_FILTERS_PREFIX = 'Export Filters:'
 
 /** 读取 Properties.export_filters（'|' 连接；行不存在为空表） */
 export function documentExportFilters(document: SubtitleDocument): string[] {
+  // 新模型直接读 properties；旧 autosave 文档可能仍把该段留在 passthrough
+  if (document.properties?.exportFilters) {
+    return document.properties.exportFilters.split('|').filter((name) => name !== '')
+  }
   const section = document.passthroughSections.find((item) => item.name === PROJECT_GARBAGE_SECTION)
   const line = section?.lines.find((item) => item.startsWith(EXPORT_FILTERS_PREFIX))
   if (!line) return []
@@ -549,6 +553,12 @@ export function documentExportFilters(document: SubtitleDocument): string[] {
  * 空表不写行；段内无其它行时整段移除）。
  */
 export function withExportFilters(document: SubtitleDocument, names: string[]): SubtitleDocument {
+  // 新模型直接写 properties（不清除 passthrough 里的旧段，导出时 properties 优先）
+  if (document.properties) {
+    const exportFilters = names.join('|')
+    if (document.properties.exportFilters === exportFilters) return document
+    return { ...document, properties: { ...document.properties, exportFilters } }
+  }
   const next: SubtitleDocument = { ...document }
   const sections = next.passthroughSections.map((item) => ({ ...item, lines: [...item.lines] }))
   const index = sections.findIndex((item) => item.name === PROJECT_GARBAGE_SECTION)

@@ -11,7 +11,14 @@ import { useSyncExternalStore } from 'react'
 
 import { persistConfigJson } from '../storage/configStore'
 
-export type OptionType = 'bool' | 'int' | 'double' | 'string' | 'color' | 'list-string'
+export type OptionType =
+  | 'bool'
+  | 'int'
+  | 'double'
+  | 'string'
+  | 'color'
+  | 'list-string'
+  | 'list-bool'
 
 /** default_config.json（Aegisub src/libresrc/default_config.json 原样子集） */
 export const DEFAULT_CONFIG = {
@@ -312,6 +319,12 @@ export const DEFAULT_CONFIG = {
   },
   Timing: { 'Default Duration': 3000 },
   Tool: {
+    // dialog_text_import.cpp / command/edit.cpp paste_over 的持久化选项
+    Import: { Text: { 'Actor Separator': ':', 'Comment Starter': '#', 'Include Blank': false } },
+    'Paste Lines Over': {
+      // default_config.json 为 10 项（Effect=true）；对话框首次按源码 resize 到 11 项补齐 false
+      Fields: [false, false, false, false, false, false, false, false, false, true],
+    },
     'Kanji Timer': { Interpolation: true },
     // Web 版偏离上游：首选项对话框可拖拽，尺寸持久化（0 = 未设置，使用 CSS 默认尺寸）
     Preferences: { Page: 0, 'Dialog Width': 0, 'Dialog Height': 0 },
@@ -382,6 +395,12 @@ export const DEFAULT_CONFIG = {
     'YCbCr Matrix Mismatch': 1,
     'No LayoutRes in Script': 1,
     'LayoutRes Mismatch': 1,
+    // dialog_video_properties.cpp 的 "Last ... Choice"（下次默认高亮）
+    'Last No YCbCr Matrix in Script Choice': 1,
+    'Last YCbCr Matrix Mismatch Choice': 1,
+    'Last PlayRes Mismatch Choice': 0,
+    'Last No LayoutRes in Script Choice': 1,
+    'Last LayoutRes Mismatch Choice': 0,
     'Open Audio': true,
     'Overscan Mask': false,
     Provider: 'ffmpegsource',
@@ -438,6 +457,7 @@ const COLOR_OPTIONS = new Set<string>([
 ])
 
 const LIST_STRING_OPTIONS = new Set<string>(['Audio/Colour Schemes', 'Subtitle/Grid/Column'])
+const LIST_BOOL_OPTIONS = new Set<string>(['Tool/Paste Lines Over/Fields'])
 
 /** 扁平化默认值：路径 → 值（agi::Options 的 from_json 展开语义） */
 function flatten(tree: unknown, prefix: string, out: Map<string, unknown>): void {
@@ -458,6 +478,7 @@ const STORAGE_KEY = 'aegisub-web:config'
 function detectType(name: string, value: unknown): OptionType {
   if (COLOR_OPTIONS.has(name)) return 'color'
   if (LIST_STRING_OPTIONS.has(name)) return 'list-string'
+  if (LIST_BOOL_OPTIONS.has(name)) return 'list-bool'
   if (typeof value === 'boolean') return 'bool'
   if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'double'
   return 'string'
@@ -511,6 +532,12 @@ export function applyConfigTree(tree: unknown): number {
     else if (type === 'string' && typeof value === 'string') values.set(name, value)
     else if (type === 'color' && typeof value === 'string') values.set(name, value)
     else if (type === 'list-string' && Array.isArray(value)) values.set(name, [...value])
+    else if (
+      type === 'list-bool' &&
+      Array.isArray(value) &&
+      value.every((item) => typeof item === 'boolean')
+    )
+      values.set(name, [...value])
     else continue
     applied += 1
   }
@@ -546,6 +573,8 @@ function toSourceTree(tree: Record<string, unknown>, prefix = ''): Record<string
       out[key] = toSourceTree(value as Record<string, unknown>, name)
     } else if (getOptionType(name) === 'list-string') {
       out[key] = (value as unknown[]).map((item) => ({ string: item }))
+    } else if (getOptionType(name) === 'list-bool') {
+      out[key] = (value as unknown[]).map((item) => ({ bool: item }))
     } else {
       out[key] = value
     }
@@ -664,6 +693,10 @@ export function getOptionString(name: string): string {
   return getOption<string>(name)
 }
 
+export function getOptionListBool(name: string): boolean[] {
+  return getOption<boolean[]>(name)
+}
+
 export function isOptionDefault(name: string): boolean {
   if (!defaults.has(name)) throw new Error(`Unknown option: ${name}`)
   return JSON.stringify(values.get(name)) === JSON.stringify(defaults.get(name))
@@ -678,9 +711,13 @@ export function setOption(name: string, value: unknown): void {
     (type === 'int' && typeof value === 'number' && Number.isInteger(value)) ||
     (type === 'double' && typeof value === 'number' && Number.isFinite(value)) ||
     ((type === 'string' || type === 'color') && typeof value === 'string') ||
-    (type === 'list-string' && Array.isArray(value))
+    (type === 'list-string' && Array.isArray(value)) ||
+    (type === 'list-bool' &&
+      Array.isArray(value) &&
+      value.every((item) => typeof item === 'boolean'))
   if (!valid) throw new Error(`Type mismatch for option ${name}: ${type}`)
-  const normalized = type === 'list-string' ? [...(value as unknown[])] : value
+  const normalized =
+    type === 'list-string' || type === 'list-bool' ? [...(value as unknown[])] : value
   if (JSON.stringify(values.get(name)) === JSON.stringify(normalized)) return
   values.set(name, normalized)
   persist()

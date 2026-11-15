@@ -1,6 +1,7 @@
 // 重设分辨率移植测试：对齐 resolution_resampler.cpp / dialog_resample.cpp 的可见语义
 import { describe, expect, it } from 'vitest'
 
+import { createProjectProperties } from './defaults'
 import {
   RESAMPLE_AR_ADD_BORDERS,
   RESAMPLE_AR_MANUAL,
@@ -82,6 +83,9 @@ function makeDoc(over: Partial<SubtitleDocument> = {}): SubtitleDocument {
     styles: [makeStyle()],
     cues: [],
     passthroughSections: [],
+    attachments: [],
+    extradata: [],
+    properties: createProjectProperties(),
     ...over,
   }
 }

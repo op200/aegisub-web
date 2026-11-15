@@ -1,6 +1,7 @@
 import { Check, X } from 'lucide-react'
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
 
+import { getOptionInt, getOptionString, useOptionsVersion } from '../../config/options'
 import { Karaoke, roundCs, type KaraokeTagType } from '../../core/karaoke'
 import type { SubtitleCue } from '../../core/types'
 import { tPlain } from '../i18n'
@@ -53,6 +54,7 @@ export const KaraokeBar = forwardRef<KaraokeBarHandle, KaraokeBarProps>(function
   const timingCanvasRef = useRef<HTMLCanvasElement>(null)
   const mouseRef = useRef<{ x: number; remove: boolean } | null>(null)
   const theme = useSystemTheme()
+  const optionsVersion = useOptionsVersion() // Audio/Karaoke/Font Face/Size 与颜色选项变更后重绘
   const dragRef = useRef<{ marker: number } | null>(null)
 
   const reportPending = useCallback(
@@ -110,10 +112,14 @@ export const KaraokeBar = forwardRef<KaraokeBarHandle, KaraokeBarProps>(function
 
   // ---- split bar 绘制与交互 ----
   const buildLayout = useCallback(() => {
+    void optionsVersion // 字体选项变化后重建排版
     const kara = karaRef.current!
     const canvas = document.createElement('canvas')
     const context = canvas.getContext('2d')!
-    context.font = "12px 'Segoe UI', 'Microsoft YaHei UI', sans-serif"
+    // AudioKaraoke::SetStyle：Audio/Karaoke/Font Face + Font Size（pt → px）
+    const face = getOptionString('Audio/Karaoke/Font Face')
+    const sizePx = Math.max(1, getOptionInt('Audio/Karaoke/Font Size')) * (4 / 3)
+    context.font = `${sizePx}px ${face ? `"${face}", ` : ''}'Segoe UI', 'Microsoft YaHei UI', sans-serif`
     let charWidth = context.measureText(' ').width
     const slots: Slot[] = []
     const sylStartSlot: number[] = []
@@ -127,7 +133,7 @@ export const KaraokeBar = forwardRef<KaraokeBarHandle, KaraokeBarProps>(function
       }
     })
     return { slots, charWidth, sylStartSlot, font: context.font }
-  }, [])
+  }, [optionsVersion])
 
   const drawSplitBar = useCallback(() => {
     const canvas = splitCanvasRef.current
@@ -260,6 +266,7 @@ export const KaraokeBar = forwardRef<KaraokeBarHandle, KaraokeBarProps>(function
 
   // ---- 音节时间条绘制与拖拽 ----
   const drawTiming = useCallback(() => {
+    void optionsVersion // 颜色/字体选项变化后重绘
     const canvas = timingCanvasRef.current
     const kara = karaRef.current
     if (!canvas || !kara) return
@@ -292,8 +299,10 @@ export const KaraokeBar = forwardRef<KaraokeBarHandle, KaraokeBarProps>(function
       ctx.fillRect(toX(syl.startMs), 0, toX(syl.startMs + syl.durationMs) - toX(syl.startMs), h)
     }
 
-    // 音节标签（粗体白字）
-    ctx.font = "bold 11px 'Segoe UI', 'Microsoft YaHei UI', sans-serif"
+    // 音节标签（粗体白字；Audio/Karaoke 字体）
+    const face = getOptionString('Audio/Karaoke/Font Face')
+    const sizePx = Math.max(1, getOptionInt('Audio/Karaoke/Font Size')) * (4 / 3)
+    ctx.font = `bold ${sizePx}px ${face ? `"${face}", ` : ''}'Segoe UI', 'Microsoft YaHei UI', sans-serif`
     ctx.fillStyle = '#ffffff'
     ctx.textBaseline = 'middle'
     kara.syllables.forEach((syl) => {
@@ -311,19 +320,19 @@ export const KaraokeBar = forwardRef<KaraokeBarHandle, KaraokeBarProps>(function
       }
     })
 
-    // 行首红 / 行尾蓝（不可拖），音节边界黄（可拖）
-    ctx.lineWidth = 2
-    ctx.strokeStyle = 'rgb(216,0,0)'
+    // 行首红 / 行尾蓝（不可拖），音节边界（可拖；Colour/Audio Display/Syllable Boundaries）
+    ctx.lineWidth = Math.max(1, getOptionInt('Audio/Line Boundaries Thickness'))
+    ctx.strokeStyle = getOptionString('Colour/Audio Display/Line boundary Start')
     ctx.beginPath()
     ctx.moveTo(toX(start) + 1, 0)
     ctx.lineTo(toX(start) + 1, h)
     ctx.stroke()
-    ctx.strokeStyle = 'rgb(0,0,216)'
+    ctx.strokeStyle = getOptionString('Colour/Audio Display/Line boundary End')
     ctx.beginPath()
     ctx.moveTo(w - 1, 0)
     ctx.lineTo(w - 1, h)
     ctx.stroke()
-    ctx.strokeStyle = 'rgb(255,255,0)'
+    ctx.strokeStyle = getOptionString('Colour/Audio Display/Syllable Boundaries')
     for (let i = 1; i < kara.syllables.length; i++) {
       const x = toX(kara.syllables[i].startMs)
       ctx.beginPath()
@@ -331,7 +340,7 @@ export const KaraokeBar = forwardRef<KaraokeBarHandle, KaraokeBarProps>(function
       ctx.lineTo(x, h)
       ctx.stroke()
     }
-  }, [cue.startMs, cue.endMs, currentTimeMs])
+  }, [cue.startMs, cue.endMs, currentTimeMs, optionsVersion])
 
   useEffect(() => {
     drawTiming()

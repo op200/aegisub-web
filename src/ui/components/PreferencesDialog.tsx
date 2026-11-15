@@ -31,6 +31,7 @@ import {
   setOption,
   useOptionsVersion,
 } from '../../config/options'
+import { CHARSET_CHOICES } from '../../core/encoding'
 import { clearKeyframeCache, keyframeCacheStats } from '../../storage/keyframeCacheStore'
 import { loadStyleCatalogs } from '../../storage/styleCatalogStore'
 import {
@@ -116,6 +117,12 @@ const PAGES: Page[] = [
           },
           { kind: 'bool', label: 'Show main toolbar', opt: 'App/Show Toolbar' },
           { kind: 'bool', label: 'Save UI state in subtitles files', opt: 'App/Save UI State' },
+          {
+            kind: 'select',
+            label: 'Default save character set',
+            opt: 'App/Save Charset',
+            options: CHARSET_CHOICES.map((choice) => ({ value: choice.label, label: choice.name })),
+          },
           { kind: 'skip' },
           { kind: 'int', label: 'Toolbar Icon Size', opt: 'App/Toolbar Icon Size' },
           {

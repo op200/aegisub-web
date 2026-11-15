@@ -18,6 +18,7 @@
  * 吞吐参考：965MB 24 分钟 mkv 全量解码约 3 分钟（约 7× 实时），
  * 期间波形/频谱渐进绘制、界面可交互。
  */
+import { getOptionInt } from '../config/options'
 import type { AudioPeaks } from './peakAnalyzer'
 import { MS_PER_BUCKET } from './peakAnalyzer'
 import type { PeaksWorkerResponse } from './peaks.worker'
@@ -49,20 +50,23 @@ const fileExt = (name: string) => name.split('.').pop()?.toLowerCase() ?? ''
 export async function extractAudioPeaks(
   file: File,
   onProgress?: (peaks: AudioPeaks) => void,
+  audioStreamIndex?: number,
 ): Promise<AudioPeaks> {
   const ext = fileExt(file.name)
-  const preferNative = NATIVE_AUDIO_EXT.has(ext) && file.size <= NATIVE_DECODE_LIMIT
+  // 指定了音轨索引时 decodeAudioData 无法选择轨道，必须走解复用路径
+  const preferNative =
+    audioStreamIndex === undefined && NATIVE_AUDIO_EXT.has(ext) && file.size <= NATIVE_DECODE_LIMIT
   if (preferNative) {
     try {
       return await extractWithDecodeAudioData(file)
     } catch {
-      return await extractWithDemuxer(file, onProgress)
+      return await extractWithDemuxer(file, onProgress, audioStreamIndex)
     }
   }
   try {
-    return await extractWithDemuxer(file, onProgress)
+    return await extractWithDemuxer(file, onProgress, audioStreamIndex)
   } catch (error) {
-    if (ext !== 'mkv' && file.size <= NATIVE_DECODE_LIMIT) {
+    if (audioStreamIndex === undefined && ext !== 'mkv' && file.size <= NATIVE_DECODE_LIMIT) {
       try {
         return await extractWithDecodeAudioData(file)
       } catch {
@@ -116,7 +120,13 @@ async function extractWithDecodeAudioData(file: File): Promise<AudioPeaks> {
       settle(() => reject(new Error(event.message || 'Peaks worker failed to load')))
     }
     // AudioBuffer 声道无法转移（decodeAudioData 内部缓冲），structured clone 拷贝
-    worker.postMessage({ kind: 'audio-pcm', channels, sampleRate: decoded.sampleRate, durationMs })
+    worker.postMessage({
+      kind: 'audio-pcm',
+      channels,
+      sampleRate: decoded.sampleRate,
+      durationMs,
+      quality: getOptionInt('Audio/Renderer/Spectrum/Quality'),
+    })
   })
 }
 
@@ -126,6 +136,7 @@ async function extractWithDecodeAudioData(file: File): Promise<AudioPeaks> {
 async function extractWithDemuxer(
   file: File,
   onProgress?: (peaks: AudioPeaks) => void,
+  audioStreamIndex?: number,
 ): Promise<AudioPeaks> {
   const worker = spawnPeaksWorker()
   return new Promise<AudioPeaks>((resolve, reject) => {
@@ -185,6 +196,11 @@ async function extractWithDemuxer(
     worker.onerror = (event) => {
       settle(() => reject(new Error(event.message || 'Peaks worker failed to load')))
     }
-    worker.postMessage({ kind: 'audio-demux', file })
+    worker.postMessage({
+      kind: 'audio-demux',
+      file,
+      quality: getOptionInt('Audio/Renderer/Spectrum/Quality'),
+      audioStreamIndex,
+    })
   })
 }

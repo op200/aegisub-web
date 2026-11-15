@@ -1,7 +1,7 @@
 import type { SearchMatch, SearchSettings } from '../workers/protocol'
 import { blockText, parseBlocks } from './assTags'
 import { createCue, createDefaultStyle, makeId } from './defaults'
-import { exportSubtitle, parseSubtitle } from './format'
+import { exportSubtitle, parseSubtitle, type ExportOptions, type ParseOptions } from './formats'
 import type {
   CoreCommand,
   CoreState,
@@ -52,9 +52,9 @@ export class TypeScriptCoreRuntime {
     this.coalescable = false
   }
 
-  open(bytes: Uint8Array, sourceName: string): CoreState {
+  open(bytes: Uint8Array, sourceName: string, options: ParseOptions = {}): CoreState {
     const text = new TextDecoder('utf-8').decode(bytes)
-    this.document = parseSubtitle(text, sourceName)
+    this.document = parseSubtitle(text, sourceName, options)
     this.resetHistory()
     return this.getState()
   }
@@ -147,8 +147,9 @@ export class TypeScriptCoreRuntime {
     return this.getState()
   }
 
-  export(format?: SubtitleFormat): Uint8Array {
-    return new TextEncoder().encode(exportSubtitle(this.document, format))
+  export(format?: SubtitleFormat, options: ExportOptions = {}): Uint8Array {
+    const output = exportSubtitle(this.document, format, options)
+    return typeof output === 'string' ? new TextEncoder().encode(output) : output
   }
 
   search(settings: SearchSettings): SearchMatch[] {
@@ -378,6 +379,28 @@ export class TypeScriptCoreRuntime {
       }
       case 'updateScriptInfo':
         Object.assign(this.document.scriptInfo, command.patch)
+        break
+      case 'addAttachment': {
+        const { attachment } = command
+        const existing = this.document.attachments.findIndex(
+          (item) =>
+            item.group === attachment.group &&
+            item.name.toLowerCase() === attachment.name.toLowerCase(),
+        )
+        if (existing >= 0) this.document.attachments[existing] = { ...attachment }
+        else this.document.attachments.push({ ...attachment })
+        break
+      }
+      case 'deleteAttachment':
+        this.document.attachments = this.document.attachments.filter(
+          (item) =>
+            !(
+              item.group === command.group && item.name.toLowerCase() === command.name.toLowerCase()
+            ),
+        )
+        break
+      case 'updateProperties':
+        Object.assign(this.document.properties, command.patch)
         break
       case 'sortCues':
         this.document.cues.sort(
