@@ -79,7 +79,7 @@ template<> std::string AssOverrideParameter::Get<std::string>() const {
 
 template<> int AssOverrideParameter::Get<int>() const {
 	if (classification == AssParameterClass::ALPHA)
-		// &Hxx&, but vsfilter lets you leave everything out
+		// &Hxx&：允许省略 &H 前缀（libass 同样宽容）
 		return mid<int>(0, strtol(std::find_if(value.c_str(), value.c_str() + value.size(), isxdigit), nullptr, 16), 255);
 	return atoi(Get<std::string>().c_str());
 }

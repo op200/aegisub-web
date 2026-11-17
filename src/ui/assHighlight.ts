@@ -60,6 +60,8 @@ export interface AssHighlightSegment {
   type: AssSyntaxType
   /** 段级底纹（web 增强：模板 `!代码!` 块的 Dark Modern 编辑区底色；未设置则用样式配置背景） */
   background?: string
+  /** 拼写检查错误（SyntaxHighlight 的 SPELLING 样式；绘制红色波浪线） */
+  spellError?: boolean
 }
 
 /** Colour/Subtitle/Syntax 默认配色（default_config.json） */
@@ -416,24 +418,16 @@ export function tokenizeDialogueBody(text: string, karaokeTemplater = false): As
 }
 
 /**
- * 把 \p 之后的文本与向量 clip 参数标记为绘图（dialogue_parser.cpp MarkDrawings），
- * 并把最后一个未闭合覆盖块之后的所有 token 合并为纯文本（VSFilter 语义）。
+ * 把 \p 之后的文本与向量 clip 参数标记为绘图（dialogue_parser.cpp MarkDrawings）。
+ * 按 libass 语义，未闭合的覆盖块一直延续到行尾，其内容仍按标签着色。
  */
 function markDrawings(str: string, tokens: AssToken[]): void {
   if (!tokens.length) return
 
-  let lastOvrEnd = 0
-  for (let i = tokens.length; i > 0; i--) {
-    if (tokens[i - 1].type === 'OVR_END') {
-      lastOvrEnd = i
-      break
-    }
-  }
-
   let pos = 0
   let inDrawing = false
 
-  for (let i = 0; i < lastOvrEnd; i++) {
+  for (let i = 0; i < tokens.length; i++) {
     const len = tokens[i].length
 
     if (tokens[i].type === 'TEXT') {
@@ -467,7 +461,6 @@ function markDrawings(str: string, tokens: AssToken[]): void {
             tokens[drawingStart].length = tokenlen
             tokens[drawingStart].type = 'DRAWING_FULL'
             tokens.splice(drawingStart + 1, drawingEnd - drawingStart - 1)
-            lastOvrEnd -= drawingEnd - drawingStart - 1
           }
         }
       }
@@ -475,7 +468,7 @@ function markDrawings(str: string, tokens: AssToken[]): void {
       // \p<比例>：比例含 1-9 则后续文本按绘图着色（前导 0 视为 0）
       if (len === 1 && i + 1 < tokens.length && str[pos] === 'p') {
         inDrawing = false
-        if (i + 1 !== lastOvrEnd && tokens[i + 1].type === 'ARG') {
+        if (tokens[i + 1].type === 'ARG') {
           for (let j = pos + len; j < pos + len + tokens[i + 1].length; j++) {
             const c = str[j]
             if (c >= '1' && c <= '9') inDrawing = true
@@ -486,25 +479,6 @@ function markDrawings(str: string, tokens: AssToken[]): void {
     }
 
     pos += len
-  }
-
-  for (let i = lastOvrEnd; i < tokens.length;) {
-    const token = tokens[i]
-    if (
-      token.type === 'KARAOKE_TEMPLATE' ||
-      token.type === 'KARAOKE_VARIABLE' ||
-      token.type === 'LINE_BREAK'
-    ) {
-      i++
-      continue
-    }
-    token.type = inDrawing ? 'DRAWING_FULL' : 'TEXT'
-    if (i > 0 && tokens[i - 1].type === token.type) {
-      tokens[i - 1].length += token.length
-      tokens.splice(i, 1)
-      continue
-    }
-    i++
   }
 }
 
@@ -587,18 +561,56 @@ function splitDrawings(text: string, tokens: AssToken[]): void {
   }
 }
 
+/** 拼写检查用的词切分（ICU BreakIterator 的 word 规则；与 dialogueWords 同语义） */
+const HIGHLIGHT_WORD_SEGMENTER: Intl.Segmenter | null =
+  typeof Intl !== 'undefined' && 'Segmenter' in Intl
+    ? new Intl.Segmenter(undefined, { granularity: 'word' })
+    : null
+function* segmentWords(text: string): Generator<{ segment: string; isWordLike: boolean }> {
+  if (!HIGHLIGHT_WORD_SEGMENTER) {
+    let last = 0
+    for (const match of text.matchAll(/[\p{L}\p{M}\p{N}_'’-]+/gu)) {
+      const index = match.index ?? 0
+      if (index > last) yield { segment: text.slice(last, index), isWordLike: false }
+      yield { segment: match[0], isWordLike: true }
+      last = index + match[0].length
+    }
+    if (last < text.length) yield { segment: text.slice(last), isWordLike: false }
+    return
+  }
+  for (const part of HIGHLIGHT_WORD_SEGMENTER.segment(text))
+    yield { segment: part.segment, isWordLike: part.isWordLike === true }
+}
+
 /** token → 语法样式的映射（SyntaxHighlighter::Highlight，相邻同类合并） */
 function syntaxHighlight(
   text: string,
   tokens: AssToken[],
   templateLuaHighlight: boolean,
+  spellcheck?: ((word: string) => boolean) | null,
 ): AssHighlightSegment[] {
-  const styled: { type: AssSyntaxType; length: number; background?: string }[] = []
-  const setStyling = (length: number, type: AssSyntaxType, background?: string) => {
+  const styled: {
+    type: AssSyntaxType
+    length: number
+    background?: string
+    spellError?: boolean
+  }[] = []
+  const setStyling = (
+    length: number,
+    type: AssSyntaxType,
+    background?: string,
+    spellError?: boolean,
+  ) => {
     if (length <= 0) return
     const last = styled[styled.length - 1]
-    if (last && last.type === type && last.background === background) last.length += length
-    else styled.push({ type, length, background })
+    if (
+      last &&
+      last.type === type &&
+      last.background === background &&
+      last.spellError === spellError
+    )
+      last.length += length
+    else styled.push({ type, length, background, spellError })
   }
 
   let tokenPos = 0
@@ -661,7 +673,18 @@ function syntaxHighlight(
         setStyling(len, 'DRAWING_ENDPOINT_Y')
         break
       case 'TEXT':
-        setStyling(len, 'NORMAL')
+        if (spellcheck) {
+          // subs_edit_ctrl.cpp：TEXT 被 SplitWords 拆成 WORD，SyntaxHighlight 对错词叠加 SPELLING
+          const content = text.slice(tokenPos, tokenPos + len)
+          for (const part of segmentWords(content)) {
+            setStyling(
+              part.segment.length,
+              'NORMAL',
+              undefined,
+              part.isWordLike ? !spellcheck(part.segment) : undefined,
+            )
+          }
+        } else setStyling(len, 'NORMAL')
         break
       case 'TAG_NAME':
         setStyling(len, 'TAG')
@@ -698,6 +721,7 @@ function syntaxHighlight(
       text: text.slice(pos, pos + style.length),
       type: style.type,
       ...(style.background ? { background: style.background } : null),
+      ...(style.spellError ? { spellError: true } : null),
     })
     pos += style.length
   }
@@ -715,9 +739,10 @@ export function tokenizeAss(
   text: string,
   karaokeTemplater = false,
   templateLuaHighlight = true,
+  spellcheck?: ((word: string) => boolean) | null,
 ): AssHighlightSegment[] {
   const tokens = tokenizeDialogueBody(text, karaokeTemplater)
   markDrawings(text, tokens)
   splitDrawings(text, tokens)
-  return syntaxHighlight(text, tokens, templateLuaHighlight)
+  return syntaxHighlight(text, tokens, templateLuaHighlight, spellcheck)
 }

@@ -32,6 +32,8 @@ export interface MediaSource {
   /** 多轨道选择：容器内视频/音频流索引（ffmpegsource 的 TrackSelection） */
   videoStreamIndex?: number
   audioStreamIndex?: number
+  /** 容器只有一条视频轨：WebCodecs 打不开时可安全回退原生 <video>（默认轨即所选轨） */
+  singleVideoTrack?: boolean
 }
 
 export interface HostCapabilities {

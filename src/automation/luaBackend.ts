@@ -16,6 +16,11 @@ export interface LuaVmApi {
   lualib: any
   to_luastring: (value: string) => Uint8Array
   to_jsstring: (value: Uint8Array) => string
+  /**
+   * 可选：把 VM 内建的 C 模块（lpeg / luabins）注册到 package.preload。
+   * 只有能加载 C 模块的后端实现它；返回 false 表示该模块不可用。
+   */
+  preloadNativeModule?(L: any, name: 'lpeg' | 'luabins'): boolean
 }
 
 export interface LuaBackend {

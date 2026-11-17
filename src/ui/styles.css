@@ -565,10 +565,16 @@ button:disabled {
 .system-fonts-hint .system-fonts-hint-close:hover {
   color: #fff;
 }
+/* JASSUB/libass 加载失败：字幕渲染不可用（不做内置绘制回退，直接报错） */
+.subtitle-render-error {
+  border-color: #8a3a3a;
+  color: #ffb4b4;
+}
 /* WebCodecs 回退画布的错误提示（浏览器不支持解码时可见诊断） */
 .webcodecs-video-error {
   position: absolute;
   inset: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1290,6 +1296,24 @@ button:disabled {
   resize: none;
   z-index: 1;
 }
+.calltip {
+  position: absolute;
+  z-index: 4;
+  max-width: 320px;
+  padding: 2px 5px;
+  color: #000;
+  background: #ffffe1;
+  border: 1px solid #000;
+  font-family: 'Segoe UI', Tahoma, sans-serif;
+  font-size: 12px;
+  line-height: 1.25;
+  white-space: pre;
+  pointer-events: none;
+}
+.calltip-arg {
+  color: var(--accent, #1a6fb8);
+  font-weight: 700;
+}
 .cue-editor::selection {
   /* 选区由 textarea 自绘，但只画半透明底色：textarea 自身字形恒透明（color: transparent），
      下方高亮层的语法配色直接透出，选中不改变文字颜色（对齐 VSCode）；若写不透明底色或
@@ -1543,11 +1567,8 @@ button:disabled {
 }
 .grid-cps {
   /* base_grid.cpp 只 SetFont 一次、grid_column.cpp 无 SetFont：CPS 列与其余列同字体 */
-  color: var(--text-faint);
-}
-.grid-cps.cps-error {
-  color: var(--grid-cps-error, #ff0000);
-  font-weight: 700;
+  /* CPS 渐变（grid_column.cpp Paint）以当前行前景色为基准，故必须继承而非单独着色 */
+  color: inherit;
 }
 /* Aegisub Colour/Subtitle Grid 配色（Preferences → Interface → Colors 可改）
    背景优先级同 base_grid.cpp OnPaint：SelectedComment > Selection > Comment > Default，
@@ -1566,6 +1587,12 @@ button:disabled {
 .subtitle-row.at-time:not(.selected):not(.comment) {
   background: var(--grid-inframe-bg, #fffdea);
 }
+/* Colour/Subtitle Grid/Collision：与活动行时间重叠的行整行使用碰撞前景色，
+   优先级高于选中行（base_grid.cpp OnPaint：collision ? text_collision : selected ? text_sel : text） */
+.subtitle-row.collision,
+.subtitle-row.collision.selected {
+  color: var(--grid-fg-collision, #f00);
+}
 /* Colour/Subtitle Grid/Active Border：base_grid.cpp OnPaint 末段在整行之上补画一个
    1px 矩形框（DrawRectangle(0, top, w, lineHeight + 1)），其上下边正好压在行的灰色
    网格线上（相邻行共用同一像素）→ 语义是「把该行原有的灰线换成品红」。
@@ -1580,6 +1607,11 @@ button:disabled {
 /* 选中行前景色（Colour/Subtitle Grid/Selection）作用于所有列含行号列 */
 .subtitle-row.selected .row-number {
   color: var(--grid-sel-fg, #000);
+}
+/* 碰撞行优先于选中行的行号配色（源码 collision 分支先于 selected） */
+.subtitle-row.collision .row-number,
+.subtitle-row.selected.collision .row-number {
+  color: var(--grid-fg-collision, #f00);
 }
 
 .grid-context-menu {
@@ -1610,6 +1642,36 @@ button:disabled {
 .grid-context-menu .menu-item:hover:not(:disabled) {
   background: var(--menu-hover-bg);
   outline: 1px solid var(--menu-hover-border);
+}
+/* 文本编辑框右键菜单的二级子菜单（MenuPopup/MenuSub） */
+.grid-context-menu .menu-sub {
+  position: relative;
+}
+.grid-context-menu .menu-sub > .menu-item {
+  justify-content: space-between;
+}
+.grid-context-menu .menu-arrow {
+  margin-left: auto;
+  opacity: 0.75;
+}
+.grid-context-menu .menu-sub-popup {
+  display: none;
+  position: absolute;
+  top: -4px;
+  left: 100%;
+  min-width: 160px;
+  padding: 3px;
+  background: var(--control-raised);
+  border: 1px solid var(--border-popup);
+  box-shadow: 2px 3px 8px rgba(0, 0, 0, 0.22);
+  z-index: 2;
+}
+.grid-context-menu .menu-sub:hover > .menu-sub-popup,
+.grid-context-menu .menu-sub:focus-within > .menu-sub-popup {
+  display: block;
+}
+.grid-context-menu .menu-sub.disabled {
+  opacity: 0.5;
 }
 
 .app-footer {
@@ -1937,6 +1999,16 @@ button:disabled {
 }
 .export-filter-configure {
   align-self: flex-start;
+}
+/* Transform Framerate 配置（export_framerate.cpp 的内嵌设置面板） */
+.export-framerate-settings .dialog-field-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.export-framerate-settings .dialog-field-row > input[type='text'] {
+  width: 90px;
 }
 .style-dialog {
   width: 560px;
@@ -3760,4 +3832,224 @@ button:disabled {
   width: 100%;
   height: 26px;
   white-space: nowrap;
+}
+
+/* ---- 颜色选择器（dialog_colorpicker.cpp）---- */
+.colour-button {
+  width: 34px;
+  height: 15px;
+  padding: 0;
+  border: 1px solid var(--border-field);
+  border-radius: 1px;
+  cursor: pointer;
+  background-image:
+    linear-gradient(var(--swatch-color, #000), var(--swatch-color, #000)),
+    repeating-conic-gradient(#d0d0d0 0 25%, #fff 0 50%);
+  background-size:
+    auto,
+    8px 8px;
+}
+.colour-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.color-picker-dialog {
+  width: 620px;
+  max-width: 96vw;
+}
+.color-picker-body {
+  display: flex;
+  gap: 10px;
+  padding: 8px;
+  align-items: flex-start;
+}
+.color-picker-spectrum {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+  padding: 5px;
+}
+.color-picker-spectrum legend,
+.color-picker-controls legend {
+  padding: 0 3px;
+  font-size: 11px;
+}
+.color-picker-spectrum-row {
+  display: flex;
+  gap: 5px;
+}
+.color-picker-spectrum-wrap,
+.color-picker-slider-wrap {
+  position: relative;
+  line-height: 0;
+}
+.color-picker-canvas {
+  width: 256px;
+  height: 256px;
+  cursor: crosshair;
+  border: 1px solid var(--border-field);
+}
+.color-picker-slider {
+  width: 10px;
+  height: 256px;
+  cursor: ns-resize;
+  border: 1px solid var(--border-field);
+}
+.color-picker-pointer {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  border: 1px solid #000;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px #fff;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.color-picker-slider-pointer {
+  position: absolute;
+  left: -3px;
+  width: 14px;
+  height: 2px;
+  background: #000;
+  box-shadow: 0 0 0 1px #fff;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.color-picker-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.color-picker-controls fieldset {
+  margin: 0;
+  padding: 4px 6px 6px;
+  min-width: 0;
+}
+.picker-input-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 3px;
+}
+.picker-input-row > span {
+  flex: 0 0 42px;
+  font-size: 11px;
+  text-align: right;
+}
+.picker-input-row label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+.picker-input-row label > span {
+  font-size: 11px;
+}
+.picker-number {
+  width: 52px;
+}
+.picker-text {
+  flex: 1;
+  min-width: 0;
+}
+.color-picker-hsx {
+  display: flex;
+  gap: 6px;
+}
+.color-picker-hsx fieldset {
+  flex: 1;
+}
+.color-picker-bottom {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: stretch;
+}
+.color-picker-preview {
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--border-field);
+}
+.picker-dropper {
+  white-space: nowrap;
+}
+.color-picker-recent {
+  display: grid;
+  grid-template-columns: repeat(8, 16px);
+  gap: 2px;
+}
+.color-picker-swatch {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid var(--border-field);
+  cursor: pointer;
+}
+
+/* ---- 拼写检查对话框（dialog_spellchecker.cpp）---- */
+.spellcheck-dialog {
+  width: 520px;
+}
+.spellcheck-body {
+  display: flex;
+  gap: 10px;
+  padding: 8px;
+}
+.spellcheck-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+.spellcheck-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.spellcheck-field > span {
+  flex: 0 0 auto;
+  font-size: 12px;
+}
+.spellcheck-field > input {
+  flex: 1;
+  min-width: 0;
+}
+.spellcheck-lists {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.spellcheck-suggestions {
+  height: 150px;
+}
+.spellcheck-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 150px;
+}
+.spellcheck-actions button {
+  width: 100%;
+}
+.spellcheck-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+.spellcheck-notice {
+  padding: 14px;
+}
+.spellcheck-error {
+  padding: 10px 12px 0;
+  font-weight: 700;
+}
+.spellcheck-hint {
+  padding: 4px 12px 10px;
+  color: var(--text-tertiary);
 }

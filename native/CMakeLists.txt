@@ -150,6 +150,39 @@ else()
   add_library(lua55 STATIC ${LUA55_SOURCES})
   target_include_directories(lua55 PUBLIC "${LUA55_ROOT}")
 
+  # -------------------------------------------------------------------------
+  # Lua 5.1 时代的 C 模块：LPeg 0.10 与 luabins
+  # -------------------------------------------------------------------------
+  # - LPeg：Aegisub 自带 libaegisub/lua/modules/lpeg.c（0.10）；桌面版用它做
+  #   MoonScript 0.7 的语法解析，web 的 MoonScript 0.8 不需要，但脚本可能 require 'lpeg'。
+  # - luabins：Aegisub subprojects/luabins（0.3，已废弃），仍按桌面行为提供。
+  # 两者都需要 lua55_legacy_compat.h 补齐 Lua 5.5 移除的 API。
+  set(LUABINS_ROOT "${AEGISUB_ROOT}/subprojects/luabins/src")
+  add_library(lua55_legacy_modules STATIC
+    "${AEGISUB_ROOT}/libaegisub/lua/modules/lpeg.c"
+    "${LUABINS_ROOT}/fwrite.c"
+    "${LUABINS_ROOT}/load.c"
+    "${LUABINS_ROOT}/luabins.c"
+    "${LUABINS_ROOT}/luainternals.c"
+    "${LUABINS_ROOT}/savebuffer.c"
+    "${LUABINS_ROOT}/save.c"
+    "${LUABINS_ROOT}/write.c"
+  )
+  target_include_directories(lua55_legacy_modules PRIVATE
+    "${LUA55_ROOT}"
+    "${AEGISUB_ROOT}/libaegisub/lua/modules"
+    "${LUABINS_ROOT}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(lua55_legacy_modules PRIVATE
+      -include "${CMAKE_CURRENT_SOURCE_DIR}/src/lua55_legacy_compat.h")
+  elseif(MSVC)
+    target_compile_options(lua55_legacy_modules PRIVATE
+      /FI"${CMAKE_CURRENT_SOURCE_DIR}/src/lua55_legacy_compat.h")
+  endif()
+  target_link_libraries(lua55_legacy_modules PUBLIC lua55)
+
   if(DEFINED EMSCRIPTEN)
     set(LUA55_WASM_LINK_OPTIONS
       -sMODULARIZE=1
@@ -159,13 +192,13 @@ else()
       -sALLOW_MEMORY_GROWTH=1
       -sSTACK_SIZE=1048576
       -sENVIRONMENT=web,worker,node
-      -sEXPORTED_FUNCTIONS=_lua_web_registry_index,_lua_web_newstate,_lua_web_close,_lua_web_newthread,_lua_web_main_handle,_lua_web_openlibs,_lua_web_gettop,_lua_web_settop,_lua_web_pushvalue,_lua_web_pop,_lua_web_insert,_lua_web_remove,_lua_web_replace,_lua_web_absindex,_lua_web_xmove,_lua_web_type,_lua_web_typename,_lua_web_isnil,_lua_web_isnumber,_lua_web_isstring,_lua_web_istable,_lua_web_isboolean,_lua_web_isfunction,_lua_web_isuserdata,_lua_web_isyieldable,_lua_web_toboolean,_lua_web_tonumber,_lua_web_tointeger,_lua_web_tolstring,_lua_web_touserdata,_lua_web_pushnil,_lua_web_pushboolean,_lua_web_pushnumber,_lua_web_pushinteger,_lua_web_pushstring,_lua_web_pushlightuserdata,_lua_web_newuserdata,_lua_web_newtable,_lua_web_getfield,_lua_web_setfield,_lua_web_getglobal,_lua_web_setglobal,_lua_web_rawget,_lua_web_rawset,_lua_web_rawgeti,_lua_web_rawseti,_lua_web_rawlen,_lua_web_setmetatable,_lua_web_next,_lua_web_pushclosure,_lua_web_pcall,_lua_web_call,_lua_web_resume,_lua_web_ref,_lua_web_loadbuffer,_lua_web_dostring,_lua_web_set_error,_lua_web_buffer,_lua_web_buffer2,_lua_web_strlen_addr,_lua_web_next_ref,_lua_web_getstack,_lua_web_getinfo,_lua_web_dbg_str,_lua_web_dbg_int
+      -sEXPORTED_FUNCTIONS=_lua_web_registry_index,_lua_web_newstate,_lua_web_close,_lua_web_newthread,_lua_web_main_handle,_lua_web_openlibs,_lua_web_preload_lpeg,_lua_web_preload_luabins,_lua_web_gettop,_lua_web_settop,_lua_web_pushvalue,_lua_web_pop,_lua_web_insert,_lua_web_remove,_lua_web_replace,_lua_web_absindex,_lua_web_xmove,_lua_web_type,_lua_web_typename,_lua_web_isnil,_lua_web_isnumber,_lua_web_isstring,_lua_web_istable,_lua_web_isboolean,_lua_web_isfunction,_lua_web_isuserdata,_lua_web_isyieldable,_lua_web_toboolean,_lua_web_tonumber,_lua_web_tointeger,_lua_web_tolstring,_lua_web_touserdata,_lua_web_pushnil,_lua_web_pushboolean,_lua_web_pushnumber,_lua_web_pushinteger,_lua_web_pushstring,_lua_web_pushlightuserdata,_lua_web_newuserdata,_lua_web_newtable,_lua_web_getfield,_lua_web_setfield,_lua_web_getglobal,_lua_web_setglobal,_lua_web_rawget,_lua_web_rawset,_lua_web_rawgeti,_lua_web_rawseti,_lua_web_rawlen,_lua_web_setmetatable,_lua_web_next,_lua_web_pushclosure,_lua_web_pcall,_lua_web_call,_lua_web_resume,_lua_web_ref,_lua_web_loadbuffer,_lua_web_dostring,_lua_web_set_error,_lua_web_buffer,_lua_web_buffer2,_lua_web_strlen_addr,_lua_web_next_ref,_lua_web_getstack,_lua_web_getinfo,_lua_web_dbg_str,_lua_web_dbg_int
       -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32,HEAP8,HEAP16,HEAPU16,HEAPF32,HEAPF64,getValue,setValue
     )
     add_executable(lua55_wasm "${CMAKE_CURRENT_SOURCE_DIR}/src/lua_web_api.cpp")
     set_target_properties(lua55_wasm PROPERTIES OUTPUT_NAME lua55)
     target_include_directories(lua55_wasm PRIVATE "${LUA55_ROOT}")
     target_link_options(lua55_wasm PRIVATE ${LUA55_WASM_LINK_OPTIONS})
-    target_link_libraries(lua55_wasm lua55)
+    target_link_libraries(lua55_wasm lua55_legacy_modules lua55)
   endif()
 endif()

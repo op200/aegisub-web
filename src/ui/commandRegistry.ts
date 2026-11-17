@@ -124,6 +124,12 @@ export interface CommandApi {
   replaceAll(): void
   openStyleManager(): void
   openDialog(dialog: DialogKind): void
+  /** am/reload：重载全部全局 + 本地 Automation 脚本 */
+  reloadAutomationScripts(): void
+  /** am/reload/autoload：只重扫 autoload 目录 */
+  reloadGlobalAutomationScripts(): void
+  /** app/updates：向服务器重新取入口页，比较资源哈希判断是否有新版本 */
+  checkForUpdates(): void
   setToolbarVisible(value: boolean): void
   setAudioView(view: AudioView): void
   setAudioOption(option: keyof AudioOptions, value: boolean): void
@@ -1416,6 +1422,13 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   'am/meta': {
     run: (_, api) => api.openDialog('automation'),
   },
+  // command/automation.cpp：重载全部脚本 / 只重扫 autoload
+  'am/reload': {
+    run: (_, api) => api.reloadAutomationScripts(),
+  },
+  'am/reload/autoload': {
+    run: (_, api) => api.reloadGlobalAutomationScripts(),
+  },
   'tool/style/assistant': {
     // 源码无 Validate：按钮恒可用（无活动行时 Web 对话框不渲染）
     run: (_, api) => api.openDialog('styling-assistant'),
@@ -1453,7 +1466,7 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
     run: (_, api) => api.openDialog('language'),
   },
   'app/updates': {
-    run: (_, api) => api.setStatus('The web build updates automatically'),
+    run: (_, api) => api.checkForUpdates(),
   },
   'app/log': {
     run: (_, api) => api.toggleLog(),
@@ -1517,7 +1530,12 @@ export const COMMAND_REGISTRY: Record<string, CommandDef> = {
   },
 
   // ---- 帮助 ----
-  'help/contents': { run: (_, api) => api.setStatus('Aegisub-compatible shortcuts are active') },
+  'help/contents': {
+    // help.cpp：桌面用 wxHelpController 打开本地 HTML 帮助；web 打开官方在线文档
+    run: () => {
+      window.open('https://docs.aegisub.org/3.5/Main_Page/', '_blank', 'noopener')
+    },
+  },
   'help/website': {
     run: () => {
       window.open('https://aegisub.org/', '_blank', 'noopener')
@@ -1671,7 +1689,7 @@ async function joinLines(
     text = ordered.map((cue) => cue.text).join(' ')
   } else if (mode === 'as_karaoke') {
     text = ordered
-      .map((cue) => `{\\k${Math.round((cue.endMs - cue.startMs) / 10)}}${cue.text}`)
+      .map((cue) => `{\\k${Math.trunc((cue.endMs - cue.startMs) / 10)}}${cue.text}`)
       .join('')
   }
   // keep_first：保留首行文本
@@ -1721,113 +1739,135 @@ function adjoinable(ctx: CommandContext): boolean {
   return seen === sel.length
 }
 
+/** trim_text（edit.cpp）：去掉行首/行尾的连续空格、制表符、\n、\N、\h */
+function trimText(text: string): string {
+  return text.replace(/^( |\t|\\[nNh])+/, '').replace(/( |\t|\\[nNh])+$/, '')
+}
+
+/** expand_times（edit.cpp）：把 dst 的时间范围扩张到覆盖 src */
+function expandTimes(src: SubtitleCue, dst: SubtitleCue): void {
+  dst.startMs = Math.min(dst.startMs, src.startMs)
+  dst.endMs = Math.max(dst.endMs, src.endMs)
+}
+
+/** check_start（edit.cpp）：d1 以 d2 开头时去掉该前缀，并让 d2 覆盖 d1 的时间 */
+function checkStart(d1: SubtitleCue, d2: SubtitleCue): boolean {
+  if (!d1.text.startsWith(d2.text)) return false
+  d1.text = trimText(d1.text.slice(d2.text.length))
+  expandTimes(d1, d2)
+  return true
+}
+
+/** check_end（edit.cpp）：d1 以 d2 结尾时去掉该后缀，并让 d2 覆盖 d1 的时间 */
+function checkEnd(d1: SubtitleCue, d2: SubtitleCue): boolean {
+  if (!d1.text.endsWith(d2.text)) return false
+  d1.text = trimText(d1.text.slice(0, d1.text.length - d2.text.length))
+  expandTimes(d1, d2)
+  return true
+}
+
 /**
- * edit/line/recombine（edit.cpp RecombineCombination）：
- * 把"时间部分重叠、文本互补"的行重新合并。
+ * edit/line/recombine（edit.cpp edit_line_recombine）：
+ * 把被拆开/合并过的行按文本前后缀互补关系重新拼合。
  */
 async function recombineLines(ctx: CommandContext, api: CommandApi): Promise<void> {
   const { core, selected } = ctx
   const selSet = new Set(selected)
-  const cues = core.document.cues.filter((cue) => selSet.has(cue.id))
-  if (cues.length < 2) return
+  const docIndex = new Map(core.document.cues.map((cue, index) => [cue.id, index]))
+  // 按开始时间排序，同时间保持文档顺序（boost::sort + GetSelectedSet）
+  const ordered = core.document.cues
+    .filter((cue) => selSet.has(cue.id))
+    .sort((a, b) => a.startMs - b.startMs || docIndex.get(a.id)! - docIndex.get(b.id)!)
+  if (ordered.length < 2) return
 
-  interface Group {
-    style: string
-    actor: string
-    effect: string
-    layer: number
-    lines: SubtitleCue[]
-  }
-  const groups = new Map<string, Group>()
-  for (const cue of cues) {
-    const key = `${cue.style}\u0000${cue.actor}\u0000${cue.effect}\u0000${cue.layer}`
-    if (!groups.has(key))
-      groups.set(key, {
-        style: cue.style,
-        actor: cue.actor,
-        effect: cue.effect,
-        layer: cue.layer,
-        lines: [],
-      })
-    groups.get(key)!.lines.push(cue)
-  }
+  const originals = new Map(ordered.map((cue) => [cue.id, cue]))
+  const working = ordered.map((cue) => structuredClone(cue))
+  const deleted = new Set<string>()
+  for (const line of working) line.text = trimText(line.text)
 
-  interface MergePlan {
-    first: SubtitleCue
-    startMs: number
-    endMs: number
-    text: string
-    dropIds: string[]
-  }
-  const plans: MergePlan[] = []
-  for (const group of groups.values()) {
-    const lines = [...group.lines].sort((a, b) => a.startMs - b.startMs)
-    for (let i = 0; i < lines.length; i++) {
-      const base = lines[i]
-      if (plans.some((plan) => plan.dropIds.includes(base.id) || plan.first.id === base.id))
+  const last = working.length - 1
+  // C++ 的 d2 <= end 循环：跳过已删除行，条件不成立即停止
+  const advance = (from: number, merge: (line: SubtitleCue) => boolean): number => {
+    let index = from
+    while (index <= last) {
+      const line = working[index]
+      if (deleted.has(line.id)) {
+        index++
         continue
-      for (let j = i + 1; j < lines.length; j++) {
-        const other = lines[j]
-        if (plans.some((plan) => plan.dropIds.includes(other.id) || plan.first.id === other.id))
-          continue
-        // 部分重叠：base 先开始，other 在 base 结束前开始
-        if (other.startMs < base.endMs && other.endMs > base.endMs) {
-          const baseTail = lastLineText(base.text).replace(/\\N$/i, '')
-          const otherHead = firstLineText(other.text).replace(/^\\N/i, '')
-          plans.push({
-            first: base,
-            startMs: base.startMs,
-            endMs: other.endMs,
-            text:
-              base.text.slice(0, base.text.length - baseTail.length) +
-              baseTail +
-              otherHead +
-              other.text.slice(otherHead.length),
-            dropIds: [other.id],
-          })
-          break
-        }
-        // 完全包含（other 完全在 base 内）：文本拼接
-        if (other.startMs >= base.startMs && other.endMs <= base.endMs) {
-          plans.push({
-            first: base,
-            startMs: base.startMs,
-            endMs: base.endMs,
-            text: `${base.text} ${other.text}`.trim(),
-            dropIds: [other.id],
-          })
-          break
-        }
       }
+      if (!merge(line)) break
+      index++
+    }
+    return index
+  }
+
+  for (let i = 0; i < last; i++) {
+    const d1 = working[i]
+    if (deleted.has(d1.id)) continue
+    const d2 = working[i + 1]
+
+    // 1, 1+2（或 2+1），2 会变成 1, 2, 2，删掉重复行
+    if (d1.text === d2.text) {
+      expandTimes(d1, d2)
+      deleted.add(d1.id)
+      continue
+    }
+
+    // 1, 1+2, 1 会变成 1, 2, [空]
+    if (!d1.text) {
+      deleted.add(d1.id)
+      continue
+    }
+
+    // d2 是选区最后一行时不会命中上面的空行判断
+    if (i + 1 === last && !d2.text) {
+      deleted.add(d2.id)
+      continue
+    }
+
+    let cursor = i + 1
+    // 1, 1+2
+    cursor = advance(cursor, (line) => checkStart(line, d1))
+    // 1, 2+1
+    cursor = advance(cursor, (line) => checkEnd(line, d1))
+    // 1+2, 2
+    cursor = advance(cursor, (line) => checkEnd(d1, line))
+    // 2+1, 2
+    cursor = advance(cursor, (line) => checkStart(d1, line))
+  }
+
+  const commands: CoreCommand[] = []
+  const removed: string[] = []
+  for (const line of working) {
+    if (deleted.has(line.id)) {
+      removed.push(line.id)
+      continue
+    }
+    const original = originals.get(line.id)!
+    if (
+      line.startMs !== original.startMs ||
+      line.endMs !== original.endMs ||
+      line.text !== original.text
+    ) {
+      commands.push({
+        type: 'updateCue',
+        id: line.id,
+        patch: { startMs: line.startMs, endMs: line.endMs, text: line.text },
+      })
     }
   }
-  if (!plans.length) {
+  if (!commands.length && !removed.length) {
     api.setStatus('No recombination possibilities found')
     return
   }
-  const commands: CoreCommand[] = []
-  for (const plan of plans) {
-    commands.push({
-      type: 'updateCue',
-      id: plan.first.id,
-      patch: { startMs: plan.startMs, endMs: plan.endMs, text: plan.text },
-    })
-    commands.push({ type: 'deleteCues', ids: plan.dropIds })
-  }
-  await api.apply(commands, 'combining')
-}
+  if (removed.length) commands.push({ type: 'deleteCues', ids: removed })
 
-/** 最后一行可见文本（供 recombine 拼接判断） */
-function lastLineText(text: string): string {
-  const stripped = text.replace(/\{[^}]*\}/g, '')
-  const parts = stripped.split(/\\[Nn]/)
-  return parts[parts.length - 1] ?? ''
-}
-
-/** 第一行可见文本 */
-function firstLineText(text: string): string {
-  const stripped = text.replace(/\{[^}]*\}/g, '')
-  return stripped.split(/\\[Nn]/)[0] ?? ''
+  const next = await api.apply(commands, 'combining')
+  if (!next) return
+  // 新选区 = 原选区中仍存在的行；为空时取文档第一行
+  const surviving = next.document.cues.filter((cue) => selSet.has(cue.id)).map((cue) => cue.id)
+  const fallback = next.document.cues[0]?.id
+  api.selectLines(surviving.length ? surviving : fallback ? [fallback] : [])
 }
 
 /**

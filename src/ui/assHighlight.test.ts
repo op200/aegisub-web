@@ -438,14 +438,15 @@ describe('tokenizeAss', () => {
     ])
   })
 
-  it('未闭合覆盖块按纯文本处理', () => {
+  it('未闭合覆盖块延续到行尾（libass 语义）', () => {
     expectStyles('{\\incorrect}{\\incorrect', false, [
       ['OVERRIDE', 1],
       ['PUNCTUATION', 1],
       ['TAG', 9],
-      ['OVERRIDE', 1],
-      // 源码此处为 WORD 切分后的 NORMAL(2) + SPELLING(9)（无拼写检查器时合并为 NORMAL 11）
-      ['NORMAL', 11],
+      // 前一块的 OVR_END 与后一未闭合块的 OVR_BEGIN 相邻同类，合并为 2
+      ['OVERRIDE', 2],
+      ['PUNCTUATION', 1],
+      ['TAG', 9],
     ])
   })
 
@@ -534,7 +535,8 @@ describe('tokenizeAss', () => {
     ])
 
     expectStyles('{foo$bar', true, [
-      ['NORMAL', 4],
+      ['OVERRIDE', 1],
+      ['COMMENT', 3],
       ['KARAOKE_VARIABLE', 4],
     ])
   })
@@ -576,13 +578,16 @@ describe('tokenizeAss', () => {
       ['NORMAL', 1],
     ])
 
-    // `}` 被 !表达式! 吞掉：无 OVR_END → 覆盖块按纯文本处理
+    // `}` 被 !表达式! 吞掉：无 OVR_END，libass 语义下覆盖块延续到行尾
     expectStyles("{\\b1!'}'!a", true, [
-      ['NORMAL', 4],
+      ['OVERRIDE', 1],
+      ['PUNCTUATION', 1],
+      ['TAG', 1],
+      ['PARAMETER', 1],
       ['LUA_DELIMITER', 1],
       ['LUA_STRING', 3],
       ['LUA_DELIMITER', 1],
-      ['NORMAL', 1],
+      ['PARAMETER', 1],
     ])
   })
 

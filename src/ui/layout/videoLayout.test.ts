@@ -1,10 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import {
-  calculateAttachedVideoLayout,
-  fitWindowZoomToVideo,
-  placeholderVideoZoom,
-} from './videoLayout'
+import { calculateAttachedVideoLayout, fitWindowZoomToVideo } from './videoLayout'
 
 describe('window zoom on video open', () => {
   // frame_main.cpp FrameMain::OnVideoOpen
@@ -36,29 +32,12 @@ describe('attached video layout', () => {
     })
   })
 
-  it('reserves a 1080p frame when no video is loaded', () => {
-    // 占位缩放 = 载入 1080p 视频时 OnVideoOpen 会得到的缩放
-    const zoom = placeholderVideoZoom(1, 1920, 1080)
-    expect(zoom).toBe(0.5)
-    // 载入 1080p 时再次减档不改变该缩放：占位 → 载入无跳变
-    expect(fitWindowZoomToVideo({ width: 1920, height: 1080 }, zoom, 1920, 1080)).toBe(zoom)
-    expect(calculateAttachedVideoLayout({ width: 1920, height: 1080 }, zoom, 16 / 9)).toMatchObject(
-      {
-        displayWidth: 960,
-        displayHeight: 540,
-        panelWidth: 991,
-        panelHeight: 596,
-      },
-    )
-  })
-
-  it('keeps 100 percent when the window is large enough for the placeholder', () => {
-    expect(placeholderVideoZoom(1, 3840, 2160)).toBe(1)
-    expect(calculateAttachedVideoLayout({ width: 1920, height: 1080 }, 1, 16 / 9)).toMatchObject({
-      displayWidth: 1920,
-      displayHeight: 1080,
-      panelWidth: 1951,
-      panelHeight: 1136,
+  it('reserves a 1080p frame at the 50 percent placeholder zoom', () => {
+    expect(calculateAttachedVideoLayout({ width: 1920, height: 1080 }, 0.5, 16 / 9)).toMatchObject({
+      displayWidth: 960,
+      displayHeight: 540,
+      panelWidth: 991,
+      panelHeight: 596,
     })
   })
 

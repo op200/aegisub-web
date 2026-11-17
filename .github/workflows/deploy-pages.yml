@@ -2,7 +2,7 @@ name: Deploy GitHub Pages
 
 on:
   push:
-    branches: master
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -37,8 +37,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 'latest'
-          cache: 'pnpm'
+          node-version: "latest"
+          cache: "pnpm"
 
       - run: pnpm i --frozen-lockfile
 

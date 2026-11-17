@@ -29,3 +29,26 @@ export function MenuPopup(props: { x: number; y: number; label: string; children
     </div>
   )
 }
+
+/** 二级子菜单（wxMenu::AppendSubMenu）；hover / 键盘聚焦展开 */
+export function MenuSub(props: { label: string; children: ReactNode; disabled?: boolean }) {
+  return (
+    <div className={`menu-sub${props.disabled ? ' disabled' : ''}`}>
+      <button
+        type="button"
+        className="menu-item menu-sub-label"
+        role="menuitem"
+        aria-haspopup="menu"
+        disabled={props.disabled}
+      >
+        <span className="menu-label">{props.label}</span>
+        <span className="menu-arrow" aria-hidden="true">
+          ▸
+        </span>
+      </button>
+      <div className="menu-sub-popup" role="menu">
+        {props.children}
+      </div>
+    </div>
+  )
+}

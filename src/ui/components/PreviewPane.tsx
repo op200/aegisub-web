@@ -36,7 +36,7 @@ import type { MediaSource } from '../../platform/types'
 import { aegisubIconUrl, commandIcon } from '../aegisubIcons'
 import { getVideoContext } from '../aegisubMenus'
 import { createAssRenderer, type AssRenderer } from '../assRenderer'
-import { assColorToCss, cssColorToHex } from '../color'
+import { cssColorToHex } from '../color'
 import { COMMANDS, commandTooltip } from '../commands'
 import { tPlain } from '../i18n'
 import { logError, logInfo, logWarning } from '../log'
@@ -251,14 +251,6 @@ const VISUAL_TOOLS = [
   ['', ''],
   ['help/video', 'visual_help'],
 ] as const
-
-interface HitBox {
-  cue: SubtitleCue
-  left: number
-  right: number
-  top: number
-  bottom: number
-}
 
 // ---------------------------------------------------------------------------
 // 矢量裁剪工具（visual_tool_vector_clip.cpp）
@@ -1538,99 +1530,6 @@ function plainText(text: string): string[] {
     .split(/\\N|\\n/)
 }
 
-function drawCue(
-  context: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-  text: string,
-  style: SubtitleStyle,
-  playResX: number,
-  playResY: number,
-  /** false：只计算包围盒不落笔（字幕由 jassub/libass 绘制时） */
-  draw = true,
-): { left: number; right: number; top: number; bottom: number } {
-  const scaleX = width / Math.max(1, playResX)
-  const scaleY = height / Math.max(1, playResY)
-  const scale = scaleY
-  const overrides = readVisualOverrides(text)
-  const fontSize = Math.max(1, style.fontSize * scale)
-  const lines = plainText(text)
-  const lineHeight = fontSize * 1.2
-  const defaultVertical =
-    style.alignment <= 3
-      ? height - Math.max(18, style.marginV * scale) - lineHeight * (lines.length - 1)
-      : style.alignment >= 7
-        ? Math.max(fontSize, style.marginV * scale + fontSize)
-        : height / 2
-  const defaultHorizontal = [1, 4, 7].includes(style.alignment)
-    ? Math.max(16, style.marginL * scale)
-    : [3, 6, 9].includes(style.alignment)
-      ? width - Math.max(16, style.marginR * scale)
-      : width / 2
-  const horizontal = overrides.pos ? overrides.pos.x * scaleX : defaultHorizontal
-  const vertical = overrides.pos ? overrides.pos.y * scaleY : defaultVertical
-  context.textAlign = [1, 4, 7].includes(style.alignment)
-    ? 'left'
-    : [3, 6, 9].includes(style.alignment)
-      ? 'right'
-      : 'center'
-  context.textBaseline = 'alphabetic'
-  context.lineJoin = 'round'
-  context.font = `${style.italic ? 'italic ' : ''}${style.bold ? '700 ' : '400 '}${fontSize}px "${style.fontName}", sans-serif`
-  context.fillStyle = assColorToCss(style.primaryColor)
-  context.strokeStyle = assColorToCss(style.outlineColor, '#000000')
-  context.lineWidth = Math.max(1, style.outline * scale * 2)
-  context.save()
-  if (overrides.clip) {
-    context.beginPath()
-    context.rect(
-      overrides.clip.x1 * scaleX,
-      overrides.clip.y1 * scaleY,
-      (overrides.clip.x2 - overrides.clip.x1) * scaleX,
-      (overrides.clip.y2 - overrides.clip.y1) * scaleY,
-    )
-    if (!overrides.clip.inverse) context.clip()
-  }
-  context.translate(horizontal, vertical)
-  context.rotate((overrides.rotationZ * Math.PI) / 180)
-  const xyScaleX = Math.max(0.05, Math.abs(Math.cos((overrides.rotationY * Math.PI) / 180)))
-  const xyScaleY = Math.max(0.05, Math.abs(Math.cos((overrides.rotationX * Math.PI) / 180)))
-  context.scale((overrides.scaleX / 100) * xyScaleX, (overrides.scaleY / 100) * xyScaleY)
-  let boxLeft = width
-  let boxRight = 0
-  lines.forEach((line, index) => {
-    const y = (index - (lines.length - 1)) * lineHeight
-    const measured = context.measureText(line)
-    const textWidth =
-      Math.abs(measured.actualBoundingBoxLeft) + Math.abs(measured.actualBoundingBoxRight) ||
-      measured.width
-    if (draw) {
-      if (style.shadow > 0) {
-        context.shadowColor = assColorToCss(style.backColor, 'rgba(0,0,0,.7)')
-        context.shadowBlur = 0
-        context.shadowOffsetX = style.shadow * scale
-        context.shadowOffsetY = style.shadow * scale
-      }
-      if (style.outline > 0) context.strokeText(line, 0, y)
-      context.fillText(line, 0, y)
-      context.shadowColor = 'transparent'
-    }
-    const lineLeft =
-      context.textAlign === 'center'
-        ? -textWidth / 2
-        : context.textAlign === 'right'
-          ? -textWidth
-          : 0
-    boxLeft = Math.min(boxLeft, horizontal + lineLeft - style.outline * scale)
-    boxRight = Math.max(boxRight, horizontal + lineLeft + textWidth + style.outline * scale)
-  })
-  context.restore()
-  const scaledHeight = lineHeight * Math.max(0.05, overrides.scaleY / 100)
-  const top = vertical - scaledHeight * (lines.length - 1) - style.outline * scale
-  const bottom = vertical + lineHeight + style.outline * scale
-  return { left: boxLeft, right: boxRight, top, bottom }
-}
-
 interface VideoSliderProps {
   /** 最后一个可寻址帧（video_slider.cpp VideoOpened：GetFrameCount() - 1） */
   maxFrame: number
@@ -2032,12 +1931,18 @@ export function PreviewPane({
   // WebCodecs 视频回退：<video> 无法解码的容器（mkv 等）onError 后切换
   const [wcMode, setWcMode] = useState(false)
   const [wcError, setWcError] = useState<string | null>(null)
+  // 反向回退：强制 WebCodecs 的文件打不开时（如浏览器未开放 HEVC 的 VideoDecoder）
+  // 单视频轨容器自动回退原生 <video>，避免黑屏（原生与 WebCodecs 的编解码支持并不相同）
+  const [nativeFallback, setNativeFallback] = useState(false)
+  const wcFailureReasonRef = useRef<string | null>(null)
   // 媒体更换时在渲染期复位回退模式（render-phase state adjustment）
   const [wcMedia, setWcMedia] = useState(media)
   if (wcMedia !== media) {
     setWcMedia(media)
     setWcMode(false)
     setWcError(null)
+    setNativeFallback(false)
+    wcFailureReasonRef.current = null
   }
   const wcCanvasRef = useRef<HTMLCanvasElement>(null)
   const wcSourceRef = useRef<WebCodecsVideoSource | null>(null)
@@ -2054,8 +1959,11 @@ export function PreviewPane({
   // 当前接线的视频元素（wcActive 切换/媒体更换会替换元素，替换时拆掉旧节点路由）
   const gainVideoRef = useRef<HTMLMediaElement | null>(null)
   // 实际生效的解码通道：状态栏覆盖（手动切换）优先，否则自动（<video> onError）
-  // 多轨选择：<video> 无法切换轨道，指定了视频流索引时强制 WebCodecs 解码
-  const wcActive = decoderOverride ?? (media?.videoStreamIndex !== undefined ? true : wcMode)
+  // 多轨选择：<video> 无法切换轨道，指定了视频流索引时强制 WebCodecs 解码；
+  // 单轨文件若 WebCodecs 打不开（codec 支持差异）则回退原生
+  const wcActive =
+    decoderOverride ??
+    (nativeFallback ? false : media?.videoStreamIndex !== undefined ? true : wcMode)
   // 状态栏解码通道指示（原生 / WebCodecs；无视频为 null）
   const onPlaybackModeChangeRef = useRef(onPlaybackModeChange)
   useEffect(() => {
@@ -2064,11 +1972,11 @@ export function PreviewPane({
   useEffect(() => {
     onPlaybackModeChangeRef.current?.(media?.url ? (wcActive ? 'webcodecs' : 'native') : null)
   }, [media, wcActive])
-  // Subtitle/Provider：'canvas' 用内置 drawCue，其余（jassub/libass 历史值）走 JASSUB
-  const assEnabled = getOptionString('Subtitle/Provider') !== 'canvas'
+  // 字幕渲染唯一走 JASSUB（libass WASM）；内置 canvas 渲染器已移除，
+  // 加载失败时只报错，不再回退任何内置绘制
   const [assRenderer, setAssRenderer] = useState<AssRenderer | null>(null)
   const assRendererRef = useRef<AssRenderer | null>(null)
-  const [assError, setAssError] = useState(false)
+  const [assError, setAssError] = useState('')
   // 系统字体授权提示：支持但未授权时在预览区给出显性入口（浏览器安全模型要求
   // 用户手势授权，藏进 Fonts Collector 等于不可发现）
   const [fontAccess, setFontAccess] = useState<
@@ -2119,7 +2027,6 @@ export function PreviewPane({
   const frameTimeMs = frameRate.isLoaded()
     ? frameRate.timeAtFrame(currentFrame, 'exact')
     : currentTimeMs
-  const hitBoxesRef = useRef<HitBox[]>([])
   const currentRef = useRef(currentTimeMs)
   // video/copy_coordinates：鼠标在视频上的最近位置（视频分辨率坐标）
   const mousePosRef = useRef<{ x: number; y: number } | null>(null)
@@ -2441,80 +2348,10 @@ export function PreviewPane({
         crossCtx.clearRect(0, 0, crossTextCanvas.width, crossTextCanvas.height)
       }
     }
-    // jassub/libass 接管字幕绘制时，交互 canvas 只保留辅助绘制与 hitbox
-    const assActive =
-      !!assRenderer && !assError && getOptionString('Subtitle/Provider') !== 'canvas' && hasVideo
+    // 字幕由 JASSUB（libass）绘制，交互 canvas 只画视觉工具辅助层
     const active = document.cues.filter(
       (cue) => !cue.comment && cue.startMs <= currentTimeMs && cue.endMs >= currentTimeMs,
     )
-
-    // dummy 视频：按视频分辨率等比 letterbox（不拉伸），黑边 + 背景 + 视频坐标系内绘制字幕
-    if (media?.dummy) {
-      const { width: vw, height: vh, color, pattern } = media.dummy
-      // 字幕/背景画在媒体显示框上（含平移与内容缩放后的实际位置，与 DOM 框对齐）
-      const rect = mediaRect()
-      const s = Math.min(rect.width / vw, rect.height / vh)
-      const vwPx = vw * s
-      const vhPx = vh * s
-      const ox = rect.left + (rect.width - vwPx) / 2
-      const oy = rect.top + (rect.height - vhPx) / 2
-      // assActive 时背景由 .dummy-video-stage div 绘制（交互 canvas 在字幕层之上，画背景会遮住 jassub）
-      if (!assActive) {
-        context.fillStyle = '#000'
-        context.fillRect(0, 0, cssWidth, cssHeight)
-        drawDummyBackground(context, ox, oy, vwPx, vhPx, color, pattern, s)
-      }
-      context.save()
-      context.translate(ox, oy)
-      context.scale(s, s)
-      const boxes: HitBox[] = []
-      for (const cue of active) {
-        const style = document.styles.find((item) => item.name === cue.style) ?? document.styles[0]
-        if (!style) continue
-        const box = drawCue(context, vw, vh, cue.text, style, vw, vh, !assActive)
-        boxes.push({
-          cue,
-          left: ox + box.left * s,
-          right: ox + box.right * s,
-          top: oy + box.top * s,
-          bottom: oy + box.bottom * s,
-        })
-      }
-      hitBoxesRef.current = boxes
-      context.restore()
-    } else {
-      const playResY = Number(document.scriptInfo.PlayResY) || 1080
-      const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
-      // 字幕画在媒体显示框（含平移/内容缩放后的实际位置）上，hitbox 同步按该框映射
-      const rect = mediaRect()
-      const boxX = rect.left
-      const boxY = rect.top
-      const boxWidth = rect.width
-      const boxHeight = rect.height
-      const boxes: HitBox[] = []
-      for (const cue of active) {
-        const style = document.styles.find((item) => item.name === cue.style) ?? document.styles[0]
-        if (!style) continue
-        const box = drawCue(
-          context,
-          boxWidth,
-          boxHeight,
-          cue.text,
-          style,
-          playResX,
-          playResY,
-          !assActive,
-        )
-        boxes.push({
-          cue,
-          left: boxX + box.left,
-          right: boxX + box.right,
-          top: boxY + box.top,
-          bottom: boxY + box.bottom,
-        })
-      }
-      hitBoxesRef.current = boxes
-    }
 
     // ---- 十字工具（visual_tool_cross.cpp Draw：全屏十字线 + 鼠标处脚本坐标读数）----
     if (hasVideo && visualTool === 'video/tool/cross' && mouseOnStageRef.current) {
@@ -2650,14 +2487,16 @@ export function PreviewPane({
         // DrawAllFeatures 填充：选中行的起点方框 = Lines Primary 0.3（alt_fill），其余 = Highlight Primary 0.3
         const selectedIds = new Set(selectedCues.map((cue) => cue.id))
         for (const cue of active) {
-          const o = readVisualOverrides(cue.text)
+          const style =
+            document.styles.find((item) => item.name === cue.style) ?? document.styles[0]
+          const o = readVisualOverrides(cue.text, style)
           const selected = selectedIds.has(cue.id)
-          const start = startOf(o)
-          if (!start && !o.org) continue
-          const sx = mapX(start?.x ?? 0)
-          const sy = mapY(start?.y ?? 0)
-          if (start) drawFeature(sx, sy, 'square', selected ? colors.selFill : colors.baseFill)
-          if (start && o.move) {
+          // GetLinePosition：无 \pos/\move 时用样式对齐/Margin 推导默认位置，所有可见行都有起点柄
+          const start = startOf(o) ?? defaultLinePosition(cue, style, { x: playResX, y: playResY })
+          const sx = mapX(start.x)
+          const sy = mapY(start.y)
+          drawFeature(sx, sy, 'square', selected ? colors.selFill : colors.baseFill)
+          if (o.move) {
             const ex = mapX(o.move.x2)
             const ey = mapY(o.move.y2)
             const dx = ex - sx
@@ -3260,9 +3099,7 @@ export function PreviewPane({
     vclip,
     persp,
     hasVideo,
-    assRenderer,
-    assError,
-    // 平移/内容缩放改变媒体显示框位置与尺寸，overlay 绘制与 hitbox 需跟随重算
+    // 平移/内容缩放改变媒体显示框位置与尺寸，视觉工具辅助层需跟随重算
     // （窗口缩放会改变 stage 尺寸，由下面的 ResizeObserver 触发重绘，无需入表）
     pan,
     contentZoom,
@@ -3298,7 +3135,6 @@ export function PreviewPane({
 
   // ---- JASSUB（libass WASM）字幕渲染器生命周期（对应原版 SubtitlesProvider）----
   useEffect(() => {
-    if (!assEnabled) return
     const host = zoomStageRef.current
     if (!host) return
     let cancelled = false
@@ -3310,10 +3146,14 @@ export function PreviewPane({
         }
         assRendererRef.current = renderer
         setAssRenderer(renderer)
+        setAssError('')
       })
-      .catch(() => {
-        // worker/wasm 加载失败：回退内置 drawCue
-        if (!cancelled) setAssError(true)
+      .catch((error: unknown) => {
+        // jassub 是唯一字幕渲染器：加载失败直接报错，不回退内置绘制
+        if (cancelled) return
+        const message = error instanceof Error ? error.message : String(error)
+        setAssError(message)
+        logError('subtitle', `JASSUB/libass failed to load: ${message}`)
       })
     return () => {
       cancelled = true
@@ -3324,7 +3164,7 @@ export function PreviewPane({
     // document 经下方 setTrack 增量同步，不触发重建；
     // localFontsEpoch：本地字体授权后重建实例，libass 用新权限重新匹配字体
     // oxlint-disable-next-line react-hooks/exhaustive-deps
-  }, [assEnabled, localFontsEpoch])
+  }, [localFontsEpoch])
 
   // 文档变化 → 替换 libass track：视觉工具拖拽中走 flushNow 即时渲染（源码每次
   // 鼠标事件 Commit+Render），其余（编辑器高频修改）走防抖
@@ -3409,12 +3249,25 @@ export function PreviewPane({
     // 通道/媒体更换：丢弃上一元素的待发 seek 目标与首帧偏移校准
     videoSeekRef.current = null
     firstFrameOffsetSecRef.current = 0
+    // 旧通道的失败提示随通道切换失效（提示已挪到舞台层，切到可用通道后必须消失）
+    // oxlint-disable-next-line react/set-state-in-effect
+    setWcError(null)
   }, [media, wcActive])
 
   useEffect(() => {
     const canvas = wcCanvasRef.current
     if (!wcActive || wcSourceRef.current || !canvas || !media?.url) return
     let cancelled = false
+    // 自动模式下单视频轨文件回退原生：WebCodecs 与 <video> 支持的 codec 集合不同
+    // （例如浏览器只在原生侧提供 HEVC），打不开时别把画面留成黑屏。
+    // 手动强制 WebCodecs（状态栏切换）或无法确定轨道时保留错误
+    const tryNativeFallback = (reason: string): boolean => {
+      if (decoderOverride != null || !media.singleVideoTrack) return false
+      logInfo('video', `WebCodecs 无法解码该单轨视频，回退原生 <video>：${reason}`)
+      wcFailureReasonRef.current = reason
+      setNativeFallback(true)
+      return true
+    }
     // media.file 缺失（token 句柄）时经 URL 取回字节
     const ensureFile = async (): Promise<File | null> => {
       if (media.file) return media.file
@@ -3445,6 +3298,7 @@ export function PreviewPane({
           onKeyframes: (list) => onKeyframesChangeRef.current?.(list),
           onError: (message) => {
             logError('video', `WebCodecs 解码器错误：${message}`)
+            if (!cancelled && tryNativeFallback(message)) return
             setWcError(message)
           },
         },
@@ -3466,21 +3320,21 @@ export function PreviewPane({
             if (Math.abs(opened.source.currentTime - target) > 60) opened.source.seek(target)
           } else if (opened.reason) {
             logError('video', `WebCodecs 回退打开失败：${opened.reason}`)
-            setWcError(opened.reason)
+            if (!tryNativeFallback(opened.reason)) setWcError(opened.reason)
           }
         })
         .catch((error) => {
           const message = error instanceof Error ? error.message : 'WebCodecs 视频打开失败'
           if (!cancelled) {
             logError('video', `WebCodecs 回退打开失败：${message}`)
-            setWcError(message)
+            if (!tryNativeFallback(message)) setWcError(message)
           }
         })
     })
     return () => {
       cancelled = true
     }
-  }, [wcActive, media, onDurationChange, onIntrinsicSizeChange, onTimeChange])
+  }, [wcActive, media, decoderOverride, onDurationChange, onIntrinsicSizeChange, onTimeChange])
 
   // ---- 视频色彩层（YCbCr Matrix）----
   // 源码 video_controller.cpp：COMMIT_SCRIPTINFO 后若脚本头矩阵变化，provider->SetColorSpace
@@ -3795,17 +3649,55 @@ export function PreviewPane({
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [durationMs, frameCount, frameRate, media, mediaAction, onTimeChange, requestVideoSeek])
 
-  const hitTest = (x: number, y: number): HitBox | null => {
+  /**
+   * 视觉工具特征命中（visual_tool.cpp OnMouseEvent：取最高 layer；
+   * visual_feature.cpp VisualDraggableFeature::IsMouseOver）。
+   * 不用字幕渲染器的字形包围盒——JASSUB/libass 不暴露事件几何。
+   */
+  const hitTest = (x: number, y: number): SubtitleCue | null => {
     const stage = stageRef.current
     if (!stage) return null
     const bounds = stage.getBoundingClientRect()
     const px = x - bounds.left
     const py = y - bounds.top
-    for (let i = hitBoxesRef.current.length - 1; i >= 0; i--) {
-      const box = hitBoxesRef.current[i]
-      if (px >= box.left && px <= box.right && py >= box.top && py <= box.bottom) return box
+    const rect = mediaRect()
+    const playResY = Number(document.scriptInfo.PlayResY) || 1080
+    const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
+    let hit: SubtitleCue | null = null
+    let maxLayer = Number.NEGATIVE_INFINITY
+    for (const cue of document.cues) {
+      if (cue.comment || cue.startMs > currentTimeMs || cue.endMs < currentTimeMs) continue
+      const style = document.styles.find((item) => item.name === cue.style) ?? document.styles[0]
+      const o = readVisualOverrides(cue.text, style)
+      const start =
+        (o.move ? { x: o.move.x1, y: o.move.y1 } : o.pos) ??
+        defaultLinePosition(cue, style, { x: playResX, y: playResY })
+      const over = (
+        point: { x: number; y: number },
+        layer: number,
+        shape: 'square' | 'circle' | 'triangle',
+      ) => {
+        const sx = rect.left + (point.x / playResX) * rect.width
+        const sy = rect.top + (point.y / playResY) * rect.height
+        const dx = px - sx
+        const dy = py - sy
+        const inside =
+          shape === 'square'
+            ? Math.abs(dx) < 6 && Math.abs(dy) < 6
+            : shape === 'circle'
+              ? dx * dx + dy * dy < 36
+              : dy >= -10 && dy <= 6 && 16 * dx + 9 * (dy - 6) < 0 && 16 * dx - 9 * (dy - 6) > 0
+        if (inside && layer >= maxLayer) {
+          hit = cue
+          maxLayer = layer
+        }
+      }
+      // visual_tool_drag.cpp MakeFeatures：起点方框(0) / \move 终点圆(1) / \org 三角(-1)
+      over(start, 0, 'square')
+      if (o.move) over({ x: o.move.x2, y: o.move.y2 }, 1, 'circle')
+      if (o.org) over(o.org, -1, 'triangle')
     }
-    return null
+    return hit
   }
 
   // ---- 矢量裁剪：激活/解析（visual_tool_vector_clip.cpp DoRefresh）----
@@ -4433,17 +4325,20 @@ export function PreviewPane({
     // 未选中→SetSelection(feat, !ctrl)（Ctrl=并集/否则单选），已选中→仅 SetActiveLine；
     // 两者都记 sel_changed 供抬起时微调。空白点击且可见特征 >1 时把选择收缩为活动行
     visualClickRef.current = null
+    const visibleCount = document.cues.filter(
+      (cue) => !cue.comment && cue.startMs <= currentTimeMs && cue.endMs >= currentTimeMs,
+    ).length
     if (!holdTool) {
       if (hit) {
-        const isSelected = selectedCues.some((item) => item.id === hit.cue.id)
-        visualClickRef.current = { id: hit.cue.id, selChanged: !isSelected }
-        if (isSelected) onVisualSetActive(hit.cue.id)
-        else onVisualSelect(hit.cue.id, event.ctrlKey)
-      } else if (!event.altKey && hitBoxesRef.current.length > 1 && activeCue) {
+        const isSelected = selectedCues.some((item) => item.id === hit.id)
+        visualClickRef.current = { id: hit.id, selChanged: !isSelected }
+        if (isSelected) onVisualSetActive(hit.id)
+        else onVisualSelect(hit.id, event.ctrlKey)
+      } else if (!event.altKey && visibleCount > 1 && activeCue) {
         onVisualSelect(activeCue.id, false)
       }
     }
-    const cue = holdTool ? activeCue : (hit?.cue ?? activeCue)
+    const cue = holdTool ? activeCue : (hit ?? activeCue)
     if (!cue) return
     event.currentTarget.setPointerCapture(event.pointerId)
     const stage = stageRef.current
@@ -4671,12 +4566,12 @@ export function PreviewPane({
       dx = x - cur.x
       dy = y - cur.y
     } else {
-      // 无 \pos/\move 的默认位置近似为 hitbox 中心（\pos 本身仍精确写点击点，仅影响 \org 平移量）
-      const box = hitBoxesRef.current.find((item) => item.cue.id === activeCue.id)
-      if (box) {
-        dx = x - (box.left + box.right) / 2
-        dy = y - (box.top + box.bottom) / 2
-      }
+      // visual_tool.cpp GetLinePosition：无 \pos/\move 时按样式对齐与 Margin 推导默认位置
+      const style =
+        document.styles.find((item) => item.name === activeCue.style) ?? document.styles[0]
+      const linePos = defaultLinePosition(activeCue, style, { x: playResX, y: playResY })
+      dx = x - linePos.x
+      dy = y - linePos.y
     }
     let text = activeCue.text
     if (o.move) {
@@ -4762,22 +4657,15 @@ export function PreviewPane({
     }
     if (kind === 'raw') return canvas
 
-    // 字幕层：libass 接管时叠 JASSUB canvas（透明底），否则用内置 drawCue 在视频坐标系重画
-    const assActive =
-      !!assRenderer && !assError && getOptionString('Subtitle/Provider') !== 'canvas' && hasVideo
-    if (assActive) {
-      assRenderer?.drawInto(ctx, 0, 0, width, height)
-      return canvas
+    // 字幕层：JASSUB（libass）是唯一渲染器；不可用时明确报错，不输出无字幕截图
+    if (!assRenderer) {
+      logError(
+        'subtitle',
+        `Snapshot failed: JASSUB/libass renderer is not available${assError ? ` (${assError})` : ''}`,
+      )
+      return null
     }
-    const playResY = Number(document.scriptInfo.PlayResY) || 1080
-    const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
-    const active = document.cues.filter(
-      (cue) => !cue.comment && cue.startMs <= currentTimeMs && cue.endMs >= currentTimeMs,
-    )
-    for (const cue of active) {
-      const style = document.styles.find((item) => item.name === cue.style) ?? document.styles[0]
-      if (style) drawCue(ctx, width, height, cue.text, style, playResX, playResY)
-    }
+    assRenderer.drawInto(ctx, 0, 0, width, height)
     return canvas
   }
 
@@ -5011,6 +4899,11 @@ export function PreviewPane({
             </button>
           </div>
         )}
+        {assError && (
+          <div className="system-fonts-hint subtitle-render-error" role="alert">
+            <span>{`Subtitle rendering failed (JASSUB/libass): ${assError}`}</span>
+          </div>
+        )}
         <div
           className="video-stage"
           ref={stageRef}
@@ -5085,14 +4978,26 @@ export function PreviewPane({
                     : 0
                   setDurationMs(value)
                   onDurationChange(value)
-                  onIntrinsicSizeChange(
-                    event.currentTarget.videoWidth,
-                    event.currentTarget.videoHeight,
-                  )
+                  const host = event.currentTarget
+                  // 视频轨无法解码时（如浏览器未开放 HEVC 解码）原生 <video> 可能只加载音频：
+                  // loadedmetadata 时 videoWidth/Height 为 0。按 0 尺寸上报会让视频栏塌缩成 1×1，
+                  // 这里视为该通道解码失败，走与 onError 相同的处理
+                  if (!host.videoWidth || !host.videoHeight) {
+                    logWarning('video', '原生 <video> 未解码出视频轨（videoWidth/Height = 0）')
+                    if (nativeFallback) {
+                      setWcError(
+                        wcFailureReasonRef.current ??
+                          tPlain('The browser could not decode this video'),
+                      )
+                    } else if (decoderOverride !== false) {
+                      setWcMode(true)
+                    }
+                    return
+                  }
+                  onIntrinsicSizeChange(host.videoWidth, host.videoHeight)
                   // 首帧偏移校准（每个元素实例一次）：首帧 present 时的 mediaTime 即元素
                   // 时间轴上的首帧时间（容器首帧 PTS）。校准后若元素位置与归一化时间轴
                   // 不符（如中途从 WebCodecs 切回、元素重挂载后仍停在首帧），补一次同步 seek
-                  const host = event.currentTarget
                   host.requestVideoFrameCallback?.((_now, metadata) => {
                     if (videoRef.current !== host) return
                     firstFrameOffsetSecRef.current = metadata.mediaTime
@@ -5119,8 +5024,20 @@ export function PreviewPane({
                   logWarning(
                     'video',
                     `原生 <video> 解码失败（MediaError code=${mediaError?.code ?? '?'} ${mediaError?.message ?? ''}）` +
-                      (decoderOverride === false ? '' : '，自动切换 WebCodecs 解码'),
+                      (nativeFallback
+                        ? '，两条解码通道均失败'
+                        : decoderOverride === false
+                          ? ''
+                          : '，自动切换 WebCodecs 解码'),
                   )
+                  if (nativeFallback) {
+                    // WebCodecs 回退到原生后仍失败：两通道都不可用，停止来回切换并展示原因
+                    setWcError(
+                      wcFailureReasonRef.current ??
+                        tPlain('The browser could not decode this video'),
+                    )
+                    return
+                  }
                   setWcMode(true)
                 }}
               />
@@ -5138,7 +5055,6 @@ export function PreviewPane({
                   className="webcodecs-video"
                   style={{ width: '100%', height: '100%', background: '#000' }}
                 />
-                {wcError && <div className="webcodecs-video-error">{wcError}</div>}
               </div>
             ) : media?.dummy ? (
               <div
@@ -5147,13 +5063,10 @@ export function PreviewPane({
                 style={{
                   width: `${mediaCssSize(media.dummy.width)}px`,
                   height: `${mediaCssSize(media.dummy.height)}px`,
-                  background:
-                    assRenderer && !assError
-                      ? dummyBackgroundCss(
-                          media.dummy,
-                          (windowZoom * contentZoom) / (displayDpr > 0 ? displayDpr : 1),
-                        )
-                      : undefined,
+                  background: dummyBackgroundCss(
+                    media.dummy,
+                    (windowZoom * contentZoom) / (displayDpr > 0 ? displayDpr : 1),
+                  ),
                 }}
               />
             ) : (
@@ -5175,6 +5088,8 @@ export function PreviewPane({
                 }}
               />
             )}
+            {/* 解码失败提示：原生/WebCodecs 任一通道失败都展示（自动回退两通道均失败时可见） */}
+            {wcError && <div className="webcodecs-video-error">{wcError}</div>}
           </div>
           <canvas
             ref={canvasRef}

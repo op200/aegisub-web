@@ -62,6 +62,8 @@ export const VFS_DIRS = {
   catalog: '/catalog',
   /** Path/Automation/Autoload（?user|?data 两个令牌同根合并） */
   automationAutoload: '/automation/autoload',
+  /** 本地（项目内）脚本的存放目录：桌面版用字幕文件旁的任意路径，web 无外部路径，统一收纳于此 */
+  automationLocal: '/automation/local',
   /** Path/Automation/Include（?user|?data 两个令牌同根合并） */
   automationInclude: '/automation/include',
   /** ?dictionary（?data/dictionaries） */
@@ -291,6 +293,24 @@ export async function writeFile(vpath: string, data: Blob | Uint8Array): Promise
   const blob = data instanceof Blob ? data : new Blob([data as BlobPart])
   await withStore('readwrite', async (store) => {
     await requestToPromise(store.put(makeEntry(path, { data: blob }), path))
+  })
+}
+
+/**
+ * 更新文件 mtime；文件不存在时创建空文件（对齐 agi::fs::Touch，
+ * 缺失的父目录一并创建）。目录按 Touch 的语义静默忽略。
+ */
+export async function touchFile(vpath: string): Promise<void> {
+  const path = normalizePath(vpath)
+  const entry = await stat(path)
+  if (entry?.directory) return
+  if (!entry) {
+    await mkdir(dirname(path))
+    await writeTextFile(path, '')
+    return
+  }
+  await withStore('readwrite', async (store) => {
+    await requestToPromise(store.put({ ...entry, mtime: Date.now() }, path))
   })
 }
 

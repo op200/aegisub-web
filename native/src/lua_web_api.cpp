@@ -32,6 +32,10 @@ extern "C" {
 #include "lualib.h"
 }
 
+// Aegisub 自带的 Lua 5.1 时代 C 模块（兼容 Lua 5.5 的垫片见 lua55_legacy_compat.h）
+extern "C" int luaopen_lpeg(lua_State *L);
+extern "C" int luaopen_luabins(lua_State *L);
+
 /** EM_JS 必须在文件作用域（不能放进匿名 namespace） */
 EM_JS(void, lua_web_js_release, (int id), { Module.luaWeb.release(id); });
 
@@ -188,6 +192,41 @@ int buffer_address(const std::vector<char> &buf) {
   return buf.empty() ? 0 : static_cast<int>(reinterpret_cast<intptr_t>(buf.data()));
 }
 
+/**
+ * 把一个 luaopen_* 注册到 package.preload；返回 1 表示成功。
+ * 5.1 时代的 luaL_register 还会顺手设置全局表，所以包装函数额外补上 _G[name]。
+ */
+int preload_module(lua_State *L, const char *name, lua_CFunction openf) {
+  lua_getglobal(L, "package");
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    return 0;
+  }
+  lua_getfield(L, -1, "preload");
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 2);
+    return 0;
+  }
+  lua_pushcfunction(L, openf);
+  lua_setfield(L, -2, name);
+  lua_pop(L, 2);
+  return 1;
+}
+
+int open_lpeg_web(lua_State *L) {
+  luaopen_lpeg(L);
+  lua_pushvalue(L, -1);
+  lua_setglobal(L, "lpeg");
+  return 1;
+}
+
+int open_luabins_web(lua_State *L) {
+  luaopen_luabins(L);
+  lua_pushvalue(L, -1);
+  lua_setglobal(L, "luabins");
+  return 1;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -235,6 +274,24 @@ extern "C" int lua_web_main_handle(int handle) {
 extern "C" void lua_web_openlibs(int handle) {
   lua_State *L = resolve(handle);
   if (L) luaL_openlibs(L);
+}
+
+/** LPeg 0.10（Aegisub libaegisub/lua/modules/lpeg.c）→ package.preload['lpeg'] */
+extern "C" int lua_web_preload_lpeg(int handle) {
+  lua_State *L = resolve(handle);
+  if (!L) return 0;
+  return preload_module(L, "lpeg", open_lpeg_web);
+}
+
+/**
+ * luabins（Aegisub subprojects/luabins）→ package.preload['aegisub.__luabins_impl']。
+ * 桌面版 modules.cpp 在 require 时通过 aegisub.__raise_warning 提示已废弃；
+ * web 的提示由 luaModules 的 Lua 包装层发出。
+ */
+extern "C" int lua_web_preload_luabins(int handle) {
+  lua_State *L = resolve(handle);
+  if (!L) return 0;
+  return preload_module(L, "aegisub.__luabins_impl", open_luabins_web);
 }
 
 extern "C" int lua_web_gettop(int handle) {

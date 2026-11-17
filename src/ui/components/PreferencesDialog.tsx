@@ -44,9 +44,16 @@ import {
   type HotkeyMap,
 } from '../aegisubHotkeys'
 import { commandIcon } from '../aegisubIcons'
-import { cssColorToHex, hexToCssColor } from '../color'
+import {
+  BLACK_COLOR,
+  parseAssPickerColor,
+  parseOptionColor,
+  pickerColorToAss,
+  pickerColorToOption,
+} from '../color'
 import { COMMANDS, shortcutFromKeyboardEvent, type ShortcutContext } from '../commands'
 import { tPlain } from '../i18n'
+import { ColorButton } from './ColorPickerDialog'
 import { Dialog } from './dialogs'
 
 // ---------------------------------------------------------------------------
@@ -840,12 +847,6 @@ const PAGES: Page[] = [
             opt: 'Video/Provider',
             choices: ['avisynth', 'ffmpegsource', 'dummy'],
           },
-          {
-            kind: 'choice',
-            label: 'Subtitles provider',
-            opt: 'Subtitle/Provider',
-            choices: ['jassub', 'canvas'],
-          },
         ],
       },
     ],
@@ -1048,39 +1049,18 @@ function StringControl({ value, onCommit, enabled }: ControlProps) {
 
 function ColorControl({ value, onCommit, enabled, alpha }: ControlProps & { alpha?: boolean }) {
   const raw = String(value ?? '')
-  const parts = /rgba?\(([^)]*)\)/
-    .exec(raw)?.[1]
-    .split(',')
-    .map((item) => item.trim())
-  const alphaValue =
-    raw.startsWith('rgba') && parts && parts.length >= 4 ? Math.min(255, Number(parts[3])) : 255
+  const color = parseOptionColor(raw) ?? { ...BLACK_COLOR }
   return (
     <span className="pref-color">
-      <input
-        type="color"
-        value={cssColorToHex(raw, '#000000')}
+      <ColorButton
+        value={pickerColorToAss(color)}
+        alpha={alpha}
         disabled={!enabled}
-        onChange={(event) => onCommit(hexToCssColor(event.target.value))}
+        onChange={(ass) => {
+          const next = parseAssPickerColor(ass)
+          if (next) onCommit(pickerColorToOption({ ...next, a: alpha ? next.a : 0 }))
+        }}
       />
-      {alpha && (
-        <input
-          type="number"
-          className="pref-number pref-alpha"
-          title={tPlain('Alpha (0-255)')}
-          min={0}
-          max={255}
-          value={alphaValue}
-          disabled={!enabled}
-          onChange={(event) => {
-            const next = Math.max(0, Math.min(255, Number(event.target.value) || 0))
-            const base = cssColorToHex(raw, '#ffffff').replace('#', '')
-            const r = Number.parseInt(base.slice(0, 2), 16)
-            const g = Number.parseInt(base.slice(2, 4), 16)
-            const b = Number.parseInt(base.slice(4, 6), 16)
-            onCommit(`rgba(${r},${g},${b},${next})`)
-          }}
-        />
-      )}
       <code className="pref-color-value">{raw || tPlain('(default)')}</code>
     </span>
   )

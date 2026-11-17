@@ -9,9 +9,12 @@ import {
   withExportFilters,
 } from '../automation/luaAssFile'
 import {
+  applyDialogSettings,
   defaultDialogValues,
   dialogConfigTable,
+  inlineStringEncode,
   readBackButton,
+  serializeDialogSettings,
   type DialogSpec,
   type DialogValue,
 } from '../automation/luaDialog'
@@ -19,10 +22,11 @@ import {
   configureAutomationFilter,
   isActiveAutomationMacro,
   loadAutomationScript,
-  orderedAutomationFilters,
+  orderedExportFilters,
   resetAutomationBackend,
   runAutomationFilter,
   runAutomationMacro,
+  unloadAutomationScript,
   validateAutomationMacro,
   type AutomationFilterDisplayInfo,
   type AutomationFilterInfo,
@@ -42,6 +46,7 @@ import { hasStyleOverride } from '../core/assTags'
 import { CoreClient } from '../core/client'
 import { createDocument, createProjectProperties } from '../core/defaults'
 import { decodeWithEncoding, detectEncoding, encodeText } from '../core/encoding'
+import { fixStyles, transformFramerateDocument } from '../core/exportFilters'
 import { attachmentBytes, attachmentFileName, makeAttachment } from '../core/format'
 import type { TextImportOptions } from '../core/formatExtra'
 import { detectFormat, exportExtension, exportSubtitle, type ParseOptions } from '../core/formats'
@@ -68,6 +73,8 @@ import {
   SEARCH_FIELDS,
   type SearchReplaceSettings,
 } from '../core/searchReplace'
+import { ensureSpellCheckerLoaded } from '../core/spellcheck'
+import { ensureThesaurusLoaded } from '../core/thesaurus'
 import type {
   CoreCommand,
   CoreState,
@@ -99,11 +106,10 @@ import { BrowserHostAdapter, MEDIA_FILE_TYPES, SUBTITLE_FILE_TYPES } from '../pl
 import { createNativeHostAdapter } from '../platform/nativeHost'
 import type { AppFileHandle, HostAdapter, MediaSource } from '../platform/types'
 import {
-  automationScriptPath,
+  automationLocalScriptPath,
   loadAutomationScripts,
   readAutomationScriptFile,
-  removeAutomationScriptFile,
-  writeAutomationScript,
+  writeLocalAutomationScript,
 } from '../storage/automationStore'
 import { restoreFactoryScripts } from '../storage/factoryScripts'
 import { importFontFiles } from '../storage/fontStore'
@@ -121,7 +127,14 @@ import {
   type RecentType,
   type SearchMruLists,
 } from '../storage/recentStore'
-import { fileExists, listTree, readBytes, readFile as readVfsFile, vfsDecode } from '../storage/vfs'
+import {
+  fileExists,
+  joinPath,
+  listTree,
+  readBytes,
+  readFile as readVfsFile,
+  vfsDecode,
+} from '../storage/vfs'
 import { invertLightness } from './color'
 import {
   COMMAND_REGISTRY,
@@ -159,12 +172,12 @@ import {
   TextImportDialog,
   TimecodesOffsetDialog,
   TimingProcessorDialog,
-  ToolInfoDialog,
   TranslationDialog,
   VideoDetailsDialog,
   VideoOffsetNoticeDialog,
   useEscapeClose,
   type ExportOptions,
+  type FramerateFilterSettings,
   type SelectLinesSettings,
 } from './components/dialogs'
 import { EditPanel } from './components/EditPanel'
@@ -174,6 +187,7 @@ import { LogPanel } from './components/LogPanel'
 import { MenuBar } from './components/MenuBar'
 import { PreferencesDialog } from './components/PreferencesDialog'
 import { PreviewPane, type VideoPlaybackMode } from './components/PreviewPane'
+import { SpellCheckerDialog } from './components/SpellCheckerDialog'
 import { StyleEditorDialog } from './components/StyleEditorDialog'
 import { StyleManagerDialog } from './components/StyleManagerDialog'
 import { gridRowHeight, SubtitleGrid } from './components/SubtitleGrid'
@@ -182,7 +196,6 @@ import { initLocale, tFmt, tPlain, tPlural, useLocaleVersion } from './i18n'
 import {
   calculateAttachedVideoLayout,
   fitWindowZoomToVideo,
-  placeholderVideoZoom,
   PLACEHOLDER_VIDEO_SIZE,
 } from './layout/videoLayout'
 import { installGlobalLogHandlers, logError, logInfo, getLogEntries, subscribeLogs } from './log'
@@ -258,11 +271,32 @@ function decodeText(data: Uint8Array): string {
 /** Web 版恒定帧率（DummyVideoProvider 与既有实现一致，24fps） */
 const DEFAULT_FPS = 24
 
+/** HelpButton::OpenPage 的 web 对应物：桌面打开本地帮助包，web 打开官方在线文档 */
+const HELP_PAGE_PATHS: Record<string, string> = {
+  Main: 'Main_Page',
+  'Automation Manager': 'Automation/Manager',
+  Export: 'Exporting',
+  'Fonts Collector': 'Fonts_Collector',
+  Options: 'Options',
+  Properties: 'Properties',
+  'Select Lines': 'Select_Lines',
+  'Shift Times': 'Shift_Times',
+  'Style Editor': 'Styles',
+  'Styles Manager': 'Styles',
+}
+
+function openHelpPage(page: string): void {
+  const target = HELP_PAGE_PATHS[page] ?? page.replace(/ /g, '_')
+  window.open(`https://docs.aegisub.org/3.5/${target}/`, '_blank', 'noopener')
+}
+
 /** 已加载的 Automation 脚本（auto4_base Script 的 Web 版） */
 interface LoadedAutomationEntry {
   key: string
   filename: string
   code: string
+  /** true = autoload 全局脚本（G）；false = 项目 Automation Scripts 引用的本地脚本（L） */
+  isGlobal: boolean
   stateId: number
   name: string
   description: string
@@ -506,18 +540,27 @@ export function App() {
   const [videoWindowZoom, setVideoWindowZoom] = useState(
     () => (getOptionInt('Video/Default Zoom') + 1) / 8,
   )
+  // 未载入视频时的占位显示缩放：默认 50%，直接作为初始状态（不在挂载后的 effect/hook
+  // 里重新结算，否则首屏会先按一个值绘制、再跳到另一个值，画面闪烁）。
+  // 滚轮/缩放命令直接更新该值；它不写入真实视频的 windowZoom
+  const [placeholderZoom, setPlaceholderZoom] = useState(0.5)
   // 设备像素比（源码 GetContentScaleFactor）：视频缩放按物理设备像素计
   const devicePixelRatioValue = useDevicePixelRatio()
+  // 拼写检查/同义词库词库在启动时后台加载（spellchecker_hunspell / thesaurus 构造时读 ?dictionary）
+  useEffect(() => {
+    void ensureSpellCheckerLoaded()
+    void ensureThesaurusLoaded()
+  }, [])
   const prevDprRef = useRef(devicePixelRatioValue)
   useEffect(() => {
     // wxEVT_DPI_CHANGED：new_zoom = zoom × 新scale/旧scale，保持视频表观尺寸不跳变
     const prev = prevDprRef.current
     if (prev === devicePixelRatioValue) return
     prevDprRef.current = devicePixelRatioValue
-    if (prev > 0)
-      setVideoWindowZoom((zoom) =>
-        Math.max(0.125, Math.min(3, (zoom * devicePixelRatioValue) / prev)),
-      )
+    if (prev > 0) {
+      const factor = devicePixelRatioValue / prev
+      setVideoWindowZoom((zoom) => Math.max(0.125, Math.min(3, zoom * factor)))
+    }
   }, [devicePixelRatioValue])
   const [videoIntrinsicSize, setVideoIntrinsicSize] = useState({ width: 1280, height: 720 })
   // 当前视频的真实尺寸是否已上报：载入中（已 setVideoMedia、尚未拿到元数据）沿用占位布局，
@@ -685,6 +728,8 @@ export function App() {
     format: SubtitleFormat
     /** charset 对话框选定后的编码（纯文本导入阶段沿用） */
     encoding?: string
+    /** 会话恢复等场景：不自动载入 Project Garbage 里的关联文件（避免启动弹窗） */
+    skipLinkedFiles?: boolean
   } | null>(null)
   // Paste Over：待覆盖行与目标行
   const [pasteOver, setPasteOver] = useState<{
@@ -701,19 +746,38 @@ export function App() {
   const pendingVideoPositionRef = useRef<number | null>(null)
   // 通用 wxGetSingleChoiceIndex / wxMessageBox 提示（视频属性校正、轨道选择）
   const [choicePrompt, setChoicePrompt] = useState<ChoicePromptState | null>(null)
+  // 当前提示引用 + 排队：并发 askChoice（如轨道选择与视频属性校正）不能互相覆盖，
+  // 覆盖会让前一个 Promise 永不 resolve，整个载入流程卡死
+  const choicePromptRef = useRef<ChoicePromptState | null>(null)
+  const choiceQueueRef = useRef<ChoicePromptState[]>([])
   const videoPropertiesRunRef = useRef(0)
-  const askChoice = (title: string, message: string, choices: string[], initial = 0) =>
-    new Promise<number | null>((resolve) => {
-      setChoicePrompt({
+  // 文档代次：自动载入关联文件等异步流程用它丢弃上一文档的迟到结果/弹窗
+  const documentGenerationRef = useRef(0)
+  const askChoice = (
+    title: string,
+    message: string,
+    choices: string[],
+    initial = 0,
+  ): Promise<number | null> =>
+    new Promise((resolve) => {
+      const prompt: ChoicePromptState = {
         title,
         message,
         choices,
         initial,
         onResolve: (index) => {
-          setChoicePrompt(null)
           resolve(index)
+          const next = choiceQueueRef.current.shift() ?? null
+          choicePromptRef.current = next
+          setChoicePrompt(next)
         },
-      })
+      }
+      if (choicePromptRef.current) {
+        choiceQueueRef.current.push(prompt)
+        return
+      }
+      choicePromptRef.current = prompt
+      setChoicePrompt(prompt)
     })
   const showMessage = (title: string, message: string) =>
     askChoice(title, message, [], 0).then(() => undefined)
@@ -796,6 +860,11 @@ export function App() {
   const [detectedFps, setDetectedFps] = useState<number | null>(null)
   // Lua Automation（auto4_base ScriptManager）
   const [automationScripts, setAutomationScripts] = useState<LoadedAutomationEntry[]>([])
+  // 异步重载需要卸载旧脚本状态；state 在 useCallback([]) 里读到的是旧闭包，用 ref 同步
+  const automationScriptsRef = useRef<LoadedAutomationEntry[]>([])
+  useEffect(() => {
+    automationScriptsRef.current = automationScripts
+  }, [automationScripts])
   // 宏运行期的 aegisub.dialog.display 请求与进度对话框（替代源码的模态对话框）
   const [luaDialog, setLuaDialog] = useState<{
     spec: DialogSpec
@@ -928,6 +997,7 @@ export function App() {
     const adaptFg = (value: string) => (dark ? invertLightness(value, { max: 0.93 }) : value)
     const setVar = (name: string, value: string) => root.style.setProperty(name, value)
     setVar('--grid-fg', adaptFg(getOptionString('Colour/Subtitle Grid/Standard')))
+    setVar('--grid-fg-collision', adaptFg(getOptionString('Colour/Subtitle Grid/Collision')))
     setVar('--grid-bg', adaptBg(getOptionString('Colour/Subtitle Grid/Background/Background')))
     setVar('--grid-sel-fg', adaptFg(getOptionString('Colour/Subtitle Grid/Selection')))
     setVar('--grid-sel-bg', adaptBg(getOptionString('Colour/Subtitle Grid/Background/Selection')))
@@ -1000,9 +1070,17 @@ export function App() {
   // 无视频或真实尺寸尚未上报（载入中）时，视频面板按 1080p 占位；预览内部视口
   // 必须用同一组 intrinsic/zoom，否则会按上一个视频的尺寸与缩放渲染（看似缩放错乱）
   const videoPlaceholder = !videoMedia || !videoSizeReady
-  const previewZoom = videoPlaceholder
-    ? placeholderVideoZoom(videoWindowZoom, window.innerWidth, window.innerHeight)
-    : videoWindowZoom
+  // 占位缩放是独立的显示值（默认 50%），与真实视频的 windowZoom 互不影响：
+  // 载入视频后由 OnVideoOpen 结算到 videoWindowZoom，占位值保持不变
+  const previewZoom = videoPlaceholder ? placeholderZoom : videoWindowZoom
+  // 缩放输入落到当前生效的缩放：占位期间改占位显示值，真实视频载入后改 windowZoom
+  const changeVideoZoom = useCallback(
+    (zoom: number) => {
+      if (videoPlaceholder) setPlaceholderZoom(zoom)
+      else setVideoWindowZoom(zoom)
+    },
+    [videoPlaceholder],
+  )
   const previewIntrinsic = videoPlaceholder ? PLACEHOLDER_VIDEO_SIZE : videoIntrinsicSize
   const videoLayout = useMemo(
     () =>
@@ -1177,45 +1255,163 @@ export function App() {
   const luaMsFromFrame = (frame: number) =>
     frameRate.isLoaded() ? frameRate.timeAtFrame(frame, 'start') : null
 
-  /** 从 autoload 目录重新加载全部 Automation 脚本（启动恢复 + 文件管理器改动后刷新） */
-  const reloadAllAutomationScripts = useCallback(async () => {
+  /** 把一份源码登记为脚本条目（加载失败也保留，错误由管理器展示） */
+  const loadAutomationEntry = async (
+    code: string,
+    path: string,
+    filename: string,
+    isGlobal: boolean,
+  ): Promise<LoadedAutomationEntry> => {
+    try {
+      const loaded = await loadAutomationScript(code, path)
+      return { key: path, filename, code, isGlobal, ...loaded, error: undefined }
+    } catch (error) {
+      return {
+        key: path,
+        filename,
+        code,
+        isGlobal,
+        stateId: -1,
+        name: filename,
+        description: '',
+        author: '',
+        version: '',
+        warnings: [],
+        macros: [],
+        filters: [],
+        error: error instanceof Error ? error.message : tPlain('Failed to load script'),
+      }
+    }
+  }
+
+  /** 全局脚本：扫描 /automation/autoload（AutoloadScriptManager::Reload） */
+  const loadGlobalAutomationEntries = async (): Promise<LoadedAutomationEntry[]> => {
     const stored = await loadAutomationScripts()
-    const entries = await Promise.all(
-      stored.map(async (script) => {
-        try {
-          const loaded = await loadAutomationScript(script.code, script.id)
-          return {
-            key: script.id,
-            filename: script.filename,
-            code: script.code,
-            ...loaded,
-            error: undefined,
-          }
-        } catch (error) {
-          return {
-            key: script.id,
-            filename: script.filename,
-            code: script.code,
-            stateId: -1,
-            name: script.filename,
-            description: '',
-            author: '',
-            version: '',
-            warnings: [],
-            macros: [],
-            filters: [],
-            error: error instanceof Error ? error.message : tPlain('Failed to load script'),
-          }
-        }
-      }),
+    return Promise.all(
+      stored.map((script) => loadAutomationEntry(script.code, script.id, script.filename, true)),
     )
-    setAutomationScripts(entries)
+  }
+
+  /**
+   * 解析项目属性里的脚本引用（LocalScriptManager::Reload L381-401）：
+   * `/` 绝对路径、`$` 相对 Path/Automation/Base、`~` 相对字幕目录。
+   * Web 字幕不在 VFS 中，`~` 按 VFS 根目录尽力解析；未知前缀忽略。
+   */
+  const resolveAutomationScriptRef = (token: string): string | null => {
+    const trimmed = token.trim()
+    if (!trimmed) return null
+    const rest = trimmed.slice(1)
+    if (trimmed[0] === '/') return rest.startsWith('/') ? rest : `/${rest}`
+    if (trimmed[0] === '$') return joinPath('/automation', rest)
+    if (trimmed[0] === '~') return `/${rest.replace(/^\/+/, '')}`
+    return null
+  }
+
+  /** 把本地脚本列表写回项目属性（LocalScriptManager::SaveLoadedList） */
+  const persistLocalAutomationScripts = (entries: LoadedAutomationEntry[]) => {
+    if (!coreRef.current) return
+    const value = entries
+      .filter((entry) => !entry.isGlobal)
+      .map((entry) => {
+        if (entry.key.startsWith('/automation/'))
+          return `$${entry.key.slice('/automation/'.length)}`
+        return `/${entry.key.replace(/^\/+/, '')}`
+      })
+      .join('|')
+    // 空 label：属性变更不建立撤销点（对应桌面 Project Garbage 的非撤销写入）
+    coreRef.current.apply([{ type: 'updateProperties', patch: { automationScripts: value } }], '')
+  }
+
+  /** 本地脚本：读取项目 Automation Scripts 引用，按桌面流程询问是否信任并加载 */
+  const loadLocalAutomationEntries = async (
+    document: SubtitleDocument,
+  ): Promise<LoadedAutomationEntry[]> => {
+    const refs = (document.properties.automationScripts ?? '')
+      .split('|')
+      .map((token) => token.trim())
+      .filter(Boolean)
+    if (!refs.length) return []
+    const resolved = refs
+      .map(resolveAutomationScriptRef)
+      .filter((path): path is string => path !== null)
+    if (!resolved.length) return []
+    const list = resolved.map((path) => `    ${path}`).join('\n')
+    const choice = await askChoice(
+      tPlain('Load associated automation scripts?'),
+      tFmt(
+        'The subtitle file you have opened contains local automation scripts. Do you want to load the associated automation scripts?\n\nList of scripts:\n\n%1\n\nYou should only load associated automation scripts if you trust their authors! They are not required to view or edit the subtitle file.',
+        list,
+      ),
+      [tPlain('Trust the authors && load scripts'), tPlain('No')],
+      1,
+    )
+    if (choice !== 0) {
+      // 桌面版拒绝后 SaveLoadedList 会把属性清空
+      persistLocalAutomationScripts([])
+      return []
+    }
+    const entries: LoadedAutomationEntry[] = []
+    for (const path of resolved) {
+      // 脚本可能已被移动/删除：警告后跳过（LocalScriptManager::Reload）
+      // oxlint-disable-next-line no-await-in-loop -- 脚本须按引用顺序加载
+      const code = await readAutomationScriptFile(path)
+      if (code === null) {
+        setStatus(tFmt('Automation script "%1" could not be found', path))
+        continue
+      }
+      const filename = path.split('/').pop() || path
+      // oxlint-disable-next-line no-await-in-loop -- 同上
+      entries.push(await loadAutomationEntry(code, path, filename, false))
+    }
+    return entries
+  }
+
+  /** 重新加载全局脚本（保留已加载的本地脚本；am/reload/autoload 与 Rescan Autoload Dir） */
+  const reloadGlobalAutomationScripts = async () => {
+    for (const script of automationScriptsRef.current) {
+      if (script.isGlobal) unloadAutomationScript(script.stateId)
+    }
+    const entries = await loadGlobalAutomationEntries()
+    setAutomationScripts((current) => [...entries, ...current.filter((script) => !script.isGlobal)])
+  }
+
+  /** 文件打开监听：LocalScriptManager 随字幕文件重新加载本地脚本 */
+  const reloadLocalAutomationScripts = async (document: SubtitleDocument) => {
+    // 旧文件的本地脚本先卸载（ScriptManager::Remove）
+    for (const script of automationScriptsRef.current) {
+      if (!script.isGlobal) unloadAutomationScript(script.stateId)
+    }
+    const entries = await loadLocalAutomationEntries(document)
+    setAutomationScripts((current) => [...current.filter((script) => script.isGlobal), ...entries])
+  }
+
+  /** am/reload：重载全局 + 本地脚本 */
+  const reloadAllAutomationScripts = useCallback(async () => {
+    for (const script of automationScriptsRef.current) unloadAutomationScript(script.stateId)
+    const globalEntries = await loadGlobalAutomationEntries()
+    const document = coreRef.current ? (await coreRef.current.state()).document : null
+    const localEntries = document ? await loadLocalAutomationEntries(document) : []
+    setAutomationScripts([...globalEntries, ...localEntries])
+    // 上述加载函数只依赖 coreRef / 稳定 store，不需要跟随渲染重建
+    // oxlint-disable-next-line react/exhaustive-deps -- 仅需在挂载/后端切换时执行
   }, [])
 
   useEffect(() => {
-    // 启动时恢复持久化的 Automation 脚本（LocalScriptManager 语义）
-    void reloadAllAutomationScripts()
-  }, [reloadAllAutomationScripts])
+    // 启动时只恢复全局脚本；本地脚本在字幕文件打开后由 reloadLocalAutomationScripts 加载
+    let cancelled = false
+    void loadGlobalAutomationEntries().then((entries) => {
+      if (!cancelled) {
+        setAutomationScripts((current) => [
+          ...entries,
+          ...current.filter((script) => !script.isGlobal),
+        ])
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+    // oxlint-disable-next-line react/exhaustive-deps -- 仅挂载时扫描一次 autoload
+  }, [])
 
   // Automation/Backend 变更：旧 VM 的脚本状态全部失效，重建后端并重新加载脚本
   const luaBackendRef = useRef(getOptionString('Automation/Backend'))
@@ -1240,18 +1436,20 @@ export function App() {
     }
     const code = decodeText(await host.readFile(file))
     try {
-      // 脚本以 autoload 目录下的虚拟路径为 filename：include 相对该父目录解析
-      const path = automationScriptPath(file.name)
+      const path = automationLocalScriptPath(file.name)
       const loaded = await loadAutomationScript(code, path)
-      // Add 的落盘：写入 /automation/autoload，跨会话由 autoload 扫描恢复
-      await writeAutomationScript(file.name, code)
+      // 落盘到 /automation/local，并把引用写入项目属性（本地脚本随字幕文件保存）
+      await writeLocalAutomationScript(file.name, code)
       const entry: LoadedAutomationEntry = {
         key: path,
         filename: file.name,
         code,
+        isGlobal: false,
         ...loaded,
       }
-      setAutomationScripts((current) => [...current, entry])
+      const next = [...automationScripts, entry]
+      setAutomationScripts(next)
+      persistLocalAutomationScripts(next)
       setStatus(`Automation: ${loaded.name} loaded (${loaded.macros.length} macros)`)
     } catch (error) {
       setStatus(
@@ -1261,24 +1459,32 @@ export function App() {
   }
 
   const removeAutomationScript = (key: string) => {
-    // Remove 的落盘：删除 autoload 中的脚本文件（否则下次启动会被重新收录，有意偏差）
-    void removeAutomationScriptFile(key).catch(() => undefined)
-    setAutomationScripts((current) => current.filter((script) => script.key !== key))
+    const entry = automationScripts.find((script) => script.key === key)
+    // 全局脚本来自 autoload 目录，管理器不允许 Remove（DialogAutomation::OnRemove）
+    if (!entry || entry.isGlobal) return
+    // 桌面 Remove 只把脚本移出项目列表，不删除源文件
+    unloadAutomationScript(entry.stateId)
+    const next = automationScripts.filter((script) => script.key !== key)
+    setAutomationScripts(next)
+    persistLocalAutomationScripts(next)
   }
 
   const reloadAutomationScript = async (key: string) => {
     const script = automationScripts.find((item) => item.key === key)
     if (!script) return
-    // Script::Reload：重新读取脚本文件内容
+    // Script::Reload：重新读取脚本文件内容，旧脚本状态先卸载
+    const oldStateId = script.stateId
     const code = (await readAutomationScriptFile(key)) ?? script.code
     try {
       const loaded = await loadAutomationScript(code, key)
+      if (oldStateId >= 0) unloadAutomationScript(oldStateId)
       setAutomationScripts((current) =>
         current.map((item) =>
           item.key === key ? { ...item, ...loaded, code, error: undefined } : item,
         ),
       )
     } catch (error) {
+      if (oldStateId >= 0) unloadAutomationScript(oldStateId)
       const message = error instanceof Error ? error.message : tPlain('Failed to load script')
       setAutomationScripts((current) =>
         current.map((item) =>
@@ -1422,6 +1628,24 @@ export function App() {
       videoSize: () => luaVideoSize(),
       frameFromMs: (ms) => luaFrameFromMs(ms),
       msFromFrame: (frame) => luaMsFromFrame(frame),
+      // wxFileDialog 的 web 对应物：浏览器选择器无可配置标题/目录，也拿不到真实路径
+      openFileDialog: async ({ title, wildcard }) => {
+        const extensions = [...wildcard.matchAll(/\*\.[a-z0-9]+/gi)].map((match) =>
+          match[0].slice(1),
+        )
+        const file = await host.openFile([
+          {
+            description: title || 'Files',
+            accept: extensions.length ? { 'application/octet-stream': extensions } : { '*/*': [] },
+          },
+        ])
+        return file ? [file.name] : null
+      },
+      // 桌面弹 wxFileDialog 返回完整路径；web 用 prompt 取文件名（脚本无法据此写盘）
+      saveFileDialog: async ({ title, defaultFile }) => {
+        const name = window.prompt(title || 'Save', defaultFile)
+        return name?.trim() ? name.trim() : null
+      },
     }
   }
 
@@ -1726,6 +1950,7 @@ export function App() {
 
   /** 把 Project Garbage 里的 UI 状态还原到网格/视频（project.cpp LoadSubtitles） */
   const applyLoadedDocument = (state: CoreState) => {
+    documentGenerationRef.current += 1
     setCore(state)
     setDirty(false)
     lastAutosaveRevisionRef.current = state.document.revision
@@ -1740,12 +1965,9 @@ export function App() {
     if (Number.isFinite(properties.videoZoom) && properties.videoZoom > 0) {
       setVideoWindowZoom(properties.videoZoom)
     }
-    // AspectRatio：0 Default / 1 Fullscreen / 2 Widescreen / 3 Cinematic / 4 Custom
-    if (properties.arMode === 2) setAspectOverride(16 / 9)
-    else if (properties.arMode === 3) setAspectOverride(2.35)
-    else if (properties.arMode === 4 && properties.arValue > 0)
-      setAspectOverride(properties.arValue)
-    else setAspectOverride(null)
+    // 宽高比不在此恢复：project.cpp LoadUnloadFiles 只在关联视频实际载入时用工程存档的
+    // ArMode/ArValue 覆盖（见 autoLoadLinkedFiles）。仅打开字幕（无视频、会话恢复跳过
+    // 关联文件）时若提前套用，后续手动打开的非 16:9 视频也会被撑成存档里的宽高比。
     setGridScrollRow(Math.max(0, properties.scrollPosition))
     gridRestoreTokenRef.current += 1
     setGridScrollRestore({
@@ -1753,6 +1975,8 @@ export function App() {
       token: gridRestoreTokenRef.current,
     })
     pendingVideoPositionRef.current = properties.videoPosition > 0 ? properties.videoPosition : null
+    // LocalScriptManager 随字幕文件打开事件重载本地脚本（auto4_base.cpp L364）
+    void reloadLocalAutomationScripts(state.document)
   }
 
   /** 关联文件：VFS 路径 → VFS 文件名 → 最近文件（Web 无原生路径，按此顺序解析） */
@@ -1790,8 +2014,13 @@ export function App() {
   const autoLoadLinkedFiles = async (document: SubtitleDocument) => {
     const mode = getOptionInt('App/Auto/Load Linked Files')
     if (mode === 0) return
+    // 文档切换后丢弃前一文档的迟到载入/弹窗：避免把上一文档的关联视频套到新文档，
+    // 或在新文档上突然弹出上一视频的轨道选择框（用户还没选过任何视频文件）
+    const generation = documentGenerationRef.current
+    const stale = () => generation !== documentGenerationRef.current
     const properties = document.properties ?? createProjectProperties()
     const confirm = async (path: string) => {
+      if (stale()) return false
       if (mode === 2) return true
       const choice = await askChoice(
         tPlain('Load linked file'),
@@ -1799,16 +2028,30 @@ export function App() {
         [tPlain('Yes'), tPlain('No')],
         0,
       )
-      return choice === 0
+      return choice === 0 && !stale()
     }
 
     if (properties.videoFile && !videoMedia && (await confirm(properties.videoFile))) {
       const handle = await resolveLinkedHandle(properties.videoFile, 'video')
-      if (handle) await openVideoHandle(handle)
-      else setStatus(tFmt('Could not find linked video "%1"', properties.videoFile))
+      if (stale()) return
+      if (handle) {
+        const opened = await openVideoHandle(handle)
+        // project.cpp LoadUnloadFiles：关联视频载入成功后，用工程存档的 Video AR Mode/Value
+        // 覆盖 DoLoadVideo 设的视频自身 DAR（AspectRatio：0 Default / 1 Fullscreen /
+        // 2 Widescreen / 3 Cinematic / 4 Custom；Custom 值非法时退回 Default）
+        if (opened && !stale()) {
+          if (properties.arMode === 1) setAspectOverride(4 / 3)
+          else if (properties.arMode === 2) setAspectOverride(16 / 9)
+          else if (properties.arMode === 3) setAspectOverride(2.35)
+          else if (properties.arMode === 4)
+            setAspectOverride(properties.arValue > 0 ? properties.arValue : null)
+          else setAspectOverride(null)
+        }
+      } else setStatus(tFmt('Could not find linked video "%1"', properties.videoFile))
     }
     if (properties.audioFile && !audioMedia && (await confirm(properties.audioFile))) {
       const handle = await resolveLinkedHandle(properties.audioFile, 'audio')
+      if (stale()) return
       if (handle) await openAudioHandle(handle)
       else setStatus(tFmt('Could not find linked audio "%1"', properties.audioFile))
     }
@@ -1818,6 +2061,7 @@ export function App() {
       (await confirm(properties.timecodesFile))
     ) {
       const handle = await resolveLinkedHandle(properties.timecodesFile, 'timecodes')
+      if (stale()) return
       if (handle) await openTimecodesHandle(handle)
       else setStatus(tFmt('Could not find linked timecodes "%1"', properties.timecodesFile))
     }
@@ -1827,6 +2071,7 @@ export function App() {
       (await confirm(properties.keyframesFile))
     ) {
       const handle = await resolveLinkedHandle(properties.keyframesFile, 'keyframes')
+      if (stale()) return
       if (handle) await openKeyframesHandle(handle)
       else setStatus(tFmt('Could not find linked keyframes "%1"', properties.keyframesFile))
     }
@@ -1839,6 +2084,7 @@ export function App() {
     encoding: string,
     format: SubtitleFormat,
     textImport?: TextImportOptions,
+    skipLinkedFiles = false,
   ): Promise<boolean> => {
     if (!coreRef.current) return false
     setBusy(true)
@@ -1878,7 +2124,7 @@ export function App() {
       setStatus(`Opened ${file.name}`)
       void recordRecent('subtitle', file)
       saveLastSubtitleName(file.name)
-      void autoLoadLinkedFiles(state.document)
+      if (!skipLinkedFiles) void autoLoadLinkedFiles(state.document)
       return true
     } catch (error) {
       setStatus(error instanceof Error ? error.message : tPlain('Could not open subtitles'))
@@ -1894,13 +2140,14 @@ export function App() {
     bytes: Uint8Array,
     format: SubtitleFormat,
     encoding: string,
+    skipLinkedFiles = false,
   ): Promise<boolean> => {
     if (format === 'txt') {
-      setPendingOpen({ file, bytes, format, encoding })
+      setPendingOpen({ file, bytes, format, encoding, skipLinkedFiles })
       setDialog('text-import')
       return true
     }
-    return await finishOpenSubtitle(file, bytes, encoding, format)
+    return await finishOpenSubtitle(file, bytes, encoding, format, undefined, skipLinkedFiles)
   }
 
   /**
@@ -1909,7 +2156,13 @@ export function App() {
    */
   const openSubtitleHandle = async (
     file: AppFileHandle,
-    overrides: { charset?: boolean; encoding?: string; format?: SubtitleFormat } = {},
+    overrides: {
+      charset?: boolean
+      encoding?: string
+      format?: SubtitleFormat
+      /** 会话恢复：不自动载入关联视频/音频/时间码（避免启动时无端弹窗） */
+      skipLinkedFiles?: boolean
+    } = {},
   ): Promise<boolean> => {
     if (!coreRef.current) return false
     setBusy(true)
@@ -1917,7 +2170,7 @@ export function App() {
       const bytes = await host.readFile(file)
       if (/\.(mkv|mka|mks)$/i.test(file.name)) {
         setBusy(false)
-        return await openExtractedSubtitles(bytes, file.name)
+        return await openExtractedSubtitles(bytes, file.name, overrides.skipLinkedFiles)
       }
       const decoded = overrides.encoding
         ? decodeWithEncoding(bytes, overrides.encoding)
@@ -1926,13 +2179,24 @@ export function App() {
         throw new Error(tPlain('File appears to be binary and cannot be loaded as subtitles.'))
       const format = overrides.format ?? detectFormat(file.name, decoded.text)
       if (!overrides.encoding && (overrides.charset || !decoded.definite)) {
-        setPendingOpen({ file, bytes, format })
+        setPendingOpen({
+          file,
+          bytes,
+          format,
+          skipLinkedFiles: overrides.skipLinkedFiles,
+        })
         setDialog('charset')
         setBusy(false)
         return true
       }
       setBusy(false)
-      return await beginSubtitleLoad(file, bytes, format, overrides.encoding ?? decoded.encoding)
+      return await beginSubtitleLoad(
+        file,
+        bytes,
+        format,
+        overrides.encoding ?? decoded.encoding,
+        overrides.skipLinkedFiles,
+      )
     } catch (error) {
       setStatus(error instanceof Error ? error.message : tPlain('Could not open subtitles'))
       setBusy(false)
@@ -1944,6 +2208,7 @@ export function App() {
   const openExtractedSubtitles = async (
     bytes: Uint8Array,
     sourceName: string,
+    skipLinkedFiles = false,
   ): Promise<boolean> => {
     if (!coreRef.current) return false
     setBusy(true)
@@ -1978,7 +2243,7 @@ export function App() {
       setVideoTimeMs(0)
       setStatus(tFmt('Opened %1 (track %2)', sourceName, String(track.number)))
       saveLastSubtitleName(sourceName)
-      void autoLoadLinkedFiles(state.document)
+      if (!skipLinkedFiles) void autoLoadLinkedFiles(state.document)
       return true
     } catch (error) {
       setStatus(error instanceof Error ? error.message : tPlain('Could not extract subtitles'))
@@ -2018,7 +2283,10 @@ export function App() {
     const name = loadLastSubtitleName()
     if (!name) return
     const entry = recentLists.subtitle.find((item) => item.name === name && item.file)
-    if (entry?.file) void openSubtitleHandle({ name: entry.name, file: entry.file })
+    // 会话恢复只还原字幕本身：不自动载入 Project Garbage 里缓存的关联视频，
+    // 否则启动时会在用户未选择任何视频文件的情况下弹出上一视频的轨道/属性对话框
+    if (entry?.file)
+      void openSubtitleHandle({ name: entry.name, file: entry.file }, { skipLinkedFiles: true })
     // oxlint-disable-next-line react-hooks/exhaustive-deps -- startupRestoreRef 保证仅执行一次，openSubtitleHandle 每次渲染新建
   }, [core, recentLists, openSubtitleHandle])
 
@@ -2041,7 +2309,46 @@ export function App() {
     setActiveId(id)
     setSelectedIds(id ? new Set([id]) : new Set())
     setStatus(tPlain('New subtitles'))
+    // 新文档没有 Automation Scripts 引用：卸载上一文件的本地脚本
+    setAutomationScripts((current) => current.filter((script) => script.isGlobal))
     saveLastSubtitleName(null)
+  }
+
+  /**
+   * app/updates：web 构建没有版本号，改为重新取入口页并比较 Vite 资源哈希；
+   * 哈希变化说明部署了新版本（浏览器缓存旧 JS 时需要刷新）。
+   */
+  const checkForUpdates = async () => {
+    try {
+      const currentScript = [...document.scripts]
+        .map((script) => script.src)
+        .find((src) => /\/assets\/[^/]+\.js$/.test(src))
+      const response = await fetch(window.location.href, { cache: 'no-store' })
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
+      const html = await response.text()
+      const match = /<script[^>]+src="([^"]+\.js)"/i.exec(html)
+      const nextScript = match ? new URL(match[1], window.location.href).href : currentScript
+      if (currentScript && nextScript && nextScript !== currentScript) {
+        const choice = await askChoice(
+          tPlain('Check for Updates'),
+          tPlain('A new version of the web build is available. Reload now?'),
+          [tPlain('Reload'), tPlain('Close')],
+          0,
+        )
+        if (choice === 0) window.location.reload()
+      } else {
+        await showMessage(
+          tPlain('Check for Updates'),
+          tPlain('You are running the latest version.'),
+        )
+      }
+    } catch (cause) {
+      setStatus(
+        `${tPlain('Could not check for updates')}: ${
+          cause instanceof Error ? cause.message : String(cause)
+        }`,
+      )
+    }
   }
 
   const restoreAutosave = async () => {
@@ -2458,27 +2765,29 @@ export function App() {
     }
   }
 
-  const openVideoHandle = async (file: AppFileHandle) => {
+  const openVideoHandle = async (file: AppFileHandle): Promise<boolean> => {
     const source = await host.openMedia(file)
     if (source.kind === 'audio') {
       URL.revokeObjectURL(source.url)
       setStatus(tPlain('The selected file does not contain video'))
-      return
+      return false
     }
     const previousVideo = videoMedia
     videoPropertiesRunRef.current += 1 // 旧视频的属性提示失效
     // 多轨道：FFMS2 在 LoadVideo/LoadAudio 时询问轨道（AskForTrackSelection）
     let videoStreamIndex: number | undefined
+    let singleVideoTrack = false
     let audioStreamIndex: number | undefined
     let audioSelected = !file.file // 无法探测（如本地原生句柄）时沿用默认音轨
     if (file.file) {
       try {
         const tracks = await listMediaTracks(file.file)
+        singleVideoTrack = tracks.videos.length <= 1
         const videoTrack = await chooseTrackIndex('video', tracks.videos)
         if (videoTrack.cancelled) {
           URL.revokeObjectURL(source.url)
           setStatus(tPlain('Video track selection cancelled'))
-          return
+          return false
         }
         videoStreamIndex = videoTrack.index
         // Video/Open Audio（Preferences → Video → Options）：打开视频时是否自动挂载音轨
@@ -2494,7 +2803,7 @@ export function App() {
       }
     }
     const videoSource: MediaSource =
-      videoStreamIndex === undefined ? source : { ...source, videoStreamIndex }
+      videoStreamIndex === undefined ? source : { ...source, videoStreamIndex, singleVideoTrack }
     const audioSource: MediaSource =
       audioStreamIndex === undefined ? source : { ...source, audioStreamIndex }
     const openAudio = getOptionBool('Video/Open Audio') && audioSelected
@@ -2508,6 +2817,9 @@ export function App() {
         URL.revokeObjectURL(previousAudio.url)
     }
     setVideoMedia(videoSource)
+    // project.cpp DoLoadVideo：载入任何视频后 AR 回到视频自身的 DAR（代码里的 Default =
+    // 不做覆盖）。工程存档的 AR 只在关联视频随字幕一起载入时覆盖（见 autoLoadLinkedFiles）
+    setAspectOverride(null)
     setVideoSizeReady(false)
     // FrameMain::OnVideoOpen 的减档等真实尺寸上报后结算（见 setIntrinsicSizeStable）
     pendingZoomFitRef.current = true
@@ -2605,6 +2917,7 @@ export function App() {
       URL.revokeObjectURL(previousVideo.url)
     setStatus(`Video: ${file.name}`)
     void recordRecent('video', file)
+    return true
   }
 
   const openVideo = async () => {
@@ -2618,6 +2931,10 @@ export function App() {
     setVideoDetached(false) // dialog_detached_video.cpp：关闭视频时一并关闭分离窗口
     setVideoMedia(null)
     setVideoSizeReady(false)
+    // project.cpp CloseVideo：ar_mode/ar_value 归零（回到视频自身的宽高比）
+    setAspectOverride(null)
+    // 回到无视频状态：占位栏恢复默认 50%
+    setPlaceholderZoom(0.5)
     pendingZoomFitRef.current = false
     setVideoDurationMs(0)
     setVideoTimeMs(0)
@@ -2889,12 +3206,45 @@ export function App() {
 
   // ---- Export Subtitles（dialog_export.cpp + ass_exporter.cpp 的导出过滤器链）----
   // 链序同 AssExportFilterChain::GetFilterList（优先级降序 + 重名去重）
-  const exportFilters = useMemo(
-    () => orderedAutomationFilters(automationScripts),
-    [automationScripts],
-  )
+  const exportFilters = useMemo(() => orderedExportFilters(automationScripts), [automationScripts])
   const exportFilterKey = (filter: AutomationFilterDisplayInfo) =>
     `${filter.stateId}:${filter.name}`
+
+  /**
+   * 读取脚本的 automation_settings（ExportFilter::GetConfigDialogWindow）。
+   * ass_parser 解析时保留了 "Automation Settings" 后的前导空格，故两种键都查。
+   */
+  const storedDialogSettings = (filter: AutomationFilterDisplayInfo): string => {
+    const settings = core?.document.properties.automationSettings ?? {}
+    // ExportFilter::GetScriptSettingsIdentifier 用的是 Register 去重后的展示名
+    const key = inlineStringEncode(filter.displayName)
+    return settings[key] ?? settings[` ${key}`] ?? ''
+  }
+
+  /** 回写 automation_settings（ExportFilter::LoadSettings；属性不建立撤销点） */
+  const storeDialogSettings = (
+    filter: AutomationFilterDisplayInfo,
+    spec: DialogSpec,
+    values: DialogValue[],
+  ) => {
+    if (!coreRef.current) return
+    const key = inlineStringEncode(filter.displayName)
+    const serialized = serializeDialogSettings(spec.controls, values)
+    void coreRef.current.apply(
+      [
+        {
+          type: 'updateProperties',
+          patch: {
+            automationSettings: {
+              ...(core?.document.properties.automationSettings ?? {}),
+              [key]: serialized,
+            },
+          },
+        },
+      ],
+      '',
+    )
+  }
 
   /**
    * 过滤器 Configure（web 偏差：用按钮替代桌面的内嵌配置面板）：调 config 函数
@@ -2909,11 +3259,13 @@ export function App() {
         spec: cached.spec,
         initialValues: cached.values,
         resolve: (response) => {
-          if (readBackButton(cached.spec.buttons, response.button) !== false)
+          if (readBackButton(cached.spec.buttons, response.button) !== false) {
             setFilterConfigs((current) => ({
               ...current,
               [key]: { spec: cached.spec, values: response.values },
             }))
+            storeDialogSettings(filter, cached.spec, response.values)
+          }
         },
       })
       return
@@ -2927,14 +3279,21 @@ export function App() {
     )
     if (!result.ok || !result.spec) return
     const spec = result.spec
-    const values = defaultDialogValues(spec)
+    // 初始值 = 脚本默认值 + 项目 automation_settings（Unserialise）
+    const values = applyDialogSettings(
+      spec,
+      defaultDialogValues(spec),
+      storedDialogSettings(filter),
+    )
     setFilterConfigs((current) => ({ ...current, [key]: { spec, values } }))
     setLuaDialog({
       spec,
       initialValues: values,
       resolve: (response) => {
-        if (readBackButton(spec.buttons, response.button) !== false)
+        if (readBackButton(spec.buttons, response.button) !== false) {
           setFilterConfigs((current) => ({ ...current, [key]: { spec, values: response.values } }))
+          storeDialogSettings(filter, spec, response.values)
+        }
       },
     })
   }
@@ -2942,12 +3301,30 @@ export function App() {
   /**
    * 运行单个导出过滤器（LuaExportFilter::ProcessSubs：在文档副本上跑、返回值丢弃、
    * ProcessingComplete 行集整表应用）；返回 null 表示取消（UserCancelException 中止导出）。
+   * 内置过滤器（Fix Styles / Transform Framerate）直接在文档副本上同步处理。
    */
   const runExportFilter = async (
     filter: AutomationFilterDisplayInfo,
     doc: SubtitleDocument,
     liveRows: ReturnType<typeof documentToLuaRows>,
+    framerate?: FramerateFilterSettings,
   ): Promise<SubtitleDocument | null> => {
+    if (filter.builtin === 'fix_styles') return fixStyles(doc)
+    if (filter.builtin === 'transform_framerate') {
+      if (!framerate) return doc
+      const inputFps = Number.parseFloat(framerate.inputFps)
+      const outputFps = Number.parseFloat(framerate.outputFps)
+      const invalid = !(inputFps > 0) || (framerate.outputMode === 'cfr' && !(outputFps > 0))
+      if (invalid) {
+        setStatus(tPlain('Invalid framerate for Transform Framerate'))
+        return null
+      }
+      // LoadSettings(false)：Variable = 工程 timecodes；Constant = 输入框帧率；Reverse 交换
+      let input = Framerate.cfr(inputFps)
+      let output = framerate.outputMode === 'variable' ? frameRate : Framerate.cfr(outputFps)
+      if (framerate.reverse) [input, output] = [output, input]
+      return transformFramerateDocument(doc, input, output)
+    }
     const luaHost = makeAutomationHost()
     let config: Record<string, DialogValue> | null = null
     if (filter.hasConfig) {
@@ -2961,8 +3338,17 @@ export function App() {
           liveRows,
           luaHost,
         )
-        if (specResult.ok && specResult.spec)
-          config = dialogConfigTable(specResult.spec, defaultDialogValues(specResult.spec))
+        if (specResult.ok && specResult.spec) {
+          // 未 Configure 过：脚本默认值 + 项目 automation_settings
+          config = dialogConfigTable(
+            specResult.spec,
+            applyDialogSettings(
+              specResult.spec,
+              defaultDialogValues(specResult.spec),
+              storedDialogSettings(filter),
+            ),
+          )
+        }
       }
     }
     const result = await runAutomationFilter(
@@ -2992,6 +3378,14 @@ export function App() {
       // config 函数以当前文档求值（LuaExportFilter::GenerateConfigDialog 的 c->ass）
       const liveRows = documentToLuaRows(core.document)
       for (const filter of options.filters) {
+        // 内置过滤器同步执行，不弹 DialogProgress（桌面版同样没有进度窗口）
+        if (filter.builtin) {
+          // oxlint-disable-next-line no-await-in-loop -- 过滤器链必须串行
+          const next = await runExportFilter(filter, doc, liveRows, options.framerate)
+          if (!next) return
+          doc = next
+          continue
+        }
         luaCancelledRef.current = false
         setLuaProgress({
           title: filter.displayName,
@@ -3003,7 +3397,7 @@ export function App() {
         })
         // 过滤器链必须串行：后一个过滤器处理前一个的输出（AssExporter::Export 顺序执行）
         // oxlint-disable-next-line no-await-in-loop
-        const next = await runExportFilter(filter, doc, liveRows)
+        const next = await runExportFilter(filter, doc, liveRows, options.framerate)
         if (!next) return
         doc = next
       }
@@ -3369,6 +3763,8 @@ export function App() {
       if (videoMedia && videoMedia !== audioMedia) URL.revokeObjectURL(videoMedia.url)
       setVideoMedia({ name: 'Dummy Video', url: '', kind: 'video', dummy: options })
       setVideoSizeReady(false)
+      // project.cpp DoLoadVideo：新视频（含虚拟视频）的 AR 回到自身 DAR
+      setAspectOverride(null)
       // dummy provider 同样经 FrameMain::OnVideoOpen 减档（尺寸由面板 effect 上报）
       pendingZoomFitRef.current = true
       setVideoDurationMs(options.lengthMs)
@@ -3418,6 +3814,9 @@ export function App() {
     replaceAll,
     openStyleManager: () => setShowStyleManager(true),
     openDialog: (kind) => setDialog(kind),
+    reloadAutomationScripts: () => void reloadAllAutomationScripts(),
+    reloadGlobalAutomationScripts: () => void reloadGlobalAutomationScripts(),
+    checkForUpdates: () => void checkForUpdates(),
     setToolbarVisible: (value) => {
       setToolbarVisible(value)
       setOption('App/Show Toolbar', value)
@@ -3704,7 +4103,7 @@ export function App() {
                   isCommandChecked={isCommandChecked}
                   windowZoom={previewZoom}
                   devicePixelRatio={devicePixelRatioValue}
-                  onWindowZoomChange={setVideoWindowZoom}
+                  onWindowZoomChange={changeVideoZoom}
                   onIntrinsicSizeChange={setIntrinsicSizeStable}
                   localFontsEpoch={localFontsEpoch}
                   onLocalFontsAuthorize={() => setLocalFontsEpoch((epoch) => epoch + 1)}
@@ -4163,7 +4562,13 @@ export function App() {
             const pending = pendingOpen
             setPendingOpen(null)
             setDialog(null)
-            void beginSubtitleLoad(pending.file, pending.bytes, pending.format, encoding)
+            void beginSubtitleLoad(
+              pending.file,
+              pending.bytes,
+              pending.format,
+              encoding,
+              pending.skipLinkedFiles,
+            )
           }}
           onClose={() => {
             setPendingOpen(null)
@@ -4190,6 +4595,7 @@ export function App() {
                 pending.encoding,
                 pending.format,
                 options,
+                pending.skipLinkedFiles,
               )
             }
           }}
@@ -4315,6 +4721,7 @@ export function App() {
         <FontCollectorDialog
           styles={core.document.styles}
           text={core.document.cues.map((cue) => cue.text).join('\n')}
+          fileName={core.document.sourceName}
           onLocalFontsAuthorized={() => setLocalFontsEpoch((epoch) => epoch + 1)}
           onClose={() => setDialog(null)}
         />
@@ -4342,6 +4749,13 @@ export function App() {
         <ExportSubtitlesDialog
           filters={exportFilters}
           initialSelected={core ? documentExportFilters(core.document) : []}
+          framerateDefaults={{
+            inputFps: detectedFps ?? (frameRate.isLoaded() ? frameRate.fps() : 23.976),
+            outputFps: frameRate.isLoaded() ? frameRate.fps() : 23.976,
+            // Framerate::IsVFR()：timecodes 表多于一个条目
+            outputVariable: frameRate.timecodes.length > 1,
+            hasVideo: Boolean(videoMedia),
+          }}
           onConfigure={(filter) => void openFilterConfig(filter)}
           onClose={() => setDialog(null)}
           onApply={(options) => void applyExport(options)}
@@ -4370,10 +4784,13 @@ export function App() {
             version: script.version,
             warnings: script.warnings,
             error: script.error,
+            isGlobal: script.isGlobal,
           }))}
           onAdd={() => void addAutomationScript()}
           onRemove={removeAutomationScript}
           onReload={(key) => void reloadAutomationScript(key)}
+          onRescan={() => void reloadGlobalAutomationScripts()}
+          onHelp={() => openHelpPage('Automation Manager')}
           onClose={() => setDialog(null)}
         />
       )}
@@ -4381,7 +4798,7 @@ export function App() {
         <FileManagerDialog
           onClose={() => setDialog(null)}
           onRestoreDefaults={restoreFactoryScripts}
-          onChanged={() => void reloadAllAutomationScripts()}
+          onChanged={() => void reloadGlobalAutomationScripts()}
         />
       )}
       {dialog === 'timing-postprocess' && core && (
@@ -4405,12 +4822,18 @@ export function App() {
           onApply={(commands, label) => void apply(commands, label)}
         />
       )}
-      {dialog === 'spellcheck' && (
-        <ToolInfoDialog
-          title={tPlain('Spell Checker')}
-          message={tPlain(
-            'Spell checking is disabled in the subtitle edit box so ASS override tags and template blocks are not marked as misspelled. The desktop spell checker is not available in this build.',
-          )}
+      {dialog === 'spellcheck' && core && (
+        <SpellCheckerDialog
+          cues={core.document.cues}
+          activeId={activeId}
+          onReveal={(cueId, start, end) => {
+            // dialog_spellchecker.cpp：SetSelectionAndActive + 选中错词（不依赖查找字段）
+            setActiveId(cueId)
+            anchorRef.current = cueId
+            setFindTextSelection({ pos: end, start, end })
+            setHistoryNonce((value) => value + 1)
+          }}
+          onApply={(commands, label) => void apply(commands, label)}
           onClose={() => setDialog(null)}
         />
       )}

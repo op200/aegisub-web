@@ -95,6 +95,8 @@ interface Lua55Module {
   _lua_web_getinfo(handle: number, level: number): number
   _lua_web_dbg_str(which: number): number
   _lua_web_dbg_int(which: number): number
+  _lua_web_preload_lpeg(handle: number): number
+  _lua_web_preload_luabins(handle: number): number
   HEAPU8: Uint8Array
   HEAP32: Int32Array
   luaWeb?: LuaWebBridge
@@ -209,6 +211,16 @@ export class Lua55Api implements LuaVmApi {
 
   release(id: number): void {
     this.refs.delete(id)
+  }
+
+  /**
+   * 把编译进 wasm 的 lpeg / luabins 注册到 package.preload。
+   * luabins 注册在 aegisub.__luabins_impl 下，由 luaModules 的 Lua 包装层发废弃警告。
+   */
+  preloadNativeModule(L: number, name: 'lpeg' | 'luabins'): boolean {
+    if (name === 'lpeg') return this.mod._lua_web_preload_lpeg(L) !== 0
+    if (name === 'luabins') return this.mod._lua_web_preload_luabins(L) !== 0
+    return false
   }
 
   setTextError(text: string): void {

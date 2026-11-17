@@ -133,3 +133,119 @@ export function invertLightness(value: string, remap?: { min?: number; max?: num
   if (alpha < 1) return `rgba(${to255(r2)}, ${to255(g2)}, ${to255(b2)}, ${alpha})`
   return `rgb(${to255(r2)}, ${to255(g2)}, ${to255(b2)})`
 }
+
+// ---------------------------------------------------------------------------
+// 颜色选择器（dialog_colorpicker.cpp）使用的 agi::Color 表示：
+// r/g/b 为 0..255，a 为 ASS 语义的 alpha（0 = 不透明，255 = 全透明）
+// ---------------------------------------------------------------------------
+export interface PickerColor {
+  r: number
+  g: number
+  b: number
+  a: number
+}
+
+export const BLACK_COLOR: PickerColor = { r: 0, g: 0, b: 0, a: 0 }
+
+const clampByte = (value: number) =>
+  Number.isFinite(value) ? Math.max(0, Math.min(255, Math.round(value))) : 0
+
+/** 解析 ASS/SSA 颜色（&HAABBGGRR& / &HBBGGRR& / 十进制） */
+export function parseAssPickerColor(value: string): PickerColor | null {
+  const text = value.trim()
+  const hex = /^&?[Hh]?([0-9a-fA-F]{8}|[0-9a-fA-F]{6})&?$/.exec(text)
+  if (hex) {
+    const digits = hex[1].padStart(8, '0')
+    return {
+      a: Number.parseInt(digits.slice(0, 2), 16),
+      b: Number.parseInt(digits.slice(2, 4), 16),
+      g: Number.parseInt(digits.slice(4, 6), 16),
+      r: Number.parseInt(digits.slice(6, 8), 16),
+    }
+  }
+  if (/^\d+$/.test(text)) {
+    const decimal = Number.parseInt(text, 10)
+    return {
+      a: (decimal >>> 24) & 0xff,
+      b: (decimal >>> 16) & 0xff,
+      g: (decimal >>> 8) & 0xff,
+      r: decimal & 0xff,
+    }
+  }
+  return null
+}
+
+/** 解析 CSS 颜色（#RGB / #RRGGBB / rgb() / rgba()）；alpha 换算为 ASS 语义 */
+export function parseCssPickerColor(value: string): PickerColor | null {
+  const text = value.trim()
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(text)
+  if (hex) {
+    const digits =
+      hex[1].length === 3
+        ? hex[1]
+            .split('')
+            .map((char) => char + char)
+            .join('')
+        : hex[1]
+    return {
+      r: Number.parseInt(digits.slice(0, 2), 16),
+      g: Number.parseInt(digits.slice(2, 4), 16),
+      b: Number.parseInt(digits.slice(4, 6), 16),
+      a: 0,
+    }
+  }
+  const rgb = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)$/i.exec(text)
+  if (!rgb) return null
+  const opacity = rgb[4] === undefined ? 1 : Math.max(0, Math.min(1, Number(rgb[4])))
+  return {
+    r: clampByte(Number(rgb[1])),
+    g: clampByte(Number(rgb[2])),
+    b: clampByte(Number(rgb[3])),
+    a: clampByte((1 - opacity) * 255),
+  }
+}
+
+/** ASS 颜色字符串；includeAlpha=false 时输出 override 用的 &HBBGGRR& */
+export function pickerColorToAss(color: PickerColor, includeAlpha = true): string {
+  const byte = (value: number) => clampByte(value).toString(16).padStart(2, '0').toUpperCase()
+  if (!includeAlpha) return `&H${byte(color.b)}${byte(color.g)}${byte(color.r)}&`
+  return `&H${byte(color.a)}${byte(color.b)}${byte(color.g)}${byte(color.r)}`
+}
+
+/** CSS 颜色（用于实时回写 Colour/* 选项与样式预览） */
+export function pickerColorToCss(color: PickerColor): string {
+  const opacity = 1 - clampByte(color.a) / 255
+  if (opacity >= 1)
+    return `rgb(${clampByte(color.r)}, ${clampByte(color.g)}, ${clampByte(color.b)})`
+  return `rgba(${clampByte(color.r)}, ${clampByte(color.g)}, ${clampByte(color.b)}, ${Number(opacity.toFixed(3))})`
+}
+
+/** HTML 输入框格式：与 GetHexFormatted(false) 一致 */
+export function pickerColorToHtml(color: PickerColor): string {
+  const byte = (value: number) => clampByte(value).toString(16).padStart(2, '0').toUpperCase()
+  return `#${byte(color.r)}${byte(color.g)}${byte(color.b)}`
+}
+
+/**
+ * 解析 Colour/* 选项存储格式（Color::GetRgbFormatted）：
+ * rgb(r,g,b) 或 rgba(r,g,b,a)，第 4 个分量为 ASS 语义的 0..255 alpha。
+ */
+export function parseOptionColor(value: string): PickerColor | null {
+  const match = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)/i.exec(value)
+  if (!match) return parseCssPickerColor(value)
+  return {
+    r: clampByte(Number(match[1])),
+    g: clampByte(Number(match[2])),
+    b: clampByte(Number(match[3])),
+    a: match[4] === undefined ? 0 : clampByte(Number(match[4])),
+  }
+}
+
+/** PickerColor → Colour/* 选项存储格式（alpha 为 0 时省略第 4 分量） */
+export function pickerColorToOption(color: PickerColor): string {
+  const r = clampByte(color.r)
+  const g = clampByte(color.g)
+  const b = clampByte(color.b)
+  const a = clampByte(color.a)
+  return a ? `rgba(${r}, ${g}, ${b}, ${a})` : `rgb(${r}, ${g}, ${b})`
+}

@@ -2,8 +2,10 @@ import {
   memo,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
@@ -17,7 +19,6 @@ import {
   useOptionsVersion,
 } from '../../config/options'
 import {
-  assOverrideColor,
   blockAtPos,
   findTag,
   normalizePos,
@@ -26,7 +27,30 @@ import {
   tagBool,
   tagColorHex,
 } from '../../core/assTags'
+import { IGNORE_BLOCKS, maxLineLength } from '../../core/characterCount'
 import { parseCueEntryLines } from '../../core/format'
+import {
+  addWordToDictionary,
+  canAddWord,
+  canRemoveWord,
+  getSpellcheckVersion,
+  getSpellCheckerLanguage,
+  getSpellCheckerLanguages,
+  isSpellCheckerLoaded,
+  removeWordFromDictionary,
+  setSpellCheckerLanguage,
+  spellCheckWord,
+  spellSuggestions,
+  subscribeSpellcheck,
+} from '../../core/spellcheck'
+import {
+  getThesaurusLanguage,
+  getThesaurusLanguages,
+  getThesaurusVersion,
+  setThesaurusLanguage,
+  subscribeThesaurus,
+  thesaurusLookup,
+} from '../../core/thesaurus'
 import { formatEditorTime, parseEditorTime } from '../../core/time'
 import type { SubtitleCue, SubtitleStyle } from '../../core/types'
 import { Framerate } from '../../core/vfr'
@@ -39,14 +63,22 @@ import {
   type AssSyntaxStyle,
   type AssSyntaxType,
 } from '../assHighlight'
-import { assColorToHex } from '../color'
+import { calltipAt, type Calltip } from '../calltip'
+import {
+  parseAssPickerColor,
+  parseCssPickerColor,
+  pickerColorToAss,
+  type PickerColor,
+} from '../color'
 import { editBoxActions, editCursorState, setPendingPasteText } from '../commandRegistry'
 import { COMMANDS, commandTooltip } from '../commands'
-import { tPlain } from '../i18n'
+import { wordAtPosition, type DialogueWord } from '../dialogueWords'
+import { tFmt, tPlain } from '../i18n'
 import { LUA_BLOCK_BACKGROUND, LUA_BLOCK_CARET } from '../luaHighlight'
 import { useSystemTheme } from '../theme'
+import { ColorPickerDialog } from './ColorPickerDialog'
 import { Dialog, probeLocalFonts } from './dialogs'
-import { MenuPopup } from './MenuPopup'
+import { MenuPopup, MenuSub } from './MenuPopup'
 
 const EDIT_ICON = (name: string) => aegisubIconUrl(`${name}_64`)
 
@@ -56,12 +88,18 @@ type TimeFieldKey = 'startMs' | 'endMs' | 'duration'
 
 /** edit/color/* 按钮 → 覆写标签 + 样式字段（command/edit.cpp show_color_picker） */
 const COLOR_TAGS = {
-  c: { tag: '\\c', alt: '\\1c', field: 'primaryColor' },
-  '2c': { tag: '\\2c', alt: '', field: 'secondaryColor' },
-  '3c': { tag: '\\3c', alt: '', field: 'outlineColor' },
-  '4c': { tag: '\\4c', alt: '', field: 'backColor' },
+  c: { tag: '\\c', alt: '\\1c', alpha: '\\1a', field: 'primaryColor' },
+  '2c': { tag: '\\2c', alt: '', alpha: '\\2a', field: 'secondaryColor' },
+  '3c': { tag: '\\3c', alt: '', alpha: '\\3a', field: 'outlineColor' },
+  '4c': { tag: '\\4c', alt: '', alpha: '\\4a', field: 'backColor' },
 } as const
 type ColorTagKey = keyof typeof COLOR_TAGS
+
+/** override alpha 标签参数（&H80& / 80）→ 0..255 */
+function tagAlphaByte(params: string, fallback: number): number {
+  const match = /^\s*&?[Hh]?([0-9a-fA-F]{1,2})&?\s*$/.exec(params)
+  return match ? Number.parseInt(match[1], 16) : fallback
+}
 
 /** edit/style/* 按钮 → 覆写标签 + 样式字段（command/edit.cpp toggle_override_tag） */
 const STYLE_TOGGLES = {
@@ -141,21 +179,83 @@ function mergeFontFamilies(current: string[], extra: string[]): string[] {
 
 /** 字符计数（Subtitle/Character Counter：Ignore Whitespace / Ignore Punctuation） */
 function longestVisibleLine(text: string, ignoreWhitespace: boolean, ignorePunctuation: boolean) {
-  const visibleText = text.replace(/\{[^}]*\}/g, '')
-  const lines = visibleText.split(/\\[Nn]|\r?\n/)
-  return Math.max(
-    0,
-    ...lines.map((line) => {
-      let value = Array.from(line)
-      if (ignorePunctuation) value = value.filter((c) => !/\p{P}/u.test(c))
-      if (ignoreWhitespace) value = value.filter((c) => !/[\p{Z}\s]/u.test(c))
-      return value.length
-    }),
-  )
+  let ignore = IGNORE_BLOCKS
+  if (ignoreWhitespace) ignore |= 1
+  if (ignorePunctuation) ignore |= 2
+  return maxLineLength(text, ignore)
 }
 
 function stripPlainText(text: string) {
   return [...text.matchAll(/\{[^}]*\}/g)].map(([block]) => block).join('')
+}
+
+/** 右键位置 → 文本偏移（subs_edit_ctrl.cpp PositionFromPoint）：
+ *  用与 textarea 同样式、同位置的透明镜像层，借 caretRangeFromPoint 取字符偏移 */
+function textOffsetAtPoint(editor: HTMLTextAreaElement, clientX: number, clientY: number): number {
+  const rect = editor.getBoundingClientRect()
+  const style = getComputedStyle(editor)
+  const mirror = document.createElement('div')
+  mirror.textContent = editor.value
+  Object.assign(mirror.style, {
+    position: 'fixed',
+    left: `${rect.left}px`,
+    top: `${rect.top - editor.scrollTop}px`,
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+    padding: style.padding,
+    border: style.border,
+    boxSizing: style.boxSizing,
+    fontFamily: style.fontFamily,
+    fontSize: style.fontSize,
+    fontWeight: style.fontWeight,
+    fontStyle: style.fontStyle,
+    lineHeight: style.lineHeight,
+    letterSpacing: style.letterSpacing,
+    tabSize: style.tabSize,
+    whiteSpace: 'pre-wrap',
+    overflowWrap: 'break-word',
+    overflow: 'hidden',
+    color: 'transparent',
+    background: 'transparent',
+    zIndex: '2147483647',
+  })
+  document.body.appendChild(mirror)
+  let offset = editor.selectionStart
+  const doc = document as Document & {
+    caretRangeFromPoint?: (x: number, y: number) => Range | null
+    caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null
+  }
+  const range = doc.caretRangeFromPoint?.(clientX, clientY)
+  if (range) offset = range.startOffset
+  else {
+    const position = doc.caretPositionFromPoint?.(clientX, clientY)
+    if (position) offset = position.offset
+  }
+  mirror.remove()
+  return Math.max(0, Math.min(editor.value.length, offset))
+}
+
+/** 高亮层中第 offset 个字符的屏幕矩形（calltip 定位；offset 越界时取最后一个字符） */
+function rectAtTextOffset(root: HTMLElement, offset: number): DOMRect | null {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  let remaining = offset
+  let lastRect: DOMRect | null = null
+  let node = walker.nextNode() as Text | null
+  while (node) {
+    const length = node.nodeValue?.length ?? 0
+    if (length > 0) {
+      const index = Math.min(remaining, length - 1)
+      const range = document.createRange()
+      range.setStart(node, index)
+      range.setEnd(node, Math.min(index + 1, length))
+      const rect = range.getBoundingClientRect()
+      if (rect.width > 0 || rect.height > 0) lastRect = rect
+      if (remaining < length) return rect
+    }
+    remaining -= length
+    node = walker.nextNode() as Text | null
+  }
+  return lastRect
 }
 
 /** 编辑框选区变化：写入模块级光标状态并上报核心
@@ -439,18 +539,21 @@ function useAsyncHighlight(
   templateLine: boolean,
   templateLua: boolean,
   syntax: boolean,
+  spellcheckVersion: number,
 ): HighlightView {
   const [result, setResult] = useState<HighlightResult | null>(null)
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
       // 关闭语法高亮时整段 NORMAL（对应源码 SetStyling(line_text.size(), 0)）
+      const checker = isSpellCheckerLoaded() ? spellCheckWord : null
       const segments = syntax
-        ? tokenizeAss(text, templateLine, templateLua)
+        ? tokenizeAss(text, templateLine, templateLua, checker)
         : [{ text, type: 'NORMAL' as const }]
       setResult({ text, templateLine, templateLua, syntax, segments })
     })
     return () => cancelAnimationFrame(frame)
-  }, [text, templateLine, templateLua, syntax])
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- spellcheckVersion 仅为词库变化后重算
+  }, [text, templateLine, templateLua, syntax, spellcheckVersion])
   if (
     result !== null &&
     result.text === text &&
@@ -468,6 +571,8 @@ function useAsyncHighlight(
 interface SpanStyleCache {
   colors: Record<AssSyntaxType, AssSyntaxStyle>
   styles: Map<string, CSSProperties>
+  /** 拼写错误变体（红色波浪线） */
+  spellStyles: Map<string, CSSProperties>
 }
 
 /** 段样式（取代原内联 JSX）：Bold 对齐源码 Colour/Subtitle/Syntax/Bold/* 选项，但用
@@ -499,13 +604,21 @@ function buildSpanStyleCache(colors: Record<AssSyntaxType, AssSyntaxStyle>): Spa
     styles.set(type, buildSpanStyle(style, undefined))
     styles.set(`${type}\u0000${LUA_BLOCK_BACKGROUND}`, buildSpanStyle(style, LUA_BLOCK_BACKGROUND))
   }
-  return { colors, styles }
+  return { colors, styles, spellStyles: new Map() }
 }
 
 /** 段 → 缓存样式（未命中则即时构建：非块底纹的不常见底纹颜色走此路径） */
 function spanStyleFor(cache: SpanStyleCache, segment: AssHighlightSegment): CSSProperties {
   const key = segment.background ? `${segment.type}\u0000${segment.background}` : segment.type
-  return cache.styles.get(key) ?? buildSpanStyle(cache.colors[segment.type], segment.background)
+  const base =
+    cache.styles.get(key) ?? buildSpanStyle(cache.colors[segment.type], segment.background)
+  if (!segment.spellError) return base
+  let spell = cache.spellStyles.get(key)
+  if (!spell) {
+    spell = { ...base, textDecoration: 'underline wavy #e00000', textDecorationSkipInk: 'none' }
+    cache.spellStyles.set(key, spell)
+  }
+  return spell
 }
 
 /** span 样式表（单槽缓存）：按「主题 × 选项版本」键控复用同一引用——React 对 style 浅比较
@@ -945,7 +1058,6 @@ interface EditFormatRowProps {
   frameTiming: boolean
   frameRateLoaded: boolean
   showOriginal: boolean
-  colorPickerRef: { current: HTMLInputElement | null }
   handlers: HandlersRef
 }
 
@@ -953,7 +1065,6 @@ const EditFormatRow = memo(function EditFormatRow({
   frameTiming,
   frameRateLoaded,
   showOriginal,
-  colorPickerRef,
   handlers,
 }: EditFormatRowProps) {
   return (
@@ -1028,15 +1139,6 @@ const EditFormatRow = memo(function EditFormatRow({
       >
         <img src={EDIT_ICON('button_color_four')} alt="" width={16} height={16} draggable={false} />
       </button>
-      <input
-        ref={colorPickerRef}
-        type="color"
-        defaultValue="#ffffff"
-        onChange={(event) => handlers.current.applyColor(event.target.value)}
-        aria-hidden="true"
-        tabIndex={-1}
-        className="edit-color-picker"
-      />
       <span className="edit-toolbar-spacer" />
       <button
         onClick={() => handlers.current.onCommand('grid/line/next/create')}
@@ -1132,9 +1234,15 @@ export function EditPanel({
   const originalCueIdRef = useRef(cue?.id)
   const editorRef = useRef<HTMLTextAreaElement>(null)
   const highlightRef = useRef<HTMLPreElement>(null)
-  const colorPickerRef = useRef<HTMLInputElement>(null)
+  // 颜色选择器（dialog_colorpicker.cpp）：当前会话的初始色与打开前的原文快照
+  const [colorPicker, setColorPicker] = useState<{
+    initial: string
+    key: ColorTagKey
+  } | null>(null)
+  const colorInitialRef = useRef<PickerColor>({ r: 0, g: 0, b: 0, a: 0 })
+  const colorSnapshotRef = useRef<string>('')
   const colorTagRef = useRef<ColorTagKey>('c')
-  // 颜色写入位置（openColorPicker 时捕获，用户在系统取色器停留期间编辑器可能失焦）
+  // 颜色写入位置（openColorPicker 时捕获，用户在选择器停留期间编辑器可能失焦）
   const colorPosRef = useRef<{ selStart: number; normStart: number }>({ selStart: 0, normStart: 0 })
   // edit/font 字体选择弹窗（wxGetFontFromUser）
   const [fontDraft, setFontDraft] = useState<EffectiveFont | null>(null)
@@ -1154,6 +1262,37 @@ export function EditPanel({
   >({})
   // 右键菜单（subs_edit_ctrl.cpp OnContextMenu）
   const [textMenu, setTextMenu] = useState<{ x: number; y: number } | null>(null)
+  // 右键时选中的词，拼写检查/同义词库菜单项都基于它
+  const [contextWord, setContextWord] = useState<DialogueWord | null>(null)
+  // 词库异步加载完成后刷新菜单内容
+  const spellcheckVersion = useSyncExternalStore(
+    subscribeSpellcheck,
+    getSpellcheckVersion,
+    getSpellcheckVersion,
+  )
+  const thesaurusVersion = useSyncExternalStore(
+    subscribeThesaurus,
+    getThesaurusVersion,
+    getThesaurusVersion,
+  )
+  const contextSuggestions = useMemo(
+    () => (contextWord ? spellSuggestions(contextWord.word) : []),
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- spellcheckVersion 仅为词库加载后重算
+    [contextWord, spellcheckVersion],
+  )
+  const contextMisspelled = contextWord ? !spellCheckWord(contextWord.word) : false
+  const contextThesaurus = useMemo(
+    () => (contextWord ? thesaurusLookup(contextWord.word) : []),
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- thesaurusVersion 仅为词库加载后重算
+    [contextWord, thesaurusVersion],
+  )
+  // Calltip（subs_edit_ctrl.cpp UpdateCalltip → calltip_provider.cpp）
+  const [calltip, setCalltip] = useState<{
+    tip: Calltip
+    left: number
+    top: number
+    right: boolean
+  } | null>(null)
   useEffect(() => {
     if (!textMenu) return
     const close = (event: PointerEvent) => {
@@ -1163,6 +1302,11 @@ export function EditPanel({
     window.addEventListener('pointerdown', close)
     return () => window.removeEventListener('pointerdown', close)
   }, [textMenu])
+  // 关闭 App/Call Tips 时立即隐藏已显示的提示
+  const optionsVersion = useOptionsVersion()
+  useEffect(() => {
+    if (!getOptionBool('App/Call Tips')) setCalltip(null)
+  }, [optionsVersion])
   // cue 变化时重置草稿（React 官方"props 变化调整 state"模式：渲染期更新）
   const [prevCue, setPrevCue] = useState<SubtitleCue | null>(cue)
   // 撤销/重做跳转：此时以核心文本全量回写草稿（对齐 subs_edit_box.cpp UpdateFields 的
@@ -1211,6 +1355,7 @@ export function EditPanel({
     !!(draft && draft.comment && draft.effect.toLowerCase().startsWith('template')),
     getOptionBool('Subtitle/Highlight/Template Lua'),
     getOptionBool('Subtitle/Highlight/Syntax'),
+    spellcheckVersion,
   )
   const [backedSelection, setBackedSelection] = useState<{ start: number; end: number } | null>(
     null,
@@ -1232,7 +1377,6 @@ export function EditPanel({
   }
   // span 样式表（按主题×选项版本复用引用，见 getSpanStyleCache）：React 对 style 浅比较
   // 时引用不变即跳过，稳定段在重渲染中不产生样式开销
-  const optionsVersion = useOptionsVersion()
   const spanStyleCache = getSpanStyleCache(darkTheme, optionsVersion)
   // 高亮异步到达（或过渡/开关变化）时同步光标色：光标未动时 textarea 的 ref 回调
   // 不保证重跑，只有工具函数 trackCursor 的路径会漏掉「仅高亮变化」的重渲染
@@ -1523,36 +1667,51 @@ export function EditPanel({
     requestAnimationFrame(() => editorRef.current?.focus())
   }
   // edit/color/*（command/edit.cpp show_color_picker）：初始色 = 样式色被光标处
-  // 同名标签覆盖；写入走 set_tag（替换光标块内同名标签）。浏览器原生取色器无
-  // alpha，源码的 \1a 回写路径不触发
+  // 同名标签覆盖（alpha 先读 \1a/\2a/...，再回落 \alpha）；写入走 set_tag
   const openColorPicker = (key: ColorTagKey) => {
     colorTagRef.current = key
-    const { tag, alt, field } = COLOR_TAGS[key]
+    const { tag, alt, alpha, field } = COLOR_TAGS[key]
     const style = styles.find((s) => s.name === draft.style)
-    // 样式色（&HAABBGGRR）→ #RRGGBB；无样式时主色白、其余黑（AssStyle 默认值）
-    const initial = style ? assColorToHex(style[field]) : key === 'c' ? '#ffffff' : '#000000'
-    let shown = initial
+    // 样式色（&HAABBGGRR）；无样式时主色白、其余黑（AssStyle 默认值）
+    const initial: PickerColor = style
+      ? (parseAssPickerColor(style[field]) ?? { r: 255, g: 255, b: 255, a: 0 })
+      : key === 'c'
+        ? { r: 255, g: 255, b: 255, a: 0 }
+        : { r: 0, g: 0, b: 0, a: 0 }
+    const blocks = parseBlocks(draft.text)
     const editor = editorRef.current
-    if (editor) {
-      const selStart = editor.selectionStart
-      const normStart = normalizePos(draft.text, selStart)
-      const found = findTag(parseBlocks(draft.text), blockAtPos(draft.text, normStart), tag, alt)
-      shown = (found && tagColorHex(found.params)) || initial
-      colorPosRef.current = { selStart, normStart }
-    }
-    if (colorPickerRef.current) {
-      colorPickerRef.current.value = shown
-      colorPickerRef.current.click()
-    }
+    const selStart = editor ? editor.selectionStart : draft.text.length
+    const normStart = normalizePos(draft.text, selStart)
+    const blockn = blockAtPos(draft.text, normStart)
+    const found = findTag(blocks, blockn, tag, alt)
+    const foundHex = found && tagColorHex(found.params)
+    if (foundHex) Object.assign(initial, parseCssPickerColor(foundHex) ?? {})
+    const alphaTag = findTag(blocks, blockn, alpha, '\\alpha')
+    if (alphaTag) initial.a = tagAlphaByte(alphaTag.params, initial.a)
+    colorPosRef.current = { selStart, normStart }
+    colorInitialRef.current = { ...initial }
+    colorSnapshotRef.current = draft.text
+    setColorPicker({ initial: pickerColorToAss(initial), key })
   }
-  const applyColor = (hex: string) => {
-    const { tag } = COLOR_TAGS[colorTagRef.current]
+  /** 选择器实时回调：色标签恒写 RGB，alpha 与初始值不同时补写对应 \Na 标签 */
+  const applyColor = (value: string) => {
+    const next = parseAssPickerColor(value)
+    if (!next) return
+    const { tag, alpha } = COLOR_TAGS[colorTagRef.current]
     const { selStart, normStart } = colorPosRef.current
-    const result = setTag(draft.text, tag, assOverrideColor(hex), normStart, selStart)
-    commitText(result.text, 'set color')
+    let result = setTag(draft.text, tag, pickerColorToAss(next, false), normStart, selStart)
+    let text = result.text
+    let shift = result.shift
+    if (next.a !== colorInitialRef.current.a) {
+      const alphaHex = Math.round(next.a).toString(16).padStart(2, '0').toUpperCase()
+      const alphaResult = setTag(text, alpha, `&H${alphaHex}&`, normStart, selStart + shift)
+      text = alphaResult.text
+      shift += alphaResult.shift
+    }
+    commitText(text, 'set color')
     // 源码：选区收拢到写入点之后
     requestAnimationFrame(() =>
-      editorRef.current?.setSelectionRange(selStart + result.shift, selStart + result.shift),
+      editorRef.current?.setSelectionRange(selStart + shift, selStart + shift),
     )
   }
   // edit/font（command/edit.cpp）：与光标处有效字体逐项比较，仅写有差异的标签
@@ -1658,6 +1817,35 @@ export function EditPanel({
   const trackCursor = (element: HTMLTextAreaElement) => {
     reportTextSelection(element, onTextSelection)
     applyCaretColor(element)
+    updateCalltip(element)
+  }
+  // subs_edit_ctrl.cpp UpdateCalltip：App/Call Tips 开启时光标在 override 标签内显示提示。
+  // tag_position 是标签名在行内的偏移，用高亮层的字符矩形定位浮层
+  function updateCalltip(element: HTMLTextAreaElement) {
+    if (!getOptionBool('App/Call Tips')) {
+      setCalltip(null)
+      return
+    }
+    const tip = calltipAt(element.value, element.selectionStart)
+    const pre = highlightRef.current
+    const wrap = pre?.parentElement
+    if (!tip || !pre || !wrap) {
+      setCalltip(null)
+      return
+    }
+    const rect = rectAtTextOffset(pre, tip.tagPosition)
+    if (!rect) {
+      setCalltip(null)
+      return
+    }
+    const wrapRect = wrap.getBoundingClientRect()
+    const left = rect.left - wrapRect.left
+    setCalltip({
+      tip,
+      left,
+      top: rect.bottom - wrapRect.top + 2,
+      right: left > wrap.clientWidth - 280,
+    })
   }
   // 源码 SubsTextEditCtrl（Scintilla）在文字下方空白处按下时把插入点钳到文档末尾；
   // 浏览器 textarea 会把点击横坐标映射到最后一行 → 光标落进最后一行中间。这里拦下
@@ -1703,6 +1891,21 @@ export function EditPanel({
       // 剪贴板读取被拒绝时静默忽略
     }
   }
+  /** 用拼写建议/同义词替换右键选中的词（subs_edit_ctrl.cpp ReplaceSelection） */
+  const replaceContextWord = (replacement: string) => {
+    const word = contextWord
+    setTextMenu(null)
+    if (!word) return
+    const current = editorRef.current?.value ?? draft.text
+    const text = current.slice(0, word.start) + replacement + current.slice(word.end)
+    commitText(text, 'spell check')
+    const caret = word.start + replacement.length
+    requestAnimationFrame(() => {
+      editorRef.current?.focus()
+      editorRef.current?.setSelectionRange(caret, caret)
+    })
+  }
+
   const runTextMenuCommand = (action: string) => {
     setTextMenu(null)
     const editor = editorRef.current
@@ -1767,7 +1970,6 @@ export function EditPanel({
           frameTiming={frameTiming}
           frameRateLoaded={frameRateLoaded}
           showOriginal={showOriginal}
-          colorPickerRef={colorPickerRef}
           handlers={handlersRef}
         />
       </div>
@@ -1823,6 +2025,7 @@ export function EditPanel({
             if (editingField === 'text') setEditingField(null)
             // 失焦后浏览器不再画选区，底纹段的选中色要还原
             setBackedSelection(backedSelectionFor(event.currentTarget, highlightBase))
+            setCalltip(null)
           }}
           onSelect={(event) => trackCursor(event.currentTarget)}
           onChange={(event) => {
@@ -1837,6 +2040,9 @@ export function EditPanel({
           onContextMenu={(event) => {
             event.preventDefault()
             trackCursor(event.currentTarget)
+            const offset = textOffsetAtPoint(event.currentTarget, event.clientX, event.clientY)
+            setContextWord(wordAtPosition(event.currentTarget.value, offset))
+            setCalltip(null)
             setTextMenu({ x: event.clientX, y: event.clientY })
           }}
           onPaste={(event) => {
@@ -1904,6 +2110,23 @@ export function EditPanel({
             }
           }}
         />
+        {calltip && (
+          <div
+            className="calltip"
+            role="tooltip"
+            style={
+              calltip.right
+                ? { right: 4, top: calltip.top }
+                : { left: calltip.left, top: calltip.top }
+            }
+          >
+            {calltip.tip.text.slice(0, calltip.tip.highlightStart)}
+            <span className="calltip-arg">
+              {calltip.tip.text.slice(calltip.tip.highlightStart, calltip.tip.highlightEnd)}
+            </span>
+            {calltip.tip.text.slice(calltip.tip.highlightEnd)}
+          </div>
+        )}
       </div>
       {showOriginal && (
         <div className="edit-bottom-actions">
@@ -1928,6 +2151,22 @@ export function EditPanel({
             {tPlain('Insert Original')}
           </button>
         </div>
+      )}
+
+      {colorPicker && (
+        <ColorPickerDialog
+          initial={colorPicker.initial}
+          format="ass"
+          alpha
+          title={tPlain('Select Color')}
+          onChange={applyColor}
+          onCancel={() => {
+            // 源码取消时撤销整个取色会话；这里恢复打开前的原文（含标签位置）
+            if (colorSnapshotRef.current !== draft.text)
+              commitText(colorSnapshotRef.current, 'set color')
+          }}
+          onClose={() => setColorPicker(null)}
+        />
       )}
 
       {fontDraft && (
@@ -2053,6 +2292,180 @@ export function EditPanel({
 
       {textMenu && (
         <MenuPopup x={textMenu.x} y={textMenu.y} label={tPlain('Text editor menu')}>
+          {contextWord && (
+            <>
+              {canRemoveWord(contextWord.word) && (
+                <button
+                  className="menu-item"
+                  role="menuitem"
+                  onClick={() => {
+                    void removeWordFromDictionary(contextWord.word)
+                    setTextMenu(null)
+                  }}
+                >
+                  <span className="menu-label">
+                    {tFmt('Remove "%s" from dictionary', contextWord.word)}
+                  </span>
+                </button>
+              )}
+              {contextMisspelled ? (
+                <>
+                  {contextSuggestions.length === 0 && (
+                    <button className="menu-item" role="menuitem" disabled>
+                      <span className="menu-label">{tPlain('No correction suggestions')}</span>
+                    </button>
+                  )}
+                  {contextSuggestions.map((suggestion) => (
+                    <button
+                      key={suggestion}
+                      className="menu-item"
+                      role="menuitem"
+                      onClick={() => replaceContextWord(suggestion)}
+                    >
+                      <span className="menu-label">{suggestion}</span>
+                    </button>
+                  ))}
+                  <button
+                    className="menu-item"
+                    role="menuitem"
+                    disabled={!canAddWord(contextWord.word)}
+                    onClick={() => {
+                      void addWordToDictionary(contextWord.word)
+                      setTextMenu(null)
+                    }}
+                  >
+                    <span className="menu-label">
+                      {tFmt('Add "%s" to dictionary', contextWord.word)}
+                    </span>
+                  </button>
+                </>
+              ) : contextSuggestions.length === 0 ? (
+                <button className="menu-item" role="menuitem" disabled>
+                  <span className="menu-label">{tPlain('No spell checker suggestions')}</span>
+                </button>
+              ) : (
+                <MenuSub label={tFmt('Spell checker suggestions for "%s"', contextWord.word)}>
+                  {contextSuggestions.map((suggestion) => (
+                    <button
+                      key={suggestion}
+                      className="menu-item"
+                      role="menuitem"
+                      onClick={() => replaceContextWord(suggestion)}
+                    >
+                      <span className="menu-label">{suggestion}</span>
+                    </button>
+                  ))}
+                </MenuSub>
+              )}
+            </>
+          )}
+          <MenuSub label={tPlain('Spell checker language')}>
+            <button
+              className="menu-item"
+              role="menuitemradio"
+              aria-checked={getSpellCheckerLanguage() === ''}
+              onClick={() => {
+                void setSpellCheckerLanguage('')
+                setTextMenu(null)
+              }}
+            >
+              <span className="menu-label">
+                {getSpellCheckerLanguage() === '' ? '✓ ' : ''}
+                {tPlain('Disable')}
+              </span>
+            </button>
+            {getSpellCheckerLanguages().map((language) => (
+              <button
+                key={language}
+                className="menu-item"
+                role="menuitemradio"
+                aria-checked={getSpellCheckerLanguage() === language}
+                onClick={() => {
+                  void setSpellCheckerLanguage(language)
+                  setTextMenu(null)
+                }}
+              >
+                <span className="menu-label">
+                  {getSpellCheckerLanguage() === language ? '✓ ' : ''}
+                  {language}
+                </span>
+              </button>
+            ))}
+          </MenuSub>
+          <div className="menu-separator" role="separator" />
+
+          {contextWord && (
+            <>
+              {contextThesaurus.length === 0 ? (
+                <button className="menu-item" role="menuitem" disabled>
+                  <span className="menu-label">{tPlain('No thesaurus suggestions')}</span>
+                </button>
+              ) : (
+                <MenuSub label={tFmt('Thesaurus suggestions for "%s"', contextWord.word)}>
+                  {contextThesaurus.map((entry, entryIndex) =>
+                    entry.second.length === 0 ? (
+                      <button
+                        key={entryIndex}
+                        className="menu-item"
+                        role="menuitem"
+                        onClick={() => replaceContextWord(entry.first)}
+                      >
+                        <span className="menu-label">{entry.first}</span>
+                      </button>
+                    ) : (
+                      <MenuSub key={entryIndex} label={entry.first}>
+                        {entry.second.map((synonym) => (
+                          <button
+                            key={synonym}
+                            className="menu-item"
+                            role="menuitem"
+                            onClick={() => replaceContextWord(synonym)}
+                          >
+                            <span className="menu-label">{synonym}</span>
+                          </button>
+                        ))}
+                      </MenuSub>
+                    ),
+                  )}
+                </MenuSub>
+              )}
+              <MenuSub label={tPlain('Thesaurus language')}>
+                <button
+                  className="menu-item"
+                  role="menuitemradio"
+                  aria-checked={getThesaurusLanguage() === ''}
+                  onClick={() => {
+                    void setThesaurusLanguage('')
+                    setTextMenu(null)
+                  }}
+                >
+                  <span className="menu-label">
+                    {getThesaurusLanguage() === '' ? '✓ ' : ''}
+                    {tPlain('Disable')}
+                  </span>
+                </button>
+                {getThesaurusLanguages().map((language) => (
+                  <button
+                    key={language}
+                    className="menu-item"
+                    role="menuitemradio"
+                    aria-checked={getThesaurusLanguage() === language}
+                    onClick={() => {
+                      void setThesaurusLanguage(language)
+                      setTextMenu(null)
+                    }}
+                  >
+                    <span className="menu-label">
+                      {getThesaurusLanguage() === language ? '✓ ' : ''}
+                      {language}
+                    </span>
+                  </button>
+                ))}
+              </MenuSub>
+              <div className="menu-separator" role="separator" />
+            </>
+          )}
+
           <button className="menu-item" role="menuitem" onClick={() => runTextMenuCommand('cut')}>
             <span className="menu-label">{tPlain('Cut')}</span>
           </button>

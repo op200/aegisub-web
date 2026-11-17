@@ -15,6 +15,7 @@ import {
   installLuaModuleSearch,
   installLuaModules,
   installMoonscriptModules,
+  type LuaModuleOptions,
 } from './luaModules'
 
 /** 假 VFS：refreshIncludeCache 走 dirExists + listTree，条目自带 text 不再读盘 */
@@ -97,6 +98,7 @@ async function createDirectState(
   files: Record<string, string>,
   dirs: string[],
   moonscript = false,
+  options: LuaModuleOptions = {},
 ): Promise<DirectState> {
   fengariModule ??= await import('fengari')
   const fengari = fengariModule as Fengari
@@ -110,7 +112,7 @@ async function createDirectState(
     cache.set(path, { mtime: clock, code })
   }
   const runtime = { lua, lauxlib, to_luastring, to_jsstring }
-  installLuaModules(L, runtime)
+  installLuaModules(L, runtime, options)
   if (moonscript) await installMoonscriptModules(L, runtime)
   installLuaModuleSearch(
     L,
@@ -239,24 +241,72 @@ describe('内置 aegisub.* 模块（Lua 5.3 移植）', () => {
     closeDirectState(state)
   })
 
-  it('lfs / lpeg / luabins / jit：可 require，调用时才报错', async () => {
-    const state = await createDirectState({}, [])
+  it('lfs：基于 VFS 快照的同步文件系统', async () => {
+    const changes: string[] = []
+    const entries = new Map([
+      ['/automation', { directory: true, size: 0, mtime: 1_700_000_000_000 }],
+      ['/automation/local', { directory: true, size: 0, mtime: 1_700_000_000_000 }],
+      ['/automation/local/a.lua', { directory: false, size: 42, mtime: 1_700_000_000_000 }],
+    ])
+    const state = await createDirectState({}, [], false, {
+      lfs: entries,
+      onLfsChange: (op, path) => changes.push(`${op}:${path}`),
+    })
     const result = runLua(
       state,
       `
       local lfs = require 'lfs'
-      assert(type(lfs.attributes) == 'function')
-      assert(lfs.__placeholder == true)
       assert(_G.lfs == lfs)
-      local ok, err = pcall(lfs.attributes, '/')
-      assert(not ok and err:find('lfs.attributes'), tostring(err))
+      assert(lfs.__placeholder == nil)
+      assert(lfs.currentdir() == '/')
 
+      assert(lfs.attributes('/automation/local/a.lua', 'mode') == 'file')
+      assert(lfs.attributes('/automation/local/a.lua', 'size') == 42)
+      assert(lfs.attributes('/automation/local/a.lua', 'modification') == 1700000000)
+      local attr = lfs.attributes('/automation/local/a.lua')
+      assert(attr.mode == 'file' and attr.size == 42)
+      assert(lfs.attributes('/automation/local', 'mode') == 'directory')
+      assert(lfs.attributes('/nope') == nil)
+
+      assert(lfs.chdir('/automation/local'))
+      assert(lfs.currentdir() == '/automation/local')
+      assert(lfs.attributes('a.lua', 'size') == 42)
+      assert(lfs.chdir('/nope') == nil)
+      assert(lfs.currentdir() == '/automation/local')
+
+      local names = {}
+      for name in lfs.dir('/automation/local') do names[#names + 1] = name end
+      assert(#names == 1 and names[1] == 'a.lua')
+      local ok, err = pcall(lfs.dir, '/nope')
+      assert(not ok and err:find('cannot open', 1, true))
+
+      assert(lfs.mkdir('/tmp/x'))
+      assert(lfs.attributes('/tmp/x', 'mode') == 'directory')
+      assert(lfs.touch('/tmp/x/y'))
+      assert(lfs.attributes('/tmp/x/y', 'mode') == 'file')
+      assert(lfs.rmdir('/tmp/x/y'))
+      assert(lfs.attributes('/tmp/x/y') == nil)
+      assert(lfs.rmdir('/tmp/x'))
+
+      assert(require('aegisub.lfs') == lfs)
+      `,
+    )
+    expect(result, result.error).toEqual({ ok: true, error: '' })
+    expect(changes).toEqual(['mkdir:/tmp/x', 'touch:/tmp/x/y', 'rmdir:/tmp/x/y', 'rmdir:/tmp/x'])
+    closeDirectState(state)
+  })
+
+  it('lpeg / luabins / jit：无 C 模块的后端退回惰性占位', async () => {
+    const state = await createDirectState({}, [])
+    const result = runLua(
+      state,
+      `
       local lpeg = require 'lpeg'
       assert(lpeg.__placeholder == true)
       assert(not pcall(lpeg.P, 'a'))
-      assert(not pcall(require('aegisub.lfs').attributes, '/'))
 
       local luabins = require 'luabins'
+      assert(luabins.__placeholder == true)
       assert(not pcall(luabins.save, 1))
       assert(not pcall(luabins.load, 'x'))
 

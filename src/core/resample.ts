@@ -432,7 +432,7 @@ export function createYcbcrConverter(src: YcbcrColorspace, dst: YcbcrColorspace)
 
 type VariableDataType = 'INT' | 'FLOAT' | 'TEXT' | 'BOOL' | 'BLOCK'
 
-type ParameterClass =
+export type ParameterClass =
   | 'NORMAL'
   | 'ABSOLUTE_SIZE_X'
   | 'ABSOLUTE_SIZE_Y'
@@ -574,7 +574,7 @@ const TAG_PROTOS: TagProto[] = [
 ]
 
 /** 单个标签参数（AssOverrideParameter） */
-class OverrideParam {
+export class OverrideParam {
   omitted = true
   value = ''
   readonly type: VariableDataType
@@ -741,9 +741,9 @@ type DialogueBlock =
   | { kind: 'plain'; text: string }
   | { kind: 'comment'; text: string }
   | { kind: 'drawing'; text: string; scale: number }
-  | { kind: 'override'; tags: OverrideTag[] }
+  | { kind: 'override'; tags: OverrideTag[]; unclosed?: boolean }
 
-/** AssDialogue::ParseTags：{} 无 \ 视为注释块；未闭合 { 按纯文本处理；\p 控制绘制块 */
+/** AssDialogue::ParseTags：{} 无 \ 视为注释块；未闭合 { 按 libass 语义延续到行尾；\p 控制绘制块 */
 function parseDialogueBlocks(text: string): DialogueBlock[] {
   const blocks: DialogueBlock[] = []
   if (!text) return [{ kind: 'plain', text: '' }]
@@ -754,22 +754,22 @@ function parseDialogueBlocks(text: string): DialogueBlock[] {
   while (cur < len) {
     if (text[cur] === '{') {
       const end = text.indexOf('}', cur)
-      // VSFilter 语义：未闭合的 { 当作普通文本（源码 goto plain）
-      if (end !== -1) {
-        cur += 1
-        const work = text.slice(cur, end)
-        cur = end + 1
-        if (work.length && !work.includes('\\')) {
-          blocks.push({ kind: 'comment', text: `{${work}}` })
-        } else {
-          const tags = parseOverrideTags(work)
-          for (const tag of tags) {
-            if (tag.name === '\\p') drawingLevel = tag.params[0].getIntDefault(0)
-          }
-          blocks.push({ kind: 'override', tags })
+      const closed = end !== -1
+      const workEnd = closed ? end : len
+      cur += 1
+      const work = text.slice(cur, workEnd)
+      cur = closed ? workEnd + 1 : len
+      if (work.length && !work.includes('\\')) {
+        // 无反斜杠的 {} 视为注释块；未闭合时保留原样（不补 }）
+        blocks.push({ kind: 'comment', text: closed ? `{${work}}` : `{${work}` })
+      } else {
+        const tags = parseOverrideTags(work)
+        for (const tag of tags) {
+          if (tag.name === '\\p') drawingLevel = tag.params[0].getIntDefault(0)
         }
-        continue
+        blocks.push({ kind: 'override', tags, ...(closed ? {} : { unclosed: true }) })
       }
+      continue
     }
 
     // 纯文本 / 绘制块
@@ -788,8 +788,29 @@ function parseDialogueBlocks(text: string): DialogueBlock[] {
 /** AssDialogueBlockOverride GetText / Plain / Comment / Drawing 的拼接（UpdateText） */
 function blocksToText(blocks: DialogueBlock[]): string {
   return blocks
-    .map((block) => (block.kind === 'override' ? blockText(block.tags) : block.text))
+    .map((block) => {
+      if (block.kind !== 'override') return block.text
+      const serialized = blockText(block.tags)
+      // 原文未闭合：序列化时保持无右花括号（libass 兼容）
+      return block.unclosed ? serialized.slice(0, -1) : serialized
+    })
     .join('')
+}
+
+/**
+ * 通用 override 参数遍历（ParseTags → ProcessParameters → UpdateText）：
+ * 先回调每个非省略参数，再递归 BLOCK（\t），返回重写后的整行文本。
+ * 导出过滤器等需要按参数分类改写的调用方复用同一套解析/序列化。
+ */
+export function processCueOverrideParameters(
+  text: string,
+  callback: (par: OverrideParam) => void,
+): string {
+  const blocks = parseDialogueBlocks(text)
+  for (const block of blocks) {
+    if (block.kind === 'override') processOverrideParameters(block.tags, callback)
+  }
+  return blocksToText(blocks)
 }
 
 // ---------------------------------------------------------------------------
@@ -878,18 +899,25 @@ function resampleParameter(par: OverrideParam, state: ResampleState): void {
 }
 
 /** AssDialogueBlockOverride::ProcessParameters：先回调，再对 BLOCK 参数递归 */
-function processParameters(tags: OverrideTag[], state: ResampleState): void {
+function processOverrideParameters(
+  tags: OverrideTag[],
+  callback: (par: OverrideParam) => void,
+): void {
   for (const tag of tags) {
     for (const par of tag.params) {
       if (par.omitted) continue
-      resampleParameter(par, state)
+      callback(par)
       if (par.type === 'BLOCK') {
         // Get<AssDialogueBlockOverride*>：块仅在此惰性构造，构造源为当前 value
         if (!par.blockTags) par.blockTags = parseOverrideTags(par.value)
-        processParameters(par.blockTags, state)
+        processOverrideParameters(par.blockTags, callback)
       }
     }
   }
+}
+
+function processParameters(tags: OverrideTag[], state: ResampleState): void {
+  processOverrideParameters(tags, (par) => resampleParameter(par, state))
 }
 
 /** resample_line：返回需要更新的字段（无变化返回 null，等价于提交后无差异） */

@@ -1,11 +1,14 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 
 import {
   getOptionBool,
   getOptionInt,
+  getOptionListBool,
   getOptionString,
+  setOption,
   useOptionsVersion,
 } from '../../config/options'
+import { IGNORE_BLOCKS, characterCount } from '../../core/characterCount'
 import { formatEditorTime } from '../../core/time'
 import type { SubtitleCue } from '../../core/types'
 import type { Framerate } from '../../core/vfr'
@@ -287,16 +290,21 @@ function computeGridWidths(
   return { widths, fixedWidth }
 }
 
-/** 近似 CPS：去掉 override 块后按字符数估算 */
+/** grid_column.cpp GridColumnCPS::CPS：grapheme cluster 计数（可忽略空白/标点/override 块） */
 function cpsOf(cue: SubtitleCue): number | null {
   const duration = cue.endMs - cue.startMs
-  if (duration <= 100) return null
-  const text = cue.text.replace(/\{[^}]*\}/g, '').replace(/\\(N|n|h)/g, '')
-  if (!text) return null
-  if (text.length > duration) return null
-  const cps = Math.round((text.length * 1000) / duration)
+  if (duration <= 100 || cue.text.length > duration) return null
+  let ignore = IGNORE_BLOCKS
+  if (getOptionBool('Subtitle/Character Counter/Ignore Whitespace')) ignore |= 1
+  if (getOptionBool('Subtitle/Character Counter/Ignore Punctuation')) ignore |= 2
+  const cps = Math.floor((characterCount(cue.text, ignore) * 1000) / duration)
   // grid_column.cpp Paint：cps < 0 或 cps > 100 时不绘制（过高的字/秒省略显示）
   return cps > 100 ? null : cps
+}
+
+/** AssDialogue::CollidesWith：时间区间重叠（端点相接不算） */
+function collidesWith(a: SubtitleCue, b: SubtitleCue): boolean {
+  return a.startMs < b.startMs ? b.startMs < a.endMs : a.startMs < b.endMs
 }
 
 function cellValue(
@@ -364,6 +372,8 @@ interface GridRowProps {
   active: boolean
   selected: boolean
   activeAtTime: boolean
+  /** base_grid.cpp：与活动行时间重叠（CollidesWith） */
+  collision: boolean
   textMode: GridTagsMode
   frameMode: boolean
   frameRate: Framerate
@@ -388,6 +398,7 @@ const GridRow = memo(
     active,
     selected,
     activeAtTime,
+    collision,
     textMode,
     frameMode,
     frameRate,
@@ -405,7 +416,7 @@ const GridRow = memo(
     const cps = cpsOf(cue)
     return (
       <div
-        className={`subtitle-row grid-columns${selected ? ' selected' : ''}${active ? ' active' : ''}${activeAtTime ? ' at-time' : ''}${cue.comment ? ' comment' : ''}`}
+        className={`subtitle-row grid-columns${selected ? ' selected' : ''}${active ? ' active' : ''}${activeAtTime ? ' at-time' : ''}${cue.comment ? ' comment' : ''}${collision ? ' collision' : ''}`}
         style={{ transform: `translateY(${index * rowHeight}px)` }}
         role="row"
         aria-rowindex={index + 1}
@@ -424,13 +435,26 @@ const GridRow = memo(
           const colIndex = colOffset + 1
           const cls = `${column.fill ? 'grid-fill' : ''}${isHidden(column, colIndex) ? ' grid-hidden' : ''}`
           if (column.key === 'cps') {
-            // 超过 CPS Error Threshold 时用 Colour/Subtitle Grid/CPS Error 着色
-            const cpsError = getOptionInt('Subtitle/Character Counter/CPS Error Threshold')
-            const over = cps !== null && cps > cpsError
+            // grid_column.cpp GridColumnCPS::Paint：cps > Warning 时在行背景上叠加
+            // CPS Error 色渐变，并把文字从黑色渐变回当前行前景色
+            const cpsWarning = getOptionInt('Subtitle/Character Counter/CPS Warning Threshold')
+            const cpsError = Math.max(
+              cpsWarning,
+              getOptionInt('Subtitle/Character Counter/CPS Error Threshold'),
+            )
+            let cpsStyle: CSSProperties = cellStyle(column, colIndex)
+            if (cps !== null && cps > cpsWarning) {
+              const alpha = Math.min((cps - cpsWarning + 1) / (cpsError - cpsWarning + 1), 1)
+              cpsStyle = {
+                ...cpsStyle,
+                background: `color-mix(in srgb, var(--grid-cps-error, #f00) ${alpha * 100}%, transparent)`,
+                color: `color-mix(in srgb, #000 ${(1 - alpha) * 100}%, currentColor)`,
+              }
+            }
             return (
               <span
-                className={`grid-cell-centered grid-cps ${cls}${over ? ' cps-error' : ''}`}
-                style={cellStyle(column, colIndex)}
+                className={`grid-cell-centered grid-cps ${cls}`}
+                style={cpsStyle}
                 key={column.key}
               >
                 {cps ?? ''}
@@ -468,6 +492,7 @@ const GridRow = memo(
     prev.active === next.active &&
     prev.selected === next.selected &&
     prev.activeAtTime === next.activeAtTime &&
+    prev.collision === next.collision &&
     prev.textMode === next.textMode &&
     prev.frameMode === next.frameMode &&
     prev.frameRate === next.frameRate &&
@@ -521,7 +546,6 @@ export function SubtitleGrid({
   const [context, setContext] = useState<{ x: number; y: number } | null>(null)
   // 表头右键菜单（base_grid.cpp OnContextMenu：表头 → 列显隐菜单）
   const [headerMenu, setHeaderMenu] = useState<{ x: number; y: number } | null>(null)
-  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set())
   // 拖动块选（base_grid.cpp holding 状态：锚点行 + 上次停留行）
   const dragRef = useRef<{ anchorIndex: number; anchorId: string } | null>(null)
   const dragLastRowRef = useRef(-1)
@@ -758,18 +782,33 @@ export function SubtitleGrid({
   }
 
   const toggleColumn = (key: string) => {
-    setHiddenColumns((current) => {
-      const next = new Set(current)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
-    })
+    const index = GRID_COLUMNS.findIndex((column) => column.key === key)
+    if (index < 0) return
+    // Subtitle/Grid/Column：list-bool 持久化列显隐（base_grid.cpp ToggleColumn）
+    const visible = GRID_COLUMNS.map((column) => !hiddenColumns.has(column.key))
+    visible[index] = !visible[index]
+    setOption('Subtitle/Grid/Column', visible)
   }
 
   // 语言切换时重算列宽：翻译后列名宽度不同（App 根部已订阅，此处取版本号进 memo 依赖）
   const localeVersion = useLocaleVersion()
   // Preferences 提交后重渲染（CPS 阈值等行内选项）；行 memo 后经 props 下传触发
   const optionsVersion = useOptionsVersion()
+  // 列显隐来自 Subtitle/Grid/Column（list-bool，未列出的列默认可见）
+  const hiddenColumns = useMemo(() => {
+    const visible = getOptionListBool('Subtitle/Grid/Column')
+    const hidden = new Set<string>()
+    GRID_COLUMNS.forEach((column, index) => {
+      if (visible[index] === false) hidden.add(column.key)
+    })
+    return hidden
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- optionsVersion 仅为触发重读配置
+  }, [optionsVersion])
+  // 活动行时间范围（用于 CollidesWith 碰撞高亮）
+  const activeCue = useMemo(
+    () => (activeId ? (cues.find((cue) => cue.id === activeId) ?? null) : null),
+    [cues, activeId],
+  )
   // 行 memo 用的稳定回调：实现放 ref，调用时取最新 props（App 传的回调多为内联箭头）
   const rowHandlersRef = useRef({ onSelect })
   useEffect(() => {
@@ -1085,6 +1124,11 @@ export function SubtitleGrid({
                       active={cue.id === activeId}
                       selected={selectedIds.has(cue.id)}
                       activeAtTime={activeAtTime}
+                      collision={
+                        activeCue !== null &&
+                        activeCue.id !== cue.id &&
+                        collidesWith(cue, activeCue)
+                      }
                       textMode={textMode}
                       frameMode={frameMode}
                       frameRate={frameRate}

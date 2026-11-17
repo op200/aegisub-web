@@ -3,13 +3,16 @@
  * 与 VFS 版模块搜索器。
  *
  * 桌面版由 script_reader.cpp 的 Install()/module_loader 从真实文件系统加载模块，
- * 并用 MoonScript 运行时编译 aegisub/*.moon。web 没有 lpeg，因此：
+ * 并用 MoonScript 运行时编译 aegisub/*.moon。桌面版模块依赖 lfs / lpeg 等 C 库，
+ * 浏览器的 fengari 后端无法加载 C 模块，因此：
  * - installLuaModuleSearch 把 include 目录写进 package.path 并替换 searcher #2，
  *   从 include 缓存同步加载 .lua 模块（同路径的 .moon 优先，对齐 module_loader），
  *   并清空 cpath/jspath 阻断 fengari 的 XHR 回退；
  * - installLuaModules 把 aegisub.internal.argcheck / aegisub.internal.ffi / aegisub.util /
  *   aegisub.unicode / aegisub.re / bit / ffi 注册到 package.preload（ffi 为可 require 的报错占位）；
- *   未实现的 lfs / lpeg / luabins / jit 也注册惰性占位：require 成功，调用函数时才报错；
+ *   lfs 用宿主传入的 VFS 快照实现同步读写（见 LuaModuleOptions.lfs）；lpeg / luabins
+ *   在支持 C 模块的后端（lua55-wasm）由 VM 直接 preload，其余后端退回惰性占位；
+ *   jit 恒为惰性占位（浏览器没有 LuaJIT）；
  * - installMoonscriptModules / compileMoonscriptChunk 是 vendored MoonScript 0.8
  *   （纯 Lua 解析器，不需要 lpeg），把 .moon 编译成 Lua 在同一 VM 内执行。
  */
@@ -21,6 +24,32 @@ export interface LuaRuntime {
   lauxlib: any
   to_luastring: (value: string) => Uint8Array
   to_jsstring: (value: Uint8Array) => string
+}
+
+/** lfs 快照条目（目录路径不带末尾 '/'；mtime 为毫秒） */
+export interface LuaLfsEntry {
+  directory: boolean
+  size: number
+  mtime: number
+}
+
+export interface LuaModuleOptions {
+  /**
+   * lfs 的 VFS 快照（key = 绝对路径）。
+   *
+   * 桌面 lfs 是同步文件系统调用，而 web VFS（IndexedDB）是异步的：宿主在脚本
+   * 加载前拍一张快照，lfs 的读操作全部在这个快照上进行；mkdir / rmdir / touch
+   * 先改快照，再通过 onLfsChange 异步写回 VFS（同步 API 无法等待事务）。
+   * 缺省（无 VFS 的 Node 单测）时为空快照，变更只在本次运行内可见。
+   */
+  lfs?: ReadonlyMap<string, LuaLfsEntry>
+  /** lfs 变更的落盘回调（调用时快照已更新）；失败由宿主记录 */
+  onLfsChange?: (op: 'mkdir' | 'rmdir' | 'touch', path: string) => void
+  /**
+   * 把 VM 内建的 C 模块注册进 package.preload（目前是 lpeg / luabins）。
+   * 返回 false 表示该后端没有此模块（如 fengari），此时注册惰性占位。
+   */
+  preloadNativeModule?: (L: any, name: 'lpeg' | 'luabins') => boolean
 }
 
 /** UTF-8 BOM（script_reader.cpp LoadFile 的 `-17 -69 -65`） */
@@ -66,7 +95,11 @@ function registerLuaFunction(
 }
 
 /** 注册 Aegisub 标准模块（桌面版由 MoonScript 编译的那批） */
-export function installLuaModules(L: any, runtime: LuaRuntime): void {
+export function installLuaModules(
+  L: any,
+  runtime: LuaRuntime,
+  options: LuaModuleOptions = {},
+): void {
   registerLuaSource(L, runtime, 'aegisub.internal.argcheck', ARGCHECK_SOURCE)
   registerLuaSource(L, runtime, 'aegisub.internal.ffi', INTERNAL_FFI_SOURCE)
   registerLuaSource(L, runtime, 'aegisub.util', UTIL_SOURCE)
@@ -74,14 +107,72 @@ export function installLuaModules(L: any, runtime: LuaRuntime): void {
   registerLuaSource(L, runtime, 'aegisub.re', RE_SOURCE)
   registerLuaSource(L, runtime, 'bit', BIT_SOURCE)
   registerLuaSource(L, runtime, 'ffi', FFI_SOURCE)
-  // 未实现的库：require / 全局表可用，函数被调用时才报错（惰性降级）
-  registerLuaSource(L, runtime, 'lfs', placeholderModuleSource('lfs', LFS_API))
-  registerLuaSource(L, runtime, 'aegisub.lfs', "return require('lfs')")
-  registerLuaSource(L, runtime, 'lpeg', placeholderModuleSource('lpeg', LPEG_API))
-  registerLuaSource(L, runtime, 'luabins', placeholderModuleSource('luabins', LUABINS_API))
+  installLfsModule(L, runtime, options)
+  // C 模块：lua55-wasm 直接 preload；fengari 无法加载 C 模块，退回惰性占位
+  if (!options.preloadNativeModule?.(L, 'lpeg')) {
+    registerLuaSource(L, runtime, 'lpeg', placeholderModuleSource('lpeg', LPEG_API))
+  }
+  if (!options.preloadNativeModule?.(L, 'luabins')) {
+    registerLuaSource(L, runtime, 'luabins', placeholderModuleSource('luabins', LUABINS_API))
+  } else {
+    // 桌面 modules.cpp 在 require 时提示 luabins 已废弃；C 侧不便回调 aegisub 表，
+    // 用 Lua 包装层在加载 C 实现前发出同一条警告。
+    registerLuaSource(L, runtime, 'luabins', LUABINS_DEPRECATION_SOURCE)
+  }
   registerLuaSource(L, runtime, 'jit', JIT_SOURCE)
   registerLuaFunction(L, runtime, 'aegisub.__unicode_impl', (L2) => makeUnicodeImpl(L2, runtime))
   registerLuaFunction(L, runtime, 'aegisub.__re_impl', (L2) => makeReImpl(L2, runtime))
+}
+
+/**
+ * lfs 模块。
+ *
+ * 桌面版是 libaegisub/lua/modules/lfs.cpp + automation/include/aegisub/lfs.moon：
+ * C++ 直接调用 std::filesystem，lfs.moon 用 ffi 把错误码/字符串转成 lfs 的
+ * true-or-nil 约定。web 既没有真实文件系统也没有 ffi，而且 VFS 是异步的，
+ * 因此改为「宿主动作前拍快照 + Lua 侧同步读写 + 变更异步落盘」：
+ * - entries 为宿主在脚本加载前生成的 VFS 快照（路径 → mode/size/mtime）；
+ * - mkdir / rmdir / touch 先同步改快照，再经 onLfsChange 异步写回 VFS，
+ *   所以脚本内后续的 lfs 调用能立即看到自己的改动；
+ * - chdir 只影响当前 Lua 状态（桌面版是进程级 cwd，这里不跨脚本共享）；
+ * - 运行期间外部对 VFS 的改动不会反映到已有快照（下次加载脚本时刷新）。
+ */
+function installLfsModule(L: any, runtime: LuaRuntime, options: LuaModuleOptions): void {
+  const entries = options.lfs ?? new Map<string, LuaLfsEntry>()
+  const { lua, to_luastring, to_jsstring } = runtime
+
+  /** lfs 的写操作入口（同步 API 无法等待 IndexedDB，落盘由宿主异步完成） */
+  const persistCallback = (L2: any): number => {
+    if (!options.onLfsChange) return 0
+    const op = lua.lua_isstring(L2, 1) ? to_jsstring(lua.lua_tostring(L2, 1)) : ''
+    const path = lua.lua_isstring(L2, 2) ? to_jsstring(lua.lua_tostring(L2, 2)) : ''
+    if (op === 'mkdir' || op === 'rmdir' || op === 'touch') options.onLfsChange(op, path)
+    return 0
+  }
+
+  registerLuaFunction(L, runtime, 'aegisub.__lfs_snapshot', (L2) => {
+    lua.lua_newtable(L2) // { entries = ..., persist = ... }
+    lua.lua_newtable(L2)
+    for (const [path, entry] of entries) {
+      lua.lua_newtable(L2)
+      lua.lua_pushstring(L2, to_luastring(entry.directory ? 'directory' : 'file'))
+      lua.lua_setfield(L2, -2, to_luastring('mode'))
+      lua.lua_pushinteger(L2, entry.size)
+      lua.lua_setfield(L2, -2, to_luastring('size'))
+      lua.lua_pushinteger(L2, Math.floor(entry.mtime / 1000))
+      lua.lua_setfield(L2, -2, to_luastring('modification'))
+      lua.lua_pushstring(L2, to_luastring(path))
+      lua.lua_pushvalue(L2, -2)
+      lua.lua_rawset(L2, -4)
+      lua.lua_pop(L2, 1)
+    }
+    lua.lua_setfield(L2, -2, to_luastring('entries'))
+    lua.lua_pushcfunction(L2, persistCallback)
+    lua.lua_setfield(L2, -2, to_luastring('persist'))
+    return 1
+  })
+  registerLuaSource(L, runtime, 'lfs', LFS_SOURCE)
+  registerLuaSource(L, runtime, 'aegisub.lfs', "return require('lfs')")
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +272,8 @@ export interface MoonscriptChunkResult {
 /**
  * 编译器源码懒加载表：`./moonscript/base.lua` → 模块名 `moonscript.base`。
  * init.lua 会调用 insert_loader()（依赖 io.open 的模块搜索器，web 无文件系统），
- * 故不注册；桌面版也不把编译器暴露成可 require 的模块，而是存进 registry。
+ * 故不注册；桌面通过 include/moonscript.lua 暴露聚合入口，下面用
+ * `require 'moonscript'` = `require 'moonscript.base'` 对应。
  */
 const moonscriptLoaders = import.meta.glob('./moonscript/**/*.lua', {
   query: '?raw',
@@ -217,6 +309,8 @@ function loadMoonscriptSources(): Promise<Map<string, string>> {
 export async function installMoonscriptModules(L: any, runtime: LuaRuntime): Promise<void> {
   const sources = await loadMoonscriptSources()
   for (const [name, source] of sources) registerLuaSource(L, runtime, name, source)
+  // 桌面 automation/include/moonscript.lua 的聚合入口：require 'moonscript' 直接可用
+  registerLuaSource(L, runtime, 'moonscript', "return require('moonscript.base')")
 }
 
 /**
@@ -1434,6 +1528,11 @@ end
 return bit
 `
 
+/**
+ * LuaJIT FFI 占位。浏览器沙箱没有可寻址的原生内存与动态库加载能力，
+ * WASM 里也无法调用任意 C 符号，因此 ffi.* 一律给出明确报错；
+ * aegisub.internal.ffi 的恒等包装仍保留（内置 include 依赖它）。
+ */
 const FFI_SOURCE = `
 local ffi = {}
 
@@ -1463,8 +1562,198 @@ ffi.C = setmetatable({}, {
 return ffi
 `
 
-/** `require 'lfs'` 的 API（Aegisub 的 lfs.moon 包装层暴露的函数） */
-const LFS_API = ['attributes', 'chdir', 'currentdir', 'dir', 'mkdir', 'rmdir', 'touch']
+/**
+ * lfs 的 Lua 实现（automation/include/aegisub/lfs.moon 的等价物）。
+ * 数据来自 require('aegisub.__lfs_snapshot')（{ entries, persist }），写入经 persist 落盘。
+ * 语义对齐 lfs.moon / lfs.cpp：attributes 的 mode/modification/size、目录迭代器、
+ * chdir 的 true-or-nil 约定与 "cannot open ..." 错误。
+ */
+const LFS_SOURCE = String.raw`
+local snapshot = require('aegisub.__lfs_snapshot')
+local entries = snapshot.entries
+local persist = snapshot.persist
+
+local lfs = {}
+local cwd = '/'
+
+local function check_string(value, narg, fname)
+  if type(value) ~= 'string' then
+    error(string.format("bad argument #%d to '%s' (string expected, got %s)",
+      narg, fname, type(value)), 3)
+  end
+  return value
+end
+
+-- 相对路径按 cwd 解析，并消除 '.'/'..'（VFS 路径一律 POSIX 风格）
+local function normalize(path)
+  local text = path:gsub('\\', '/')
+  if text:sub(1, 1) ~= '/' then
+    text = (cwd == '/' and '' or cwd) .. '/' .. text
+  end
+  local parts = {}
+  for segment in text:gmatch('[^/]+') do
+    if segment == '..' then
+      table.remove(parts)
+    elseif segment ~= '.' then
+      parts[#parts + 1] = segment
+    end
+  end
+  return '/' .. table.concat(parts, '/')
+end
+
+local function now()
+  return os.time and os.time() or 0
+end
+
+local function directory_children(path)
+  local prefix = path == '/' and '/' or path .. '/'
+  local names = {}
+  for key in pairs(entries) do
+    if key ~= path and key:sub(1, #prefix) == prefix then
+      local rest = key:sub(#prefix + 1)
+      if rest ~= '' and not rest:find('/', 1, true) then
+        names[#names + 1] = rest
+      end
+    end
+  end
+  table.sort(names)
+  return names
+end
+
+function lfs.currentdir()
+  return cwd
+end
+
+function lfs.chdir(path)
+  check_string(path, 1, 'chdir')
+  local key = normalize(path)
+  local entry = entries[key]
+  if not entry then
+    return nil, key .. ': No such file or directory'
+  end
+  if entry.mode ~= 'directory' then
+    return nil, key .. ': Not a directory'
+  end
+  cwd = key
+  return true
+end
+
+function lfs.attributes(path, field)
+  check_string(path, 1, 'attributes')
+  if field ~= nil then check_string(field, 2, 'attributes') end
+  local entry = entries[normalize(path)]
+  if not entry then return nil end
+  if field == 'mode' then return entry.mode end
+  if field == 'modification' then return entry.modification end
+  if field == 'size' then
+    if entry.mode ~= 'file' then return nil, path .. ': not a file' end
+    return entry.size
+  end
+  -- lfs.moon 的 switch：未知字段与省略字段都返回完整属性表
+  if entry.mode ~= 'file' then return nil, path .. ': not a file' end
+  return { mode = entry.mode, modification = entry.modification, size = entry.size }
+end
+
+function lfs.mkdir(path)
+  check_string(path, 1, 'mkdir')
+  local key = normalize(path)
+  local entry = entries[key]
+  if entry then
+    if entry.mode == 'directory' then return true end
+    return nil, key .. ': File exists'
+  end
+  -- agi::fs::CreateDirectory 是 create_directories：缺失的父目录一并创建
+  local chain = {}
+  local current = key
+  while current ~= '/' do
+    table.insert(chain, 1, current)
+    local parent = current:match('^(.*)/[^/]+$')
+    current = (parent == nil or parent == '') and '/' or parent
+  end
+  for _, dir in ipairs(chain) do
+    entries[dir] = { mode = 'directory', size = 0, modification = now() }
+  end
+  persist('mkdir', key)
+  return true
+end
+
+function lfs.rmdir(path)
+  check_string(path, 1, 'rmdir')
+  local key = normalize(path)
+  local entry = entries[key]
+  -- std::filesystem::remove 对不存在的路径不报错
+  if not entry then return true end
+  if entry.mode == 'directory' then
+    local prefix = key == '/' and '/' or key .. '/'
+    for other in pairs(entries) do
+      if other ~= key and other:sub(1, #prefix) == prefix then
+        return nil, key .. ': Directory not empty'
+      end
+    end
+  end
+  entries[key] = nil
+  persist('rmdir', key)
+  return true
+end
+
+function lfs.touch(path)
+  check_string(path, 1, 'touch')
+  local key = normalize(path)
+  local entry = entries[key]
+  if entry then
+    if entry.mode == 'file' then entry.modification = now() end
+    return true
+  end
+  local parent = key:match('^(.*)/[^/]+$')
+  parent = (parent == nil or parent == '') and '/' or parent
+  local parent_entry = entries[parent]
+  if parent_entry == nil then
+    local ok, err = lfs.mkdir(parent)
+    if not ok then return nil, err end
+  elseif parent_entry.mode ~= 'directory' then
+    return nil, parent .. ': Not a directory'
+  end
+  entries[key] = { mode = 'file', size = 0, modification = now() }
+  persist('touch', key)
+  return true
+end
+
+function lfs.dir(path)
+  check_string(path, 1, 'dir')
+  local key = normalize(path)
+  local entry = entries[key]
+  if not entry then
+    error('cannot open ' .. path .. ': No such file or directory', 2)
+  end
+  if entry.mode ~= 'directory' then
+    error('cannot open ' .. path .. ': Not a directory', 2)
+  end
+  local names = directory_children(key)
+  local index = 0
+  local state = {}
+  state.close = function() state.closed = true end
+  local function next_entry()
+    if state.closed then return nil end
+    index = index + 1
+    return names[index]
+  end
+  return next_entry, state
+end
+
+_G.lfs = lfs
+return lfs
+`
+
+/** luabins 已废弃：桌面 modules.cpp 在 require 时通过 aegisub.__raise_warning 提示 */
+const LUABINS_DEPRECATION_SOURCE = `
+if aegisub and aegisub.__raise_warning then
+  aegisub.__raise_warning('This automation script uses the library luabins. This library is deprecated and will be removed in a future version of Aegisub. If your script critically depends on luabins and cannot be adapted to work without it, please let us know at https://github.com/TypesettingTools/Aegisub/issues/382 .')
+end
+local luabins = require 'aegisub.__luabins_impl'
+_G.luabins = luabins
+return luabins
+`
+
 /** LPeg 的构造器与函数（调用即报错的占位，__placeholder 供 features 探测跳过） */
 const LPEG_API = [
   'P',

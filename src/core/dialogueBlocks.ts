@@ -61,20 +61,19 @@ export function parseDialogueBlocks(text: string): DialogueBlock[] {
   for (let cur = 0; cur < text.length;) {
     if (text[cur] === '{') {
       const end = text.indexOf('}', cur)
-      // VSFilter 语义：override 块必须闭合，未闭合按纯文本处理（落到 plain 分支）
-      if (end !== -1) {
-        const work = text.slice(cur + 1, end)
-        cur = end + 1
-        if (work.length > 0 && !work.includes('\\')) {
-          // 无反斜杠的 {...} 视为注释块
-          blocks.push({ type: 'comment', text: `{${work}}` })
-        } else {
-          const level = drawingLevelOf(work)
-          if (level !== null) drawingLevel = level
-          blocks.push({ type: 'override', text: `{${work}}` })
-        }
-        continue
+      // libass 语义：未闭合的 { 一直延续到行尾，仍按 override/comment 块处理
+      const workEnd = end === -1 ? text.length : end
+      const work = text.slice(cur + 1, workEnd)
+      cur = end === -1 ? text.length : end + 1
+      if (work.length > 0 && !work.includes('\\')) {
+        // 无反斜杠的 {...} 视为注释块（未闭合时保留原样，不补 }）
+        blocks.push({ type: 'comment', text: end === -1 ? `{${work}` : `{${work}}` })
+      } else {
+        const level = drawingLevelOf(work)
+        if (level !== null) drawingLevel = level
+        blocks.push({ type: 'override', text: end === -1 ? `{${work}` : `{${work}}` })
       }
+      continue
     }
 
     // plain / drawing 块（源码 find('{', cur + 1)：跳过当前字符再找下一个 '{'）

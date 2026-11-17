@@ -222,15 +222,13 @@ std::vector<std::unique_ptr<AssDialogueBlock>> AssDialogue::ParseTags() const {
 		if (text[cur] == '{') {
 			size_t end = text.find('}', cur);
 
-			// VSFilter requires that override blocks be closed, while libass
-			// does not. We match VSFilter here.
-			if (end == std::string::npos)
-				goto plain;
+			// libass 语义：未闭合的 { 延续到行尾，仍按覆盖块解析（不要求闭合）
+			bool closed = end != std::string::npos;
 
 			++cur;
 			// Get contents of block
-			std::string work = text.substr(cur, end - cur);
-			cur = end + 1;
+			std::string work = text.substr(cur, (closed ? end : len) - cur);
+			cur = closed ? end + 1 : len;
 
 			if (work.size() && work.find('\\') == std::string::npos) {
 				//We've found an override block with no backslashes
@@ -254,7 +252,6 @@ std::vector<std::unique_ptr<AssDialogueBlock>> AssDialogue::ParseTags() const {
 		}
 
 		// Plain-text/drawing block
-plain:
 		std::string work;
 		size_t end = text.find('{', cur + 1);
 		if (end == std::string::npos) {

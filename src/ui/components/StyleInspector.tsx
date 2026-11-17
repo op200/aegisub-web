@@ -2,8 +2,8 @@ import { Bold, Italic, Plus, Trash2, Underline } from 'lucide-react'
 import { useState } from 'react'
 
 import type { SubtitleStyle } from '../../core/types'
-import { assColorToHex, hexToAssColor } from '../color'
 import { tPlain } from '../i18n'
+import { ColorButton } from './ColorPickerDialog'
 
 interface StyleInspectorProps {
   styles: SubtitleStyle[]
@@ -155,51 +155,30 @@ export function StyleInspector({
       </div>
       <div className="color-controls">
         <label>
-          <span
-            className="color-swatch"
-            style={{ background: assColorToHex(selected.primaryColor) }}
-          />
           {tPlain('Primary')}
-          <input
-            type="color"
-            value={assColorToHex(selected.primaryColor)}
-            onChange={(event) =>
-              onUpdate(selected.id, {
-                primaryColor: hexToAssColor(event.target.value, selected.primaryColor),
-              })
-            }
+          <ColorButton
+            value={selected.primaryColor}
+            alpha
+            title={tPlain('Primary')}
+            onChange={(value) => onUpdate(selected.id, { primaryColor: value })}
           />
         </label>
         <label>
-          <span
-            className="color-swatch"
-            style={{ background: assColorToHex(selected.outlineColor) }}
-          />
           {tPlain('Outline')}
-          <input
-            type="color"
-            value={assColorToHex(selected.outlineColor)}
-            onChange={(event) =>
-              onUpdate(selected.id, {
-                outlineColor: hexToAssColor(event.target.value, selected.outlineColor),
-              })
-            }
+          <ColorButton
+            value={selected.outlineColor}
+            alpha
+            title={tPlain('Outline')}
+            onChange={(value) => onUpdate(selected.id, { outlineColor: value })}
           />
         </label>
         <label>
-          <span
-            className="color-swatch"
-            style={{ background: assColorToHex(selected.backColor) }}
-          />
           {tPlain('Shadow')}
-          <input
-            type="color"
-            value={assColorToHex(selected.backColor)}
-            onChange={(event) =>
-              onUpdate(selected.id, {
-                backColor: hexToAssColor(event.target.value, selected.backColor),
-              })
-            }
+          <ColorButton
+            value={selected.backColor}
+            alpha
+            title={tPlain('Shadow')}
+            onChange={(value) => onUpdate(selected.id, { backColor: value })}
           />
         </label>
       </div>

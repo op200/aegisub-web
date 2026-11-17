@@ -104,24 +104,21 @@ export function parseBlocks(text: string): AssBlock[] {
   while (cur < text.length) {
     if (text[cur] === '{') {
       const end = text.indexOf('}', cur)
-      // VSFilter 要求覆写块闭合，未闭合按普通文本
-      if (end < 0) {
-        blocks.push(
-          drawingLevel > 0
-            ? { type: 'drawing', text: text.slice(cur) }
-            : { type: 'plain', text: text.slice(cur) },
-        )
-        break
-      }
-      const work = text.slice(cur + 1, end)
-      cur = end + 1
+      // libass 语义：未闭合的 { 延续到行尾，仍按 override 块解析（不要求闭合）
+      const workEnd = end < 0 ? text.length : end
+      const work = text.slice(cur + 1, workEnd)
+      cur = end < 0 ? text.length : end + 1
       if (work.length > 0 && !work.includes('\\')) {
-        // 无反斜杠的 {} 按注释块
-        blocks.push({ type: 'comment', text: `{${work}}` })
+        // 无反斜杠的 {} 按注释块（未闭合时保留原样）
+        blocks.push({ type: 'comment', text: end < 0 ? `{${work}` : `{${work}}` })
       } else {
         const tags = parseOverrideTags(work)
         for (const tag of tags) if (tag.name === '\\p') drawingLevel = tagInt(tag.params, 0)
-        blocks.push({ type: 'override', text: `{${work}}`, tags })
+        blocks.push({
+          type: 'override',
+          text: end < 0 ? `{${work}` : `{${work}}`,
+          tags,
+        })
       }
       continue
     }

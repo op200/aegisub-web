@@ -21,7 +21,7 @@
   "dependencies": {
     "fengari": "^0.1.5",
     "jassub": "^2.5.37",
-    "lucide-react": "^1.72.0",
+    "lucide-react": "^1.73.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "web-demuxer": "^4.0.0"
@@ -32,8 +32,8 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.3.0",
-    "oxfmt": "0.78.0",
-    "oxlint": "1.93.0",
+    "oxfmt": "0.79.0",
+    "oxlint": "1.94.0",
     "typescript": "7.0.2",
     "vite": "8.3.8",
     "vitest": "5.1.0"

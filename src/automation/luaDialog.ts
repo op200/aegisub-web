@@ -530,3 +530,111 @@ export function dialogConfigTable(
   })
   return table
 }
+
+// ---------------------------------------------------------------------------
+// automation_settings 序列化（auto4_lua_dialog.cpp LuaConfigDialog::Serialise）
+// ---------------------------------------------------------------------------
+
+/**
+ * ass 内联字符串编码（libaegisub/ass/string_codec.cpp）：
+ * 控制字符与 `# , : |` 写成 `#XX`。
+ */
+export function inlineStringEncode(input: string): string {
+  let output = ''
+  for (const char of input) {
+    const code = char.codePointAt(0) ?? 0
+    if (code <= 0x1f || char === '#' || char === ',' || char === ':' || char === '|') {
+      output += `#${code.toString(16).toUpperCase().padStart(2, '0')}`
+    } else {
+      output += char
+    }
+  }
+  return output
+}
+
+/** 与 inlineStringEncode 互逆；非法 `#XX` 原样保留（string_codec.cpp 的宽松语义） */
+export function inlineStringDecode(input: string): string {
+  return input.replace(/#([0-9a-f]{2})/gi, (_, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  )
+}
+
+/** 单个控件的序列化值（控件类各自的 SerialiseValue） */
+function serialiseControlValue(control: DialogControl, value: DialogValue): string {
+  switch (control.kind) {
+    case 'edit':
+    case 'textbox':
+    case 'dropdown':
+    case 'color':
+    case 'coloralpha':
+      return inlineStringEncode(typeof value === 'string' ? value : String(value ?? ''))
+    case 'intedit':
+      return String(Math.trunc(Number(value) || 0))
+    case 'floatedit':
+      return String(Number(value) || 0)
+    case 'checkbox':
+      return value ? '1' : '0'
+    default:
+      return ''
+  }
+}
+
+/** 控件是否参与 Serialise（label 没有值） */
+function controlSerialisable(control: DialogControl): boolean {
+  return control.kind !== 'label'
+}
+
+/** `name1:value1|name2:value2`（LuaConfigDialog::Serialise） */
+export function serializeDialogSettings(controls: DialogControl[], values: DialogValue[]): string {
+  return controls
+    .map((control, index) =>
+      controlSerialisable(control)
+        ? `${inlineStringEncode(control.name)}:${serialiseControlValue(control, values[index])}`
+        : null,
+    )
+    .filter((part): part is string => part !== null)
+    .join('|')
+}
+
+/**
+ * 把 automation_settings 的值套回默认值（LuaConfigDialog::Unserialise）。
+ * 同名控件全部生效；未知名字忽略。
+ */
+export function applyDialogSettings(
+  spec: DialogSpec,
+  values: DialogValue[],
+  serialized: string,
+): DialogValue[] {
+  if (!serialized) return values
+  const next = [...values]
+  for (const token of serialized.split('|')) {
+    const colon = token.indexOf(':')
+    if (colon <= 0) continue
+    const name = inlineStringDecode(token.slice(0, colon))
+    const raw = token.slice(colon + 1)
+    spec.controls.forEach((control, index) => {
+      if (control.name !== name || !controlSerialisable(control)) return
+      switch (control.kind) {
+        case 'edit':
+        case 'textbox':
+        case 'dropdown':
+        case 'color':
+        case 'coloralpha':
+          next[index] = inlineStringDecode(raw)
+          break
+        case 'intedit':
+          next[index] = Number.parseInt(raw, 10) || 0
+          break
+        case 'floatedit':
+          next[index] = Number.parseFloat(raw) || 0
+          break
+        case 'checkbox':
+          next[index] = raw !== '0'
+          break
+        default:
+          break
+      }
+    })
+  }
+  return next
+}

@@ -18,6 +18,7 @@ export type OptionType =
   | 'string'
   | 'color'
   | 'list-string'
+  | 'list-color'
   | 'list-bool'
 
 /** default_config.json（Aegisub src/libresrc/default_config.json 原样子集） */
@@ -304,9 +305,6 @@ export const DEFAULT_CONFIG = {
       // 块内按 Lua 语法上色 + `!` 分界符运算符白；false = 源码语义整块 Karaoke Template 紫
       'Template Lua': true,
     },
-    // Web 版偏离上游：'jassub'（libass WASM 渲染）| 'canvas'（内置 drawCue 兜底）；
-    // 上游历史值 'libass'/'csri' 合并时一并视为 jassub
-    Provider: 'jassub',
     'Show Original': false,
     'Time Edit': { 'Insert Mode': true },
   },
@@ -319,6 +317,22 @@ export const DEFAULT_CONFIG = {
   },
   Timing: { 'Default Duration': 3000 },
   Tool: {
+    // dialog_colorpicker.cpp：光谱模式与最近颜色（坐标由 PersistLocation 持久化）
+    'Colour Picker': {
+      Mode: 4,
+      'Recent Colours': [
+        '&H000000&',
+        '&H0000FF&',
+        '&H00FFFF&',
+        '&H00FF00&',
+        '&HFFFF00&',
+        '&HFF0000&',
+        '&HFF00FF&',
+        '&HFFFFFF&',
+      ],
+      Last: { X: -1, Y: -1 },
+      Maximized: false,
+    },
     // dialog_text_import.cpp / command/edit.cpp paste_over 的持久化选项
     Import: { Text: { 'Actor Separator': ':', 'Comment Starter': '#', 'Include Blank': false } },
     'Paste Lines Over': {
@@ -350,6 +364,14 @@ export const DEFAULT_CONFIG = {
       Mode: 1,
       Text: '',
     },
+    // spellchecker_hunspell.cpp / thesaurus.cpp：语言为空 = 禁用；Skip 两项仅拼写检查对话框使用
+    'Spell Checker': {
+      Backend: 'hunspell',
+      Language: 'en_US',
+      'Skip Comments': false,
+      'Skip Uppercase': false,
+    },
+    Thesaurus: { Language: 'en_US' },
     'Shift Times': { Affect: 0, ByTime: true, Direction: true, Frames: 0, Time: 0, Type: 0 },
     'Timing Post Processor': {
       'Adjacent Bias': 0.9,
@@ -456,8 +478,9 @@ const COLOR_OPTIONS = new Set<string>([
   'Colour/Visual Tools/Lines Secondary',
 ])
 
-const LIST_STRING_OPTIONS = new Set<string>(['Audio/Colour Schemes', 'Subtitle/Grid/Column'])
-const LIST_BOOL_OPTIONS = new Set<string>(['Tool/Paste Lines Over/Fields'])
+const LIST_STRING_OPTIONS = new Set<string>(['Audio/Colour Schemes'])
+const LIST_COLOR_OPTIONS = new Set<string>(['Tool/Colour Picker/Recent Colours'])
+const LIST_BOOL_OPTIONS = new Set<string>(['Tool/Paste Lines Over/Fields', 'Subtitle/Grid/Column'])
 
 /** 扁平化默认值：路径 → 值（agi::Options 的 from_json 展开语义） */
 function flatten(tree: unknown, prefix: string, out: Map<string, unknown>): void {
@@ -478,6 +501,7 @@ const STORAGE_KEY = 'aegisub-web:config'
 function detectType(name: string, value: unknown): OptionType {
   if (COLOR_OPTIONS.has(name)) return 'color'
   if (LIST_STRING_OPTIONS.has(name)) return 'list-string'
+  if (LIST_COLOR_OPTIONS.has(name)) return 'list-color'
   if (LIST_BOOL_OPTIONS.has(name)) return 'list-bool'
   if (typeof value === 'boolean') return 'bool'
   if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'double'
@@ -533,6 +557,12 @@ export function applyConfigTree(tree: unknown): number {
     else if (type === 'color' && typeof value === 'string') values.set(name, value)
     else if (type === 'list-string' && Array.isArray(value)) values.set(name, [...value])
     else if (
+      type === 'list-color' &&
+      Array.isArray(value) &&
+      value.every((item) => typeof item === 'string')
+    )
+      values.set(name, [...value])
+    else if (
       type === 'list-bool' &&
       Array.isArray(value) &&
       value.every((item) => typeof item === 'boolean')
@@ -573,6 +603,8 @@ function toSourceTree(tree: Record<string, unknown>, prefix = ''): Record<string
       out[key] = toSourceTree(value as Record<string, unknown>, name)
     } else if (getOptionType(name) === 'list-string') {
       out[key] = (value as unknown[]).map((item) => ({ string: item }))
+    } else if (getOptionType(name) === 'list-color') {
+      out[key] = (value as unknown[]).map((item) => ({ color: item }))
     } else if (getOptionType(name) === 'list-bool') {
       out[key] = (value as unknown[]).map((item) => ({ bool: item }))
     } else {
@@ -697,6 +729,10 @@ export function getOptionListBool(name: string): boolean[] {
   return getOption<boolean[]>(name)
 }
 
+export function getOptionListColor(name: string): string[] {
+  return getOption<string[]>(name)
+}
+
 export function isOptionDefault(name: string): boolean {
   if (!defaults.has(name)) throw new Error(`Unknown option: ${name}`)
   return JSON.stringify(values.get(name)) === JSON.stringify(defaults.get(name))
@@ -712,12 +748,17 @@ export function setOption(name: string, value: unknown): void {
     (type === 'double' && typeof value === 'number' && Number.isFinite(value)) ||
     ((type === 'string' || type === 'color') && typeof value === 'string') ||
     (type === 'list-string' && Array.isArray(value)) ||
+    (type === 'list-color' &&
+      Array.isArray(value) &&
+      value.every((item) => typeof item === 'string')) ||
     (type === 'list-bool' &&
       Array.isArray(value) &&
       value.every((item) => typeof item === 'boolean'))
   if (!valid) throw new Error(`Type mismatch for option ${name}: ${type}`)
   const normalized =
-    type === 'list-string' || type === 'list-bool' ? [...(value as unknown[])] : value
+    type === 'list-string' || type === 'list-color' || type === 'list-bool'
+      ? [...(value as unknown[])]
+      : value
   if (JSON.stringify(values.get(name)) === JSON.stringify(normalized)) return
   values.set(name, normalized)
   persist()

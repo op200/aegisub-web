@@ -6,7 +6,7 @@
  *
  * 有意不实现的桌面专属命令（后续勿当作缺失）：am/manager|reload*（自动化管理器窗口）、
  * app/bring_to_front|hide|hide_others|maximize|minimize|show_all（窗口管理）、
- * video/subtitles_provider/cycle（多 provider 轮换）；subtitle/close 保留现状。
+ * video/subtitles_provider/cycle（渲染器恒为 JASSUB/libass，无可轮换 provider）；subtitle/close 保留现状。
  */
 
 export type ShortcutContext =

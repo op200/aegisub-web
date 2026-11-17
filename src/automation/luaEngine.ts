@@ -14,25 +14,30 @@
  *
  * Web 环境的有意偏差：无 aegisub.* 原生模块；MoonScript 用 vendored 0.8 纯 Lua
  * 解析器（桌面版是 0.7 + lpeg），脚本引擎列表仍只有 Lua（`*.lua,*.moon`）；
- * aegisub.dialog.open/save 恒返回 nil；text_extents 由宿主 host.textExtents 提供；
+ * aegisub.dialog.open/save 由宿主文件选择器提供，返回文件名而非真实路径；
+ * text_extents 由宿主 host.textExtents 提供；
  * 无 AssDialogue* 指针，active/selected 用对白行序数表达；__raise_warning 仅在注册期收集；
  * 颜色控件用 <input type=color>（不支持编辑 alpha，alpha 分量保留）；LuaConfigDialog 用
  * CSS grid 复刻 wxGridBagSizer 的 (x,y,width,height) 布局；
- * 单一脚本管理器（无全局/本地之分），Automation Manager 无 Rescan Autoload Dir / Help 按钮，
+ * 脚本管理器按 autoload（全局）/ 项目 Automation Scripts（本地）分离；
  * Show Info 为内嵌面板而非 wxMessageBox。
  */
 
 import { getOptionInt, getOptionString } from '../config/options'
 import * as karaokeModule from '../core/karaoke'
 import {
+  deletePath,
   dirExists,
   dirname,
   joinPath,
   listTree,
+  mkdir,
   readTextFile,
+  touchFile,
   vfsDecode,
   VFS_DIRS,
 } from '../storage/vfs'
+import { logWarning } from '../ui/log'
 import {
   buildReplaceDocumentPayload,
   LuaFileModel,
@@ -44,7 +49,12 @@ import {
   type LuaRow,
   type StyleRowFields,
 } from './luaAssFile'
-import { ensureLuaBackend, resetActiveLuaBackend, selectedLuaBackendId } from './luaBackend'
+import {
+  ensureLuaBackend,
+  resetActiveLuaBackend,
+  selectedLuaBackendId,
+  type LuaVmApi,
+} from './luaBackend'
 import {
   dialogReadBackValues,
   parseDialogSpec,
@@ -58,6 +68,7 @@ import {
   installLuaModuleSearch,
   installLuaModules,
   installMoonscriptModules,
+  type LuaLfsEntry,
 } from './luaModules'
 
 /** 当前已加载的 Lua VM 后端（Automation/Backend 选项；首次加载脚本时才拉取 VM） */
@@ -65,6 +76,8 @@ let backendLoaded = false
 /** 进行中的后端初始化（并发加载脚本时共享，避免重复实例化 VM） */
 let backendLoading: Promise<void> | null = null
 let lua: any, lauxlib: any, lualib: any, to_luastring: any, to_jsstring: any
+/** 当前后端 API（lua55-wasm 用它 preload 内建 C 模块） */
+let luaApi: LuaVmApi | null = null
 
 async function ensureLuaBackendRuntime(): Promise<void> {
   if (backendLoaded) return
@@ -74,6 +87,7 @@ async function ensureLuaBackendRuntime(): Promise<void> {
     backendLoading = ensureLuaBackend(selectedLuaBackendId())
       .then((api) => {
         ;({ lua, lauxlib, lualib, to_luastring, to_jsstring } = api)
+        luaApi = api
         backendLoaded = true
       })
       .finally(() => {
@@ -100,7 +114,20 @@ export function resetAutomationBackend(): void {
   states.clear()
   backendLoaded = false
   backendLoading = null
+  luaApi = null
   resetActiveLuaBackend()
+}
+
+/** ScriptManager::Remove：关闭单个脚本状态（本地脚本随字幕文件卸载） */
+export function unloadAutomationScript(stateId: number): void {
+  const state = states.get(stateId)
+  if (!state) return
+  try {
+    lua.lua_close(state.L)
+  } catch {
+    /* 状态关闭失败不影响后续加载 */
+  }
+  states.delete(stateId)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +208,28 @@ export interface AutomationHost {
   gettext?(message: string): string
   clipboardGet?(): Promise<string>
   clipboardSet?(text: string): Promise<boolean>
+  /**
+   * aegisub.dialog.open：宿主文件选择。返回值按桌面语义是文件路径；
+   * web 无真实路径，返回所选文件名（multiple=true 时仍只含一个）。
+   * 未提供或取消时返回 null。
+   */
+  openFileDialog?(options: {
+    title: string
+    defaultDir: string
+    defaultFile: string
+    wildcard: string
+    multiple: boolean
+  }): Promise<string[] | null>
+  /**
+   * aegisub.dialog.save：宿主保存对话框。桌面返回完整路径；
+   * web 只返回用户输入的文件名（脚本无法据此写盘），取消时返回 null。
+   */
+  saveFileDialog?(options: {
+    title: string
+    defaultDir: string
+    defaultFile: string
+    wildcard: string
+  }): Promise<string | null>
 }
 
 export interface DialogResponseLike {
@@ -1381,24 +1430,54 @@ function makeProgressSink(L: any): void {
   }
   const displayOpenDialog = (L2: any): number => {
     // C++：参数 1-4 check_wxstring、5 multiple、6 must_exist(toboolean(6) || isnil(6))
-    checkString(L2, 1)
-    checkString(L2, 2)
-    checkString(L2, 3)
-    checkString(L2, 4)
-    // Web 版无文件系统（wxFileDialog 无对应物）：始终取消
+    const title = checkString(L2, 1)
+    const defaultDir = checkString(L2, 2)
+    const defaultFile = checkString(L2, 3)
+    const wildcard = checkString(L2, 4)
+    const multiple = lua.lua_toboolean(L2, 5) !== 0
     return yieldToHost(L2, async (co) => {
-      lua.lua_pushnil(co)
+      const current = currentContext(L2)
+      if (!current?.host.openFileDialog) {
+        lua.lua_pushnil(co)
+        return 1
+      }
+      const files = await current.host.openFileDialog({
+        title,
+        defaultDir,
+        defaultFile,
+        wildcard,
+        multiple,
+      })
+      if (current?.hostCancelled) throwCancelled()
+      if (!files || !files.length) {
+        lua.lua_pushnil(co)
+        return 1
+      }
+      if (multiple) {
+        lua.lua_newtable(co)
+        files.forEach((file, index) => {
+          lua.lua_pushstring(co, to_luastring(file))
+          lua.lua_rawseti(co, -2, index + 1)
+        })
+      } else {
+        lua.lua_pushstring(co, to_luastring(files[0]))
+      }
       return 1
     })
   }
   const displaySaveDialog = (L2: any): number => {
-    checkString(L2, 1)
-    checkString(L2, 2)
-    checkString(L2, 3)
-    checkString(L2, 4)
-    // Web 版无文件系统：始终取消
+    const title = checkString(L2, 1)
+    const defaultDir = checkString(L2, 2)
+    const defaultFile = checkString(L2, 3)
+    const wildcard = checkString(L2, 4)
     return yieldToHost(L2, async (co) => {
-      lua.lua_pushnil(co)
+      const current = currentContext(L2)
+      const path = current?.host.saveFileDialog
+        ? await current.host.saveFileDialog({ title, defaultDir, defaultFile, wildcard })
+        : null
+      if (current?.hostCancelled) throwCancelled()
+      if (!path) lua.lua_pushnil(co)
+      else lua.lua_pushstring(co, to_luastring(path))
       return 1
     })
   }
@@ -1579,6 +1658,60 @@ function readGlobalString(L: any, name: string): string {
   return value
 }
 
+/**
+ * lfs 的 VFS 快照（脚本加载前拍一次）。
+ *
+ * 桌面 lfs 直接读真实文件系统；web VFS 在 IndexedDB 里且 API 是异步的，
+ * 而 Lua 的 lfs 调用必须同步返回，因此把文件元数据预载成内存表。
+ * 目录由文件路径前缀反推（VFS 目录可以隐式存在），保证 lfs.dir 能列出子项。
+ */
+async function readLfsSnapshot(): Promise<Map<string, LuaLfsEntry>> {
+  const entries = new Map<string, LuaLfsEntry>()
+  const addDirectory = (path: string): void => {
+    if (path === '/' || entries.has(path)) return
+    entries.set(path, { directory: true, size: 0, mtime: 0 })
+    addDirectory(dirname(path))
+  }
+  try {
+    for (const entry of await listTree('/')) {
+      const path = entry.directory ? entry.path.replace(/\/+$/, '') || '/' : entry.path
+      if (path === '/') continue
+      if (entry.directory) {
+        addDirectory(path)
+        continue
+      }
+      entries.set(path, { directory: false, size: entry.size, mtime: entry.mtime })
+      addDirectory(dirname(path))
+    }
+  } catch {
+    // 无 IndexedDB（Node 单测）：快照为空，lfs 退化为空文件系统
+  }
+  return entries
+}
+
+/**
+ * autoload 脚本是 Promise.all 并发加载的，共享同一次 VFS 扫描；
+ * 扫描结束即释放，之后新增脚本会重新拍快照（桌面 lfs 则是实时文件系统）。
+ */
+let pendingLfsSnapshot: Promise<Map<string, LuaLfsEntry>> | null = null
+
+function buildLfsSnapshot(): Promise<Map<string, LuaLfsEntry>> {
+  const promise = (pendingLfsSnapshot ??= readLfsSnapshot())
+  void promise.finally(() => {
+    if (pendingLfsSnapshot === promise) pendingLfsSnapshot = null
+  })
+  return promise
+}
+
+/** lfs 的同步调用无法等待 IndexedDB：先改快照，再异步落盘 */
+function persistLfsChange(op: 'mkdir' | 'rmdir' | 'touch', path: string): void {
+  const action = op === 'mkdir' ? mkdir(path) : op === 'rmdir' ? deletePath(path) : touchFile(path)
+  void action.catch((error: unknown) => {
+    const reason = error instanceof Error ? error.message : String(error)
+    logWarning('automation', `lfs.${op}('${path}') 写入 VFS 失败：${reason}`)
+  })
+}
+
 export async function loadAutomationScript(
   code: string,
   filename: string,
@@ -1621,11 +1754,19 @@ export async function loadAutomationScript(
 
     // include 内容预载：同步 C 函数无法 await，须在执行脚本本体前完成
     const includeDirs = await refreshIncludeCache(scriptDir)
+    // lfs 也是同步 API：VFS 元数据在脚本执行前一次性拍快照
+    const lfsEntries = await buildLfsSnapshot()
 
     // 模块系统：aegisub.* 等内置模块走 preload；其余从 include 目录同步加载
     // （对齐 script_reader.cpp Install / module_loader）
     const runtime = { lua, lauxlib, to_luastring, to_jsstring }
-    installLuaModules(L, runtime)
+    installLuaModules(L, runtime, {
+      lfs: lfsEntries,
+      onLfsChange: persistLfsChange,
+      preloadNativeModule: luaApi?.preloadNativeModule
+        ? (L2, name) => luaApi!.preloadNativeModule!(L2, name)
+        : undefined,
+    })
     // 主脚本或 include 目录里存在 .moon 时才装编译器（约 500KB Lua 源码）
     const moonScript = /\.moon$/i.test(filename)
     const moonAvailable =
@@ -2476,9 +2617,12 @@ export async function isActiveAutomationMacro(
 // ass_exporter.cpp / dialog_export.cpp）
 // ---------------------------------------------------------------------------
 
+/** 内置过滤器标识（脚本状态 id 为 -1，与"加载失败脚本"同样不进 Lua 链） */
+export type BuiltinExportFilterKind = 'fix_styles' | 'transform_framerate'
+
 /** 导出对话框里的一项过滤器（AssExportFilterChain 的注册序 + 去重命名结果） */
 export interface AutomationFilterDisplayInfo {
-  /** 所属脚本状态 id */
+  /** 所属脚本状态 id；内置过滤器为 -1 */
   stateId: number
   /** 脚本注册时的原始名（引擎按此查找） */
   name: string
@@ -2487,6 +2631,51 @@ export interface AutomationFilterDisplayInfo {
   description: string
   priority: number
   hasConfig: boolean
+  /** 内置过滤器（export_fixstyle.cpp / export_framerate.cpp） */
+  builtin?: BuiltinExportFilterKind
+}
+
+/** 桌面 main.cpp 启动时注册的两个内置过滤器（注册序：Fix Styles → Transform Framerate） */
+const BUILTIN_EXPORT_FILTERS: Array<Omit<AutomationFilterDisplayInfo, 'displayName'>> = [
+  {
+    stateId: -1,
+    name: 'Fix Styles',
+    description: "Fixes styles by replacing any style that isn't available on file with Default.",
+    priority: -5000,
+    hasConfig: false,
+    builtin: 'fix_styles',
+  },
+  {
+    stateId: -1,
+    name: 'Transform Framerate',
+    description:
+      'Transform subtitle times, including those in override tags, from an input framerate to an output framerate.\n\nThis is useful for converting regular time subtitles to VFRaC time subtitles for hardsubbing.\nIt can also be used to convert subtitles to a different speed video, such as NTSC to PAL speedup.',
+    priority: 1000,
+    hasConfig: false,
+    builtin: 'transform_framerate',
+  },
+]
+
+/** AssExportFilterChain::Register：去重命名 + 按优先级降序插入（同优先级保持注册序） */
+function registerExportFilter(
+  list: AutomationFilterDisplayInfo[],
+  used: Set<string>,
+  filter: Omit<AutomationFilterDisplayInfo, 'displayName'>,
+): void {
+  let displayName = filter.name
+  let copy = 1
+  while (used.has(displayName)) displayName = `${filter.name} (${copy++})`
+  used.add(displayName)
+  const entry: AutomationFilterDisplayInfo = { ...filter, displayName }
+  // 插到第一个 priority < 自身 的元素之前（同优先级排在其后，保持稳定）
+  let index = list.length
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].priority < filter.priority) {
+      index = i
+      break
+    }
+  }
+  list.splice(index, 0, entry)
 }
 
 /**
@@ -2501,27 +2690,38 @@ export function orderedAutomationFilters(
   for (const script of scripts) {
     if (script.stateId < 0) continue
     for (const filter of script.filters) {
-      let displayName = filter.name
-      let copy = 1
-      while (used.has(displayName)) displayName = `${filter.name} (${copy++})`
-      used.add(displayName)
-      const entry: AutomationFilterDisplayInfo = {
+      registerExportFilter(list, used, {
         stateId: script.stateId,
         name: filter.name,
-        displayName,
         description: filter.description,
         priority: filter.priority,
         hasConfig: filter.hasConfig,
-      }
-      // 插到第一个 priority < 自身 的元素之前（同优先级排在其后，保持稳定）
-      let index = list.length
-      for (let i = 0; i < list.length; i++) {
-        if (list[i].priority < filter.priority) {
-          index = i
-          break
-        }
-      }
-      list.splice(index, 0, entry)
+      })
+    }
+  }
+  return list
+}
+
+/**
+ * 导出对话框的完整过滤器链：内置过滤器先注册（main.cpp），再按脚本加载序注册 Lua 过滤器。
+ * 名字去重跨内置与脚本（同名 Lua 过滤器会被改名为 "Name (1)"）。
+ */
+export function orderedExportFilters(
+  scripts: Array<{ stateId: number; filters: AutomationFilterInfo[] }>,
+): AutomationFilterDisplayInfo[] {
+  const list: AutomationFilterDisplayInfo[] = []
+  const used = new Set<string>()
+  for (const filter of BUILTIN_EXPORT_FILTERS) registerExportFilter(list, used, filter)
+  for (const script of scripts) {
+    if (script.stateId < 0) continue
+    for (const filter of script.filters) {
+      registerExportFilter(list, used, {
+        stateId: script.stateId,
+        name: filter.name,
+        description: filter.description,
+        priority: filter.priority,
+        hasConfig: filter.hasConfig,
+      })
     }
   }
   return list

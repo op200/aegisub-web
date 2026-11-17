@@ -26,6 +26,13 @@ import {
   type DialogueBlock,
 } from '../../core/dialogueBlocks'
 import { CHARSET_CHOICES, charsetName } from '../../core/encoding'
+import {
+  buildZip,
+  collectReferencedFonts,
+  writeFontsToDirectory,
+  type FontFileData,
+  type LocalFontLike,
+} from '../../core/fontCollector'
 import { attachmentFileName } from '../../core/format'
 import {
   MATRIX_OPTIONS,
@@ -61,7 +68,13 @@ import {
 import { listFontFaces } from '../../storage/fontStore'
 import { aegisubHotkeyStrFirst } from '../aegisubHotkeys'
 import { aegisubIconUrl } from '../aegisubIcons'
-import { cssColorToHex, hexToCssColor } from '../color'
+import {
+  cssColorToHex,
+  hexToCssColor,
+  parseAssPickerColor,
+  parseCssPickerColor,
+  pickerColorToAss,
+} from '../color'
 import { commandForShortcut, shortcutFromKeyboardEvent } from '../commands'
 import {
   availableLocales,
@@ -75,6 +88,7 @@ import {
   tPlain,
   tPlural,
 } from '../i18n'
+import { ColorButton } from './ColorPickerDialog'
 
 interface DialogProps {
   title: string
@@ -187,19 +201,19 @@ function wxLabel(label: string): string {
   return result
 }
 
-/** #RRGGBB[AA] → <input type="color"> 的 #RRGGBB */
-function toColorInput(value: DialogValue): string {
+/** #RRGGBB[AA]（AA 为 ASS alpha）→ PickerColor */
+function dialogColorValue(value: DialogValue, alpha: boolean) {
   const hex = typeof value === 'string' ? value : ''
-  return /^#[0-9a-fA-F]{6}/.test(hex) ? hex.slice(0, 7) : '#000000'
+  const rgb = parseCssPickerColor(hex.slice(0, 7)) ?? { r: 0, g: 0, b: 0, a: 0 }
+  const a = alpha && /^#[0-9a-fA-F]{8}$/.test(hex) ? Number.parseInt(hex.slice(7, 9), 16) : 0
+  return { ...rgb, a }
 }
 
-/** <input type="color"> 的 #RRGGBB → 回读值（coloralpha 保留原 alpha 分量） */
-function fromColorInput(next: string, previous: DialogValue, alpha: boolean): string {
-  const rgb = next.toUpperCase()
-  if (!alpha) return rgb
-  const match =
-    typeof previous === 'string' ? previous.match(/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})$/) : null
-  return `${rgb}${match ? match[1].toUpperCase() : '00'}`
+/** PickerColor → #RRGGBB[AA]（auto4_lua_dialog.cpp 的 GetHexFormatted(alpha)） */
+function dialogColorString(color: { r: number; g: number; b: number; a: number }, alpha: boolean) {
+  const byte = (value: number) => Math.round(value).toString(16).padStart(2, '0').toUpperCase()
+  const rgb = `#${byte(color.r)}${byte(color.g)}${byte(color.b)}`
+  return alpha ? `${rgb}${byte(color.a)}` : rgb
 }
 
 function DialogControlField({
@@ -282,15 +296,21 @@ function DialogControlField({
         </label>
       )
     case 'color':
-    case 'coloralpha':
+    case 'coloralpha': {
+      const color = dialogColorValue(value, control.alpha)
       return (
-        <input
-          type="color"
-          value={toColorInput(value)}
+        <ColorButton
+          value={pickerColorToAss(color)}
+          alpha={control.alpha}
+          format="ass"
           title={control.hint || undefined}
-          onChange={(event) => onChange(fromColorInput(event.target.value, value, control.alpha))}
+          onChange={(ass) => {
+            const next = parseAssPickerColor(ass)
+            if (next) onChange(dialogColorString(next, control.alpha))
+          }}
         />
       )
+    }
   }
 }
 
@@ -1719,10 +1739,14 @@ export function PasteOverDialog({
 type LocalFontPermission = 'granted' | 'prompt' | 'denied' | 'unsupported' | 'unknown'
 
 interface LocalFontApi {
-  queryLocalFonts?: (options?: {
-    postscriptNames?: string[]
-  }) => Promise<
-    Array<{ family: string; fullName?: string; postscriptName?: string; style: string }>
+  queryLocalFonts?: (options?: { postscriptNames?: string[] }) => Promise<
+    Array<{
+      family: string
+      fullName?: string
+      postscriptName?: string
+      style: string
+      blob(): Promise<Blob>
+    }>
   >
 }
 
@@ -1745,11 +1769,14 @@ export async function probeLocalFonts(): Promise<{
 export function FontCollectorDialog({
   styles,
   text,
+  fileName,
   onLocalFontsAuthorized,
   onClose,
 }: {
   styles: SubtitleStyle[]
   text: string
+  /** 字幕文件名（打包 zip 的默认名） */
+  fileName?: string
   /** 授权成功后回调：libass 需重建实例才会用新权限重新匹配字体 */
   onLocalFontsAuthorized?: () => void
   onClose: () => void
@@ -1757,10 +1784,13 @@ export function FontCollectorDialog({
   const [supported, setSupported] = useState(false)
   const [permission, setPermission] = useState<LocalFontPermission>('unknown')
   const [localFamilies, setLocalFamilies] = useState<Set<string> | null>(null)
+  const [localFonts, setLocalFonts] = useState<LocalFontLike[] | null>(null)
   // 拖入/导入进 IndexedDB 的字体缓存同样可供 libass 使用——Firefox 无 Local Font
   // Access 时的主通道，可用性检查必须包含（名字集含 name 表全部记录）
   const [cachedNames, setCachedNames] = useState<Set<string> | null>(null)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [collecting, setCollecting] = useState(false)
 
   const loadLocalFonts = async (): Promise<boolean> => {
     const api = window as Window & LocalFontApi
@@ -1770,6 +1800,7 @@ export function FontCollectorDialog({
       // 字幕引用的字体名可能落在 fullName/postscriptName 上（如 方正兰亭中黑_GBK
       // 的 family 是 FZLanTingHei-DB-GBK），三个名字都收进可用性集合
       const list = await api.queryLocalFonts()
+      setLocalFonts(list)
       setLocalFamilies(
         new Set(
           list.flatMap((font) => [
@@ -1832,11 +1863,89 @@ export function FontCollectorDialog({
     return localFamilies.has(lower) ? 'installed' : 'missing'
   }
 
+  /** 收集字体文件；返回 null 表示无法收集（错误已写入 error） */
+  const collectFonts = async (): Promise<FontFileData[] | null> => {
+    setCollecting(true)
+    setError('')
+    setNotice('')
+    try {
+      const { files, missing } = await collectReferencedFonts(fonts, localFonts)
+      if (!files.length) {
+        setError(tPlain('No font files could be collected.'))
+        return null
+      }
+      setNotice(
+        missing.length
+          ? tFmt('Collected %d font files. Could not find: %s', files.length, missing.join(', '))
+          : tFmt('Collected %d font files.', files.length),
+      )
+      return files
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+      return null
+    } finally {
+      setCollecting(false)
+    }
+  }
+
+  const copyToFolder = async () => {
+    const files = await collectFonts()
+    if (!files) return
+    const picker = (
+      window as Window & {
+        showDirectoryPicker?: (options?: { mode?: string }) => Promise<FileSystemDirectoryHandle>
+      }
+    ).showDirectoryPicker
+    if (!picker) {
+      setError(tPlain('This browser does not support writing to a folder.'))
+      return
+    }
+    try {
+      const directory = await picker({ mode: 'readwrite' })
+      await writeFontsToDirectory(files, directory)
+      setNotice(tFmt('Copied %d font files to the selected folder.', files.length))
+    } catch (cause) {
+      // 用户取消选择目录不算错误
+      if (cause instanceof DOMException && cause.name === 'AbortError') return
+      setError(cause instanceof Error ? cause.message : String(cause))
+    }
+  }
+
+  const copyToArchive = async () => {
+    const files = await collectFonts()
+    if (!files) return
+    const entries = await Promise.all(
+      files.map(async (file) => ({
+        name: file.name,
+        data: new Uint8Array(await file.data.arrayBuffer()),
+      })),
+    )
+    const zip = buildZip(entries)
+    const stem = (fileName ?? 'subtitles').replace(/\.[^.]+$/, '')
+    const url = URL.createObjectURL(new Blob([zip as BlobPart], { type: 'application/zip' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${stem}_fonts.zip`
+    anchor.click()
+    URL.revokeObjectURL(url)
+    setNotice(tFmt('Packed %d font files into %s_fonts.zip.', files.length, stem))
+  }
+
   return (
     <Dialog
       title={tPlain('Fonts Collector')}
       onClose={onClose}
-      footer={<button onClick={onClose}>{tPlain('Close')}</button>}
+      footer={
+        <>
+          <button disabled={collecting || !fonts.length} onClick={() => void copyToArchive()}>
+            {tPlain('Copy fonts to &zipped archive')}
+          </button>
+          <button disabled={collecting || !fonts.length} onClick={() => void copyToFolder()}>
+            {tPlain('Copy fonts to &folder')}
+          </button>
+          <button onClick={onClose}>{tPlain('Close')}</button>
+        </>
+      }
     >
       <div className="tool-list-dialog">
         <p>{tPlain('Fonts referenced by the current subtitle:')}</p>
@@ -1880,6 +1989,7 @@ export function FontCollectorDialog({
             <strong>{error}</strong>
           </p>
         )}
+        {notice && <p>{notice}</p>}
       </div>
     </Dialog>
   )
@@ -2878,16 +2988,11 @@ export function DummyVideoDialog({ onClose, onApply }: DummyVideoDialogProps) {
         <div className="dialog-row">
           <label>
             {tPlain('Color')}
-            <input
-              type="color"
+            <ColorButton
+              format="css"
+              alpha={false}
               value={color}
-              onChange={(event) => setColor(event.target.value)}
-              style={{
-                width: 24,
-                padding: 0,
-                border: '1px solid #aaa',
-                background: 'transparent',
-              }}
+              onChange={(value) => setColor(value)}
             />
           </label>
           <label className="dialog-check">
@@ -2941,6 +3046,8 @@ export interface AutomationScriptInfo {
   version: string
   warnings: string[]
   error?: string
+  /** true = autoload 全局脚本（G），false = 项目 Automation Scripts 本地脚本（L） */
+  isGlobal: boolean
 }
 
 interface AutomationManagerDialogProps {
@@ -2948,21 +3055,25 @@ interface AutomationManagerDialogProps {
   onAdd: () => void
   onRemove: (id: string) => void
   onReload: (id: string) => void
+  /** Rescan Autoload Dir：重扫全局 autoload 目录（dialog_automation.cpp OnReloadAutoload） */
+  onRescan: () => void
+  onHelp: () => void
   onClose: () => void
 }
 
-/** Show Info 文本（dialog_automation.cpp OnInfo；web 单一脚本管理器，全局脚本恒 0） */
+/** Show Info 文本（dialog_automation.cpp OnInfo） */
 function automationInfoText(
   scripts: AutomationScriptInfo[],
   script: AutomationScriptInfo | null,
 ): string {
   const info: string[] = []
+  const globalCount = scripts.filter((item) => item.isGlobal).length
   info.push(
     tFmt(
       'Total scripts loaded: %d\nGlobal scripts loaded: %d\nLocal scripts loaded: %d\n',
       scripts.length,
-      0,
-      scripts.length,
+      globalCount,
+      scripts.length - globalCount,
     ),
   )
   info.push(tPlain('Scripting engines installed:'))
@@ -2996,12 +3107,15 @@ export function AutomationManagerDialog({
   onAdd,
   onRemove,
   onReload,
+  onRescan,
+  onHelp,
   onClose,
 }: AutomationManagerDialogProps) {
   // wxLC_SINGLE_SEL：单选，工具栏按钮按选中态启用（dialog_automation.cpp UpdateDisplay：
-  // Remove 仅对有选中项可用——web 全部为本地脚本；Reload 有选中项即可）
+  // Remove 仅对本地脚本可用；Reload 有选中项即可）
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const selected = scripts.find((script) => script.id === selectedId) ?? null
+  const selectedLocal = Boolean(selected && !selected.isGlobal)
   // Show Info 点击时捕获当前选中（web 偏差：用内嵌面板替代桌面的 wxMessageBox 模态框）
   const [info, setInfo] = useState<{ script: AutomationScriptInfo | null } | null>(null)
   return (
@@ -3011,13 +3125,15 @@ export function AutomationManagerDialog({
       footer={
         <>
           <button onClick={onAdd}>{tPlain('&Add')}</button>
-          <button disabled={!selected} onClick={() => selected && onRemove(selected.id)}>
+          <button disabled={!selectedLocal} onClick={() => selected && onRemove(selected.id)}>
             {tPlain('&Remove')}
           </button>
           <button disabled={!selected} onClick={() => selected && onReload(selected.id)}>
             {tPlain('Re&load')}
           </button>
           <button onClick={() => setInfo({ script: selected })}>{tPlain('Show &Info')}</button>
+          <button onClick={onRescan}>{tPlain('Re&scan Autoload Dir')}</button>
+          <button onClick={onHelp}>{tPlain('&Help')}</button>
           <button onClick={onClose}>{tPlain('&Close')}</button>
         </>
       }
@@ -3052,7 +3168,7 @@ export function AutomationManagerDialog({
             key={script.id}
             onClick={() => setSelectedId(script.id)}
           >
-            <span>L</span>
+            <span>{script.isGlobal ? 'G' : 'L'}</span>
             <span title={script.macros.map((macro) => macro.name).join(', ')}>
               {script.name}
               {script.macros.length > 0 && (
@@ -3682,11 +3798,28 @@ export function TimingProcessorDialog({
 // ---------------------------------------------------------------------------
 // Export Subtitles（对应 Aegisub dialog_export.cpp 的 Web 版子集）
 // ---------------------------------------------------------------------------
+/** Transform Framerate 内置过滤器的配置（export_framerate.cpp 的配置面板） */
+export interface FramerateFilterSettings {
+  /** 用户输入的文本（解析失败时按默认值处理） */
+  inputFps: string
+  /** Variable = 使用当前工程 timecodes；Constant = 输出固定帧率 */
+  outputMode: 'variable' | 'cfr'
+  outputFps: string
+  reverse: boolean
+}
+
 export interface ExportOptions {
   format: SubtitleFormat
   includeComments: boolean
   /** 勾选的导出过滤器（当前列表序 = 执行顺序，见 AssExporter::AddFilter/Export） */
   filters: AutomationFilterDisplayInfo[]
+  /** 勾选了 Transform Framerate 时的配置 */
+  framerate?: FramerateFilterSettings
+}
+
+/** 默认帧率文本：对齐 wxTextCtrl 的 %g / %2.3f 观感（最多 3 位小数、去尾零） */
+function framerateText(fps: number): string {
+  return String(Number(fps.toFixed(3)))
 }
 
 /** 导出格式列表（subtitle_format.cpp 的可写格式；EBU/Encore/TranStation 仅写出） */
@@ -3707,6 +3840,13 @@ interface ExportSubtitlesDialogProps {
   filters: AutomationFilterDisplayInfo[]
   /** 初始勾选（文档 [Aegisub Project Garbage] 的 Export Filters，按展示名匹配） */
   initialSelected: string[]
+  /** Transform Framerate 配置初值（LoadSettings(true)：输入=视频帧率/工程帧率，输出=工程帧率） */
+  framerateDefaults: {
+    inputFps: number
+    outputFps: number
+    outputVariable: boolean
+    hasVideo: boolean
+  }
   onConfigure: (filter: AutomationFilterDisplayInfo) => void
   onClose: () => void
   onApply: (options: ExportOptions) => void
@@ -3715,6 +3855,7 @@ interface ExportSubtitlesDialogProps {
 export function ExportSubtitlesDialog({
   filters,
   initialSelected,
+  framerateDefaults,
   onConfigure,
   onClose,
   onApply,
@@ -3725,7 +3866,20 @@ export function ExportSubtitlesDialog({
   const [order, setOrder] = useState<AutomationFilterDisplayInfo[]>(filters)
   const [checked, setChecked] = useState<Set<string>>(() => new Set(initialSelected))
   const [selected, setSelected] = useState<string | null>(null)
+  // Transform Framerate 配置（export_framerate.cpp：输入/输出帧率 + 反向）
+  const [framerateInput, setFramerateInput] = useState(() =>
+    framerateText(framerateDefaults.inputFps),
+  )
+  const [framerateOutputMode, setFramerateOutputMode] = useState<'variable' | 'cfr'>(() =>
+    framerateDefaults.outputVariable ? 'variable' : 'cfr',
+  )
+  const [framerateOutput, setFramerateOutput] = useState(() =>
+    framerateText(framerateDefaults.outputFps),
+  )
+  const [framerateReverse, setFramerateReverse] = useState(false)
   const selectedFilter = order.find((item) => item.displayName === selected) ?? null
+  const transformFilter = order.find((item) => item.builtin === 'transform_framerate')
+  const transformChecked = transformFilter ? checked.has(transformFilter.displayName) : false
 
   // swap(list, idx, sel_dir)（dialog_export.cpp:87）：选中项移动一格并保持选中
   const move = (delta: -1 | 1) => {
@@ -3758,6 +3912,14 @@ export function ExportSubtitlesDialog({
                 format,
                 includeComments,
                 filters: order.filter((item) => checked.has(item.displayName)),
+                framerate: transformChecked
+                  ? {
+                      inputFps: framerateInput,
+                      outputMode: framerateOutputMode,
+                      outputFps: framerateOutput,
+                      reverse: framerateReverse,
+                    }
+                  : undefined,
               })
             }
           >
@@ -3788,7 +3950,7 @@ export function ExportSubtitlesDialog({
                   checked={checked.has(filter.displayName)}
                   onChange={(event) => toggle(filter.displayName, event.target.checked)}
                 />
-                <span>{filter.displayName}</span>
+                <span>{filter.builtin ? tPlain(filter.displayName) : filter.displayName}</span>
               </div>
             ))}
           </div>
@@ -3803,7 +3965,13 @@ export function ExportSubtitlesDialog({
           <textarea
             className="export-filter-description"
             readOnly
-            value={selectedFilter?.description ?? ''}
+            value={
+              selectedFilter
+                ? selectedFilter.builtin
+                  ? tPlain(selectedFilter.description)
+                  : selectedFilter.description
+                : ''
+            }
           />
           <button
             className="export-filter-configure"
@@ -3815,6 +3983,61 @@ export function ExportSubtitlesDialog({
             {tPlain('Configure')}
           </button>
         </fieldset>
+        {transformChecked && (
+          <fieldset className="dialog-fieldset export-framerate-settings">
+            <legend>{tPlain('Transform Framerate')}</legend>
+            <label className="dialog-field-row">
+              <span>{tPlain('Input framerate:')}</span>
+              <input
+                type="text"
+                value={framerateInput}
+                onChange={(event) => setFramerateInput(event.target.value)}
+              />
+              <button
+                disabled={!framerateDefaults.hasVideo}
+                onClick={() => setFramerateInput(framerateText(framerateDefaults.inputFps))}
+              >
+                {tPlain('From &video')}
+              </button>
+            </label>
+            <div className="dialog-field-row">
+              <span>{tPlain('Output:')}</span>
+              <label className="dialog-check">
+                <input
+                  type="radio"
+                  name="export-framerate-output"
+                  disabled={!framerateDefaults.outputVariable}
+                  checked={framerateOutputMode === 'variable'}
+                  onChange={() => setFramerateOutputMode('variable')}
+                />
+                {tPlain('V&ariable')}
+              </label>
+              <label className="dialog-check">
+                <input
+                  type="radio"
+                  name="export-framerate-output"
+                  checked={framerateOutputMode === 'cfr'}
+                  onChange={() => setFramerateOutputMode('cfr')}
+                />
+                {tPlain('&Constant:')}
+                <input
+                  type="text"
+                  value={framerateOutput}
+                  disabled={framerateOutputMode === 'variable'}
+                  onChange={(event) => setFramerateOutput(event.target.value)}
+                />
+              </label>
+            </div>
+            <label className="dialog-check">
+              <input
+                type="checkbox"
+                checked={framerateReverse}
+                onChange={(event) => setFramerateReverse(event.target.checked)}
+              />
+              {tPlain('&Reverse transformation')}
+            </label>
+          </fieldset>
+        )}
         <fieldset className="dialog-fieldset">
           <legend>{tPlain('Format')}</legend>
           {EXPORT_FORMAT_CHOICES.map((choice) => (

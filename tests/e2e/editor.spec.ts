@@ -13,17 +13,36 @@ test('loads the editing workspace and renders the active subtitle', async ({ pag
     page.getByLabel('Subtitle lines').getByText('Rendered preview', { exact: true }),
   ).toBeVisible()
 
-  const nonBlankPixels = await page
-    .locator('.subtitle-overlay')
-    .evaluate((canvas: HTMLCanvasElement) => {
-      const context = canvas.getContext('2d')
-      if (!context) return 0
-      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data
-      let count = 0
-      for (let index = 3; index < pixels.length; index += 4) if (pixels[index] > 0) count += 1
-      return count
-    })
-  expect(nonBlankPixels).toBeGreaterThan(50)
+  // 字幕渲染器是 JASSUB（libass），无视频时不渲染预览（与 Aegisub 一致）；
+  // 用 Dummy Video 提供视频区后再断言 libass 画面确实画出了字形
+  await page.getByRole('menuitem', { name: 'Video', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Use Dummy Video...' }).click()
+  const dummyDialog = page.getByRole('dialog', { name: 'Dummy video options' })
+  await expect(dummyDialog).toBeVisible()
+  await dummyDialog.getByRole('button', { name: 'OK' }).click()
+
+  // JASSUB 的画布已 transferControlToOffscreen，主线程不能直接 getImageData；
+  // 用 drawImage 取样到临时 2D 画布统计不透明像素（渲染是异步的，轮询等待）
+  const overlay = page.locator('.jassub-canvas')
+  await expect(overlay).toBeVisible()
+  await expect
+    .poll(
+      () =>
+        overlay.evaluate((source: HTMLCanvasElement) => {
+          const probe = document.createElement('canvas')
+          probe.width = Math.max(1, source.width)
+          probe.height = Math.max(1, source.height)
+          const context = probe.getContext('2d')
+          if (!context) return 0
+          context.drawImage(source, 0, 0)
+          const pixels = context.getImageData(0, 0, probe.width, probe.height).data
+          let count = 0
+          for (let index = 3; index < pixels.length; index += 4) if (pixels[index] > 0) count += 1
+          return count
+        }),
+      { timeout: 15000 },
+    )
+    .toBeGreaterThan(50)
 })
 
 test('opens native-style menus and executes Aegisub shortcuts', async ({ page }) => {

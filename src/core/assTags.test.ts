@@ -28,11 +28,11 @@ describe('parseBlocks', () => {
     ])
   })
 
-  it('treats unclosed override as plain text', () => {
-    // 源码 goto plain 后仍按"到下一个 { 或结尾"切分：'{\b1' 自成一块
+  it('treats unclosed override as an override block (libass semantics)', () => {
+    // libass 未闭合的 { 延续到行尾，仍按 override 块解析（不补 }）
     expect(parseBlocks('a{\\b1')).toEqual([
       { type: 'plain', text: 'a' },
-      { type: 'plain', text: '{\\b1' },
+      { type: 'override', text: '{\\b1', tags: [{ name: '\\b', params: '1' }] },
     ])
   })
 

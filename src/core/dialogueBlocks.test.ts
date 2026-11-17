@@ -31,9 +31,12 @@ describe('parseDialogueBlocks（AssDialogue::ParseTags）', () => {
     expect(parseDialogueBlocks('')).toEqual([plain('')])
   })
 
-  it('未闭合的 { 按纯文本处理（VSFilter 语义）', () => {
+  it('未闭合的 { 延续到行尾（libass 语义）', () => {
     // find('{', cur + 1) 跳过当前位置，故 "a" 与 "{\\i1 b" 各成一块
-    expect(parseDialogueBlocks('a{\\i1 b')).toEqual([plain('a'), plain('{\\i1 b')])
+    expect(parseDialogueBlocks('a{\\i1 b')).toEqual([
+      plain('a'),
+      { type: 'override', text: '{\\i1 b' },
+    ])
   })
 
   it('\\p 后的花括号外文本为 drawing 块，\\p0 恢复 plain', () => {

@@ -3,8 +3,9 @@ import { useEffect, useRef, useState } from 'react'
 import { getOptionString, setOption } from '../../config/options'
 import type { SubtitleStyle } from '../../core/types'
 import { listFontFaces } from '../../storage/fontStore'
-import { assColorToCss, assColorToHex, cssColorToHex, hexToAssColor, hexToCssColor } from '../color'
+import { assColorToCss } from '../color'
 import { tPlain } from '../i18n'
+import { ColorButton } from './ColorPickerDialog'
 import { useEscapeClose } from './dialogs'
 
 /**
@@ -291,13 +292,11 @@ export function StyleEditorDialog({
                 {COLORS.map(([key, label, tip]) => (
                   <label key={key} className="style-color-field" title={tPlain(tip)}>
                     {tPlain(label)}
-                    <span style={{ background: assColorToCss(draft[key]) }} />
-                    <input
-                      type="color"
-                      value={assColorToHex(draft[key])}
-                      onChange={(event) =>
-                        patch(key, hexToAssColor(event.target.value, draft[key]))
-                      }
+                    <ColorButton
+                      value={draft[key]}
+                      alpha
+                      title={tPlain(label)}
+                      onChange={(value) => patch(key, value)}
                     />
                   </label>
                 ))}
@@ -427,13 +426,12 @@ export function StyleEditorDialog({
                   aria-label={tPlain('Preview text')}
                   onChange={(event) => setPreviewText(event.target.value)}
                 />
-                <input
-                  type="color"
+                <ColorButton
+                  format="css"
+                  alpha={false}
                   title={tPlain('Color of preview background')}
-                  aria-label={tPlain('Color of preview background')}
-                  value={cssColorToHex(previewBg)}
-                  onChange={(event) => {
-                    const value = hexToCssColor(event.target.value)
+                  value={previewBg}
+                  onChange={(value) => {
                     setPreviewBg(value)
                     // 源码 OnPreviewColourChange：即时 OPT_SET
                     setOption('Colour/Style Editor/Background/Preview', value)
