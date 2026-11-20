@@ -2034,6 +2034,8 @@ export function PreviewPane({
   const mouseStagePxRef = useRef<{ x: number; y: number } | null>(null)
   const mouseShiftRef = useRef(false)
   const mouseOnStageRef = useRef(false)
+  // 外接鼠标/笔的悬停位置：手机也能接键鼠，触摸抬指/双指手势不能把指针 hover 一起清掉
+  const fineHoverRef = useRef<{ clientX: number; clientY: number; shift: boolean } | null>(null)
   // 视觉工具拖拽进行中 → 文档同步走 flushNow 即时渲染（源码每次鼠标事件 Commit+Render）
   const visualDragRef = useRef(false)
   // 视觉工具点击（visual_tool.cpp OnMouseEvent）：记录本次按下命中的特征行与「按下时是否
@@ -2154,6 +2156,11 @@ export function PreviewPane({
   const panRef = useRef(pan)
   const contentZoomRef = useRef(contentZoom)
   const middleDragRef = useRef<{ x: number; y: number } | null>(null)
+  // ---- 触摸屏手势：双指缩放/平移（触摸屏没有滚轮和中键） ----
+  /** 当前按在视频区上的触摸指针（pointerId → 客户区坐标） */
+  const touchPointersRef = useRef(new Map<number, { x: number; y: number }>())
+  /** 双指手势基准：两指距离与中心点（null = 未进入双指手势） */
+  const touchGestureRef = useRef<{ distance: number; cx: number; cy: number } | null>(null)
   useEffect(() => {
     panRef.current = pan
     contentZoomRef.current = contentZoom
@@ -2197,6 +2204,23 @@ export function PreviewPane({
       width: Math.max(1, rect.width),
       height: Math.max(1, rect.height),
     }
+  }
+
+  /** 记录指针在舞台像素/视频脚本坐标下的位置（十字线、copy_coordinates 的数据源） */
+  const trackMousePosition = (clientX: number, clientY: number, shiftKey: boolean) => {
+    const stage = stageRef.current
+    if (!stage) return
+    const bounds = stage.getBoundingClientRect()
+    const rect = mediaRect()
+    const playResY = Number(document.scriptInfo.PlayResY) || 1080
+    const playResX = Number(document.scriptInfo.PlayResX) || Math.round((playResY * 16) / 9)
+    mouseStagePxRef.current = { x: clientX - bounds.left, y: clientY - bounds.top }
+    mousePosRef.current = {
+      x: ((clientX - bounds.left - rect.left) / rect.width) * playResX,
+      y: ((clientY - bounds.top - rect.top) / rect.height) * playResY,
+    }
+    mouseShiftRef.current = shiftKey
+    mouseOnStageRef.current = true
   }
 
   /** 透视工具的坐标换算环境：显示像素 = 相对视频舞台的 CSS 像素 */
@@ -4298,10 +4322,18 @@ export function PreviewPane({
   }
 
   const canvasPointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    // 双指手势进行中：第二根手指不再触发视觉工具（由舞台的捕获阶段处理器接管）
+    if (event.pointerType === 'touch' && touchGestureRef.current) return
     // 任何一次按下都开新提交组（源码 VisualTool::OnMouseEvent 末尾"左键未按住即 commit_id = -1"）
     dragAmendRef.current = false
     // 源码视觉工具只响应左键；中键留给拖动平移，右键留给上下文菜单
     if (event.button !== 0) return
+    // 触摸屏没有 hover：按下即等同鼠标指针移到该处（十字工具显示十字线/坐标，抬起时清除）
+    if (event.pointerType === 'touch') {
+      trackMousePosition(event.clientX, event.clientY, event.shiftKey)
+      if (visualTool === 'video/tool/cross' || visualTool === 'video/tool/rotate/z')
+        scheduleOverlayRender()
+    }
     visualDragRef.current = true
     if (visualTool === 'video/tool/vector_clip') {
       vclipPointerDown(event)
@@ -4385,11 +4417,20 @@ export function PreviewPane({
   }
 
   const canvasPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    // 双指手势期间不驱动视觉工具（缩放/平移由舞台处理）
+    if (event.pointerType === 'touch' && touchGestureRef.current) return
     // 鼠标状态跟踪（十字/旋转工具 Draw 的输入）：相对 overlay 的像素位置、Shift 状态、在台上
     const bounds = event.currentTarget.getBoundingClientRect()
     mouseStagePxRef.current = { x: event.clientX - bounds.left, y: event.clientY - bounds.top }
     mouseShiftRef.current = event.shiftKey
     mouseOnStageRef.current = true
+    // 记录外接鼠标/笔的悬停位置：触摸操作结束后据此恢复指针 hover（手机可接键鼠）
+    if (event.pointerType !== 'touch')
+      fineHoverRef.current = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+        shift: event.shiftKey,
+      }
     // 源码每次鼠标事件后 Render：Draw 含 mouse_pos 的工具都要随移动实时重绘
     // （visual_tool_cross.cpp 十字线、visual_tool_rotatez.cpp 原点→鼠标连线）
     if (visualTool === 'video/tool/cross' || visualTool === 'video/tool/rotate/z')
@@ -4623,6 +4664,86 @@ export function PreviewPane({
     // in a single drag"：OnMouseEvent 末尾左键未按住即 commit_id = -1）。必须放在 vclip/透视的
     // 拖拽收尾提交之后，否则松手时的最后一次提交会被误判为"新拖拽起点"而多出一个撤销点
     dragAmendRef.current = false
+    // 触摸没有 hover：抬指/取消后清除十字线（等同鼠标离开视频区）。
+    // 但手机可外接键鼠——若鼠标/笔正悬停在视频上，则恢复其 hover，不能丢
+    if (event.pointerType === 'touch') {
+      const hover = fineHoverRef.current
+      if (hover) trackMousePosition(hover.clientX, hover.clientY, hover.shift)
+      else {
+        mouseOnStageRef.current = false
+        mouseStagePxRef.current = null
+      }
+      if (visualTool === 'video/tool/cross' || visualTool === 'video/tool/rotate/z')
+        scheduleOverlayRender()
+    }
+  }
+
+  // ---- 触摸屏手势（video_display.cpp 的滚轮缩放/中键拖动在触摸屏上的等价操作）----
+  /** 单指落下 = hover；第二根手指落下 = 中止视觉工具并进入双指手势 */
+  const startTouchPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType !== 'touch' || !hasVideo) return
+    touchPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    if (touchPointersRef.current.size !== 2) return
+    // 中止第一根手指可能已启动的视觉工具拖拽（双指期间不再编辑字幕）
+    dragRef.current = null
+    visualClickRef.current = null
+    visualDragRef.current = false
+    if (vclipRef.current && (vclipRef.current.dragStart || vclipRef.current.boxStart))
+      setVclip({ ...vclipRef.current, dragStart: null, boxStart: null, dragOriginal: new Map() })
+    if (perspRef.current?.dragging) {
+      perspRef.current.dragging = false
+      perspRef.current.active = null
+      perspRef.current.dragStart = null
+      setPersp({ ...perspRef.current })
+    }
+    // 十字线不跟随双指
+    mouseOnStageRef.current = false
+    mouseStagePxRef.current = null
+    scheduleOverlayRender()
+    const [a, b] = [...touchPointersRef.current.values()]
+    touchGestureRef.current = {
+      distance: Math.hypot(a.x - b.x, a.y - b.y),
+      cx: (a.x + b.x) / 2,
+      cy: (a.y + b.y) / 2,
+    }
+    // 捕获所有触摸指针：移出视频区也能持续收到 move/up
+    const stage = stageRef.current
+    if (stage) {
+      for (const pointerId of touchPointersRef.current.keys()) {
+        try {
+          stage.setPointerCapture(pointerId)
+        } catch {
+          // 指针已结束：忽略
+        }
+      }
+    }
+  }
+
+  /** 双指：开合 = 以两指中心为锚点缩放内容（同 Ctrl+滚轮），整体移动 = 平移画面（同中键拖动） */
+  const moveTouchPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType !== 'touch') return
+    const pointers = touchPointersRef.current
+    if (!pointers.has(event.pointerId)) return
+    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    const gesture = touchGestureRef.current
+    if (!gesture || pointers.size < 2) return
+    event.preventDefault()
+    const [a, b] = [...pointers.values()]
+    const distance = Math.hypot(a.x - b.x, a.y - b.y)
+    const cx = (a.x + b.x) / 2
+    const cy = (a.y + b.y) / 2
+    if (gesture.distance > 0 && distance > 0)
+      zoomContentAt(contentZoomRef.current * (distance / gesture.distance), cx, cy)
+    panBy(cx - gesture.cx, cy - gesture.cy)
+    gesture.distance = distance
+    gesture.cx = cx
+    gesture.cy = cy
+  }
+
+  const endTouchPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType !== 'touch') return
+    touchPointersRef.current.delete(event.pointerId)
+    if (touchPointersRef.current.size < 2) touchGestureRef.current = null
   }
 
   // ---- video_context 命令（video_display.cpp 右键菜单）----
@@ -4917,6 +5038,10 @@ export function PreviewPane({
                 } as CSSProperties)
               : undefined
           }
+          onPointerDownCapture={startTouchPointer}
+          onPointerMoveCapture={moveTouchPointer}
+          onPointerUpCapture={endTouchPointer}
+          onPointerCancelCapture={endTouchPointer}
           onPointerDown={(event) => {
             // video_display.cpp OnMouseEvent：按住中键拖动平移视频画面（Pan(位置差)）
             if (event.button !== 1 || !hasVideo) return
@@ -4925,6 +5050,8 @@ export function PreviewPane({
             event.currentTarget.setPointerCapture(event.pointerId)
           }}
           onPointerMove={(event) => {
+            // 双指手势期间不更新鼠标位置/平移（手势由捕获阶段处理）
+            if (touchGestureRef.current) return
             const drag = middleDragRef.current
             if (drag && event.buttons & 4) {
               panBy(event.clientX - drag.x, event.clientY - drag.y)
@@ -5105,10 +5232,21 @@ export function PreviewPane({
             onPointerMove={canvasPointerMove}
             onPointerUp={canvasPointerUp}
             onPointerCancel={canvasPointerUp}
-            onPointerLeave={() => {
-              // 鼠标离开视频区：清除十字工具状态并重绘擦除（源码 mouse_pos 清空）
-              mouseOnStageRef.current = false
-              mouseStagePxRef.current = null
+            onPointerLeave={(event) => {
+              // 鼠标/笔离开视频区：清除十字工具状态并重绘擦除（源码 mouse_pos 清空）；
+              // 触摸抬指产生的 leave 不影响外接键鼠的 hover（手机可接键鼠）
+              if (event.pointerType === 'touch') {
+                const hover = fineHoverRef.current
+                if (hover) trackMousePosition(hover.clientX, hover.clientY, hover.shift)
+                else {
+                  mouseOnStageRef.current = false
+                  mouseStagePxRef.current = null
+                }
+              } else {
+                fineHoverRef.current = null
+                mouseOnStageRef.current = false
+                mouseStagePxRef.current = null
+              }
               if (visualTool === 'video/tool/cross' || visualTool === 'video/tool/rotate/z')
                 renderOverlay()
             }}

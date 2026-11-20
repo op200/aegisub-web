@@ -549,6 +549,16 @@ export function SubtitleGrid({
   // 拖动块选（base_grid.cpp holding 状态：锚点行 + 上次停留行）
   const dragRef = useRef<{ anchorIndex: number; anchorId: string } | null>(null)
   const dragLastRowRef = useRef(-1)
+  // 触摸拖动滚动：触摸屏没有滚轮，单指拖动 = 滚动列表（水平+垂直），轻点 = 选择行
+  const touchDragRef = useRef<{
+    pointerId: number
+    startX: number
+    startY: number
+    scrollTop: number
+    scrollLeft: number
+    moved: boolean
+    cueId: string
+  } | null>(null)
   // 滚动条滑块拖动（源码由 wxScrollBar 自身处理 thumb track 拖动）
   const thumbDragRef = useRef<{ startY: number; startTop: number } | null>(null)
 
@@ -827,6 +837,12 @@ export function SubtitleGrid({
     // oxlint-disable-next-line react-hooks/exhaustive-deps -- localeVersion 仅为触发列宽重算
     [cues, frameRate, frameMode, localeVersion],
   )
+  // 填充列（Text）自身的最小宽：窗口窄于全部列宽时让内容整体宽出视口，
+  // 由移动端 .subtitle-grid-scroll 的横向滚动查看，而不是把右侧文本列裁掉
+  const fillMinWidth = GRID_COLUMNS.reduce(
+    (sum, column) => (column.fill ? sum + column.width : sum),
+    0,
+  )
   const isHidden = (column: GridColumnDef, index: number) =>
     hiddenColumns.has(column.key) || (!column.fill && widths[index] === 0)
   const cellStyle = (column: GridColumnDef, index: number) =>
@@ -915,6 +931,18 @@ export function SubtitleGrid({
   }
 
   const endDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    // 触摸拖动结束：未移动则视为轻点选择；移动过则仅结束滚动
+    const touch = touchDragRef.current
+    if (touch && touch.pointerId === event.pointerId) {
+      touchDragRef.current = null
+      if (event.currentTarget.hasPointerCapture(event.pointerId))
+        event.currentTarget.releasePointerCapture(event.pointerId)
+      if (event.type === 'pointerup' && !touch.moved) {
+        const cue = cues.find((item) => item.id === touch.cueId)
+        if (cue) onSelect(cue.id, { toggle: false, range: false })
+      }
+      return
+    }
     const drag = dragRef.current
     dragRef.current = null
     if (!drag) return
@@ -940,6 +968,23 @@ export function SubtitleGrid({
     // 只在行上起效（点空白/滚动条不改变选区，同源码 dlg 为空时跳过）
     const target = event.target as HTMLElement
     if (!target.closest('.subtitle-row')) return
+    // 触摸屏（JS 滚动模式）：不立即选择，按下后拖动 = 滚动列表，轻点 = 选择
+    if (event.pointerType === 'touch' && !nativeScroll) {
+      const index = rowFromClientY(event.clientY)
+      const cue = cues[index]
+      if (!cue) return
+      touchDragRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        scrollTop: getScrollTop(),
+        scrollLeft: scrollHostRef.current?.scrollLeft ?? 0,
+        moved: false,
+        cueId: cue.id,
+      }
+      event.currentTarget.setPointerCapture(event.pointerId)
+      return
+    }
     const index = rowFromClientY(event.clientY)
     const cue = cues[index]
     if (!cue) return
@@ -969,6 +1014,19 @@ export function SubtitleGrid({
   }
 
   const onViewportPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    // 触摸拖动：同时滚动垂直（JS 虚拟滚动偏移）与水平（外层滚动容器）
+    const touch = touchDragRef.current
+    if (touch && touch.pointerId === event.pointerId) {
+      const dx = event.clientX - touch.startX
+      const dy = event.clientY - touch.startY
+      if (!touch.moved && Math.hypot(dx, dy) < 6) return
+      touch.moved = true
+      event.preventDefault()
+      setScroll(touch.scrollTop - dy)
+      const host = scrollHostRef.current
+      if (host) host.scrollLeft = touch.scrollLeft - dx
+      return
+    }
     const drag = dragRef.current
     if (!drag) return
     // holding 期间行号钳制到合法范围（源码 mid(0, row, GetRows()-1)）
@@ -1041,7 +1099,7 @@ export function SubtitleGrid({
       <div className="subtitle-grid-scroll" ref={scrollHostRef}>
         <div
           className="subtitle-grid-minwidth"
-          style={{ minWidth: fixedWidth, fontFamily: gridFontFamily() }}
+          style={{ minWidth: fixedWidth + fillMinWidth, fontFamily: gridFontFamily() }}
         >
           {/* 源码 base_grid.cpp 无任何 SetToolTip：网格文本单元格与表头的 hover 提示已移除；
               列 description 仅用于表头右键「列显隐」菜单项文案 */}
@@ -1076,8 +1134,10 @@ export function SubtitleGrid({
             onPointerCancel={endDrag}
             onDoubleClick={onViewportDoubleClick}
             onPointerDownCapture={() => {
-              // Subtitle/Grid/Focus Allow：关闭时点击不夺取焦点（基_grid FocusGrid）
-              if (getOptionBool('Subtitle/Grid/Focus Allow')) viewportRef.current?.focus()
+              // Subtitle/Grid/Focus Allow：关闭时点击不夺取焦点（基_grid FocusGrid）；
+              // preventScroll：触摸点行时不应连带滚动页面（焦点由触摸产生，不是键盘导航）
+              if (getOptionBool('Subtitle/Grid/Focus Allow'))
+                viewportRef.current?.focus({ preventScroll: true })
             }}
             onKeyDown={moveByKeyboard}
             onScroll={(event) => {
@@ -1226,30 +1286,28 @@ export function SubtitleGrid({
             )}
           </svg>
         </div>
-        {/* 常驻竖向滚动条（base_grid.cpp 的 wxScrollBar：全高、rows<=1 时置灰） */}
+      </div>
+      {/* 常驻竖向滚动条（base_grid.cpp 的 wxScrollBar：全高、rows<=1 时置灰）。
+          放在滚动容器外：移动端字幕栏可横向滚动，滚动条不随内容左右移动 */}
+      <div className={`grid-scrollbar${scrollGeom.enabled ? '' : ' disabled'}`} aria-hidden="true">
         <div
-          className={`grid-scrollbar${scrollGeom.enabled ? '' : ' disabled'}`}
-          aria-hidden="true"
-        >
+          className="grid-scrollbar-btn up"
+          onPointerDown={() => scrollToPos(Math.round(getScrollTop() / rowHeight) - 1)}
+        />
+        <div className="grid-scrollbar-track" onPointerDown={onTrackPointerDown}>
           <div
-            className="grid-scrollbar-btn up"
-            onPointerDown={() => scrollToPos(Math.round(getScrollTop() / rowHeight) - 1)}
-          />
-          <div className="grid-scrollbar-track" onPointerDown={onTrackPointerDown}>
-            <div
-              className="grid-scrollbar-thumb"
-              style={{ top: scrollGeom.thumbTop, height: scrollGeom.thumbHeight }}
-              onPointerDown={onThumbPointerDown}
-              onPointerMove={onThumbPointerMove}
-              onPointerUp={onThumbPointerUp}
-              onPointerCancel={onThumbPointerUp}
-            />
-          </div>
-          <div
-            className="grid-scrollbar-btn down"
-            onPointerDown={() => scrollToPos(Math.round(getScrollTop() / rowHeight) + 1)}
+            className="grid-scrollbar-thumb"
+            style={{ top: scrollGeom.thumbTop, height: scrollGeom.thumbHeight }}
+            onPointerDown={onThumbPointerDown}
+            onPointerMove={onThumbPointerMove}
+            onPointerUp={onThumbPointerUp}
+            onPointerCancel={onThumbPointerUp}
           />
         </div>
+        <div
+          className="grid-scrollbar-btn down"
+          onPointerDown={() => scrollToPos(Math.round(getScrollTop() / rowHeight) + 1)}
+        />
       </div>
 
       {headerMenu && (

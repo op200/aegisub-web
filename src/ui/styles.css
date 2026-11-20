@@ -488,6 +488,8 @@ button:disabled {
   height: var(--viewport-height, 100%);
   justify-self: start;
   align-self: start;
+  /* 触摸屏：视频区自己处理单指/双指手势，禁止浏览器滚动/缩放抢走触摸 */
+  touch-action: none;
 }
 .video-stage video {
   width: 100%;
@@ -500,6 +502,11 @@ button:disabled {
   position: absolute;
   inset: 0;
   display: grid;
+  /* 显式 100% 轨道：媒体放大到超出舞台时仍按中心对齐（负溢出），
+     否则 grid 的隐式轨道会被内容撑大、把媒体改为左上对齐，
+     导致缩放比例不同时画面/字幕整体位置跳变，也会破坏 ZoomAndPan 的锚点计算 */
+  grid-template-columns: 100%;
+  grid-template-rows: 100%;
   place-items: center;
 }
 .video-zoom-stage > video,
@@ -1346,6 +1353,8 @@ button:disabled {
 }
 
 .grid-panel {
+  /* 竖向滚动条是 .grid-panel 的绝对定位子项（在横向滚动容器之外） */
+  position: relative;
   width: 100%;
   min-width: 0;
   min-height: 0;
@@ -1353,7 +1362,8 @@ button:disabled {
   background: var(--control);
 }
 .subtitle-grid-scroll {
-  /* Aegisub 网格无横向滚动条：列超出窗口时被裁剪；
+  /* Aegisub 网格无横向滚动条：列超出窗口时被裁剪；移动端例外（@media max-aspect-ratio:9/10
+     打开 overflow-x，可横向滚动查看窄屏放不下的文本列）；
      右侧 15px 常驻竖向滚动条（base_grid.cpp AdjustScrollbar：scrollBar 定位在
      clientWidth - scrollbarWidth、高为整个网格高度；绘制时 w -= scrollbarWidth） */
   position: relative;
@@ -1459,6 +1469,8 @@ button:disabled {
      滚动操作全部走 JS（无原生滚动/吸附动画） */
   overflow: hidden;
   position: relative;
+  /* 触摸屏：行区域接管单指手势（拖动=滚动列表，轻点=选择），不让浏览器抢去滚页面 */
+  touch-action: none;
 }
 /* 可选：浏览器原生滚动（Subtitle/Grid/Native Scroll 打开时）。整行吸附依赖 scroll-snap，
    top 永远整行对齐；不在 scroll 事件里改写 scrollTop，避免与惯性滚动动画互相打架 */
@@ -1467,6 +1479,8 @@ button:disabled {
   overflow-x: hidden;
   scroll-snap-type: y mandatory;
   scroll-behavior: auto;
+  /* 原生滚动模式交还浏览器处理竖向拖动 */
+  touch-action: pan-y;
   /* 原生滚动条隐藏：滚动条由 .grid-scrollbar 自绘（源码为常驻 wxScrollBar） */
   scrollbar-width: none;
 }
@@ -2806,7 +2820,9 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 900px) {
+/* 竖屏布局按视口宽高比判定（宽:高 ≤ 9:10），不再用固定宽度：
+   宽高比 > 9:10（横向/接近方形）走普通桌面布局，更“高”的窗口走竖屏堆叠布局 */
+@media (max-aspect-ratio: 9/10) {
   html,
   body,
   #root {
@@ -2816,6 +2832,12 @@ button:disabled {
   }
   .app-shell,
   .app-shell.toolbar-hidden {
+    /* 竖屏各面板高度的相对基准：随视口高度（dvh）缩放，不再用固定 px。
+       小屏（320×568）取最小值保证可用，大屏（平板）按比例给足视频/编辑区 */
+    --mobile-video-height: clamp(240px, 33dvh, 360px);
+    --mobile-grid-height: clamp(360px, 47dvh, 520px);
+    --mobile-audio-height: clamp(110px, 14dvh, 180px);
+    --mobile-editor-height: clamp(130px, 16dvh, 180px);
     height: auto;
     min-height: 100dvh;
     display: flex;
@@ -2829,6 +2851,9 @@ button:disabled {
     overflow-y: hidden;
   }
   .menu-list {
+    /* 触控友好：菜单项在整条菜单栏宽度内 space-between 均匀铺开 */
+    width: 100%;
+    justify-content: space-between;
     height: 30px;
   }
   .menu-trigger {
@@ -2846,12 +2871,32 @@ button:disabled {
     overflow-x: auto;
   }
   .toolbar {
-    height: 42px;
-    flex: 0 0 42px;
+    /* 窄屏完整显示全部工具栏按钮：分组换行而不是横向滚动/裁切 */
+    height: auto;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+    align-content: flex-start;
+    /* 触控友好：每组按钮在行内均匀铺开，末行也贴满整宽，减少相邻图标误触 */
+    justify-content: space-between;
+    overflow: visible;
+    /* 竖屏紧凑：缩小按钮栏内边距与分组间距 */
+    padding: 1px 2px;
+  }
+  .toolbar-cluster {
+    /* 触控：分组盒不参与布局，按钮直接成为工具栏的 flex 子项，
+       由 .toolbar 的 space-between 在每一行均匀铺开（分组分隔线在竖屏下省略） */
+    display: contents;
   }
   .tool-button {
-    width: 34px;
-    height: 34px;
+    /* 按钮与图标之间的留白随屏幕宽度收紧（320px 宽约 2.5px/边，900px 宽恢复 5px/边）；
+       尺寸基于图标尺寸而非固定 30px，大图标（Toolbar Icon Size）不会被裁切 */
+    width: calc(var(--icon-size, 16px) + clamp(5px, 1vw, 10px));
+    height: calc(var(--icon-size, 16px) + clamp(5px, 1vw, 10px));
+  }
+  .visual-tool,
+  .audio-tool {
+    width: calc(var(--icon-size, 16px) + clamp(6px, 1.1vw, 11px));
+    height: calc(var(--icon-size, 16px) + clamp(6px, 1.1vw, 11px));
   }
   .workspace {
     display: flex;
@@ -2862,27 +2907,68 @@ button:disabled {
     flex-direction: column;
     border-bottom: 0;
   }
+  /* 音频/编辑栏按内容高度纵向排列：工具栏换行后不会被固定行高裁掉 */
   .right-workspace {
     flex: none;
-    grid-template-rows: 245px 220px;
+    display: flex;
+    flex-direction: column;
   }
   .preview-panel {
-    height: 340px;
-    flex: 0 0 340px;
+    height: var(--mobile-video-height);
+    flex: 0 0 var(--mobile-video-height);
     border-right: 0;
     border-bottom: 1px solid var(--border-dark);
     /* 移动端为固定高度块：恢复可压缩行，侧栏超高时内部滚动（原行为），
        不让 min-content 把底部滑条/工具行顶出面板 */
-    grid-template-rows: minmax(0, 1fr) 2px 25px 29px;
+    grid-template-rows: minmax(0, 1fr) 2px 25px auto;
     /* 移动端面板占满整行宽：底栏按可用宽度压缩，避免底栏自然宽（≈418px）撑出横向滚动 */
     min-width: 0;
   }
+  /* 竖屏/窄屏：视觉工具条从左侧竖排改为视频画面上方横排，把宽度让给画面 */
   .video-content {
-    grid-template-rows: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
   }
-  /* 移动端面板高度固定：侧栏不撑高（内部滚动），避免把滑条/底栏顶出面板 */
   .visual-toolbar-column {
+    grid-column: 1;
+    grid-row: 1;
+    flex-direction: row;
+    align-items: stretch;
+    min-width: 0;
     min-height: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .visual-toolbar {
+    /* 拉伸占满横排整行宽度，space-between 才能把图标铺开（子工具栏不伸展） */
+    flex: 1 1 auto;
+    flex-direction: row;
+    align-items: center;
+    /* 触控友好：视觉工具图标在整行宽度内均匀铺开 */
+    justify-content: space-between;
+    padding: 1px 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .visual-toolbar.visual-subtoolbar {
+    border-top: 0;
+    border-left: 1px solid var(--border-faint);
+  }
+  .visual-sep {
+    flex: none;
+    width: 1px;
+    height: 22px;
+    margin: 0 2px;
+  }
+  .video-content > .video-stage {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  /* 系统字体提示条下移：视觉工具横排后，避免盖住顶部工具条 */
+  .system-fonts-hint {
+    top: 44px;
   }
   /* 移动端面板高度固定：画布恢复铺满视频区，避免视口尺寸大于固定行高时溢出到滑条行 */
   .video-stage {
@@ -2892,70 +2978,101 @@ button:disabled {
   }
   .video-position,
   .video-subs-pos {
-    min-width: 0;
+    /* 时间框最小宽保住完整时间文本；窄到放不下一行时底栏换行（不再横向溢出面板） */
+    min-width: clamp(104px, 20vw, 110px);
   }
   .video-bottom {
     min-width: 0;
+    flex-wrap: wrap;
+    padding: 1px 2px;
+    gap: 2px;
+  }
+  .video-tool-btn {
+    width: 22px;
+    height: 20px;
+  }
+  /* 缩放框宽度随屏幕缩放（原 ≤560px 固定 49px） */
+  .video-zoom {
+    width: clamp(44px, 12vw, 60px);
   }
   .audio-panel {
-    height: 245px;
-    flex: 0 0 245px;
+    height: auto;
+    flex: 0 0 auto;
     border-bottom: 0;
   }
-  .edit-panel {
-    height: 220px;
-    flex: 0 0 220px;
-    grid-template-rows: 30px 36px 32px minmax(85px, 1fr);
+  /* 波形区固定高度（不能用 min-height：canvas 的 2:1 内在比会按宽度撑高音频栏） */
+  .audio-main {
+    height: var(--mobile-audio-height);
+    min-height: var(--mobile-audio-height);
   }
+  .audio-toolbar {
+    /* 窄屏完整显示全部音频按钮：分组换行，并按行宽均匀铺开 */
+    flex-wrap: wrap;
+    justify-content: space-between;
+    overflow: visible;
+    padding: 1px 2px;
+  }
+  .audio-toolbar-group {
+    /* 同主工具栏：按钮直接参与工具栏的 space-between 均分 */
+    display: contents;
+  }
+  .edit-panel {
+    height: auto;
+    flex: 0 0 auto;
+  }
+  /* 编辑框各行允许换行：窄屏下字符数、边距、显示原文字幕等控件不再被横向裁掉 */
+  .edit-row {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .edit-row-top {
+    flex: 0 0 auto;
+    min-height: 24px;
+    margin: 2px;
+  }
+  .edit-middle {
+    margin: 0 2px;
+  }
+  .edit-row-times,
+  .edit-row-format {
+    flex: 0 0 100%;
+    height: auto;
+    min-height: 24px;
+    margin-bottom: 2px;
+  }
+  .edit-row-format button {
+    /* 图标 16px + 2px/边：工具栏图标外留白比桌面（26px）更小 */
+    width: 22px;
+    height: 22px;
+  }
+  /* 文本编辑区脱离 flex 伸缩：面板高度=各行内容 + 相对高度的编辑区 */
+  .cue-editor-wrap {
+    flex: 0 0 var(--mobile-editor-height);
+    min-height: var(--mobile-editor-height);
+  }
+  /* 字幕栏横向滚动：避免窄屏时右侧文本列被裁切（滚动条在滚动容器外，见 grid-panel） */
   .grid-panel {
-    height: 430px;
-    flex: 0 0 430px;
+    height: var(--mobile-grid-height);
+    flex: 0 0 var(--mobile-grid-height);
+  }
+  .subtitle-grid-scroll {
+    overflow-x: auto;
   }
   .app-footer {
     height: 25px;
     flex: 0 0 25px;
     grid-template-columns: 13px max-content max-content minmax(80px, 1fr);
   }
-  .app-footer > *:nth-last-child(-n + 3) {
-    display: none;
-  }
 }
 
 @media (max-width: 560px) {
   .menu-trigger {
-    padding: 0 6px;
-    font-size: 11px;
+    /* 收紧两翼内边距与字号，让 320–430px 竖屏一行放下全部菜单项；
+       余量再交给 .menu-list 的 space-between 均匀铺开 */
+    padding: 0 clamp(1px, 0.5vw, 3px);
+    font-size: clamp(9.5px, 2.68vw, 11px);
   }
-  .toolbar-cluster:nth-child(3) {
-    display: none;
-  }
-  .preview-panel {
-    height: 300px;
-    flex-basis: 300px;
-  }
-  .video-zoom {
-    width: 49px;
-  }
-  .audio-panel {
-    height: 220px;
-    flex-basis: 220px;
-  }
-  .audio-options label:nth-child(2) {
-    display: none;
-  }
-  .edit-panel {
-    height: 235px;
-    flex-basis: 235px;
-  }
-  .edit-fields {
-    grid-template-columns: 44px 1fr 1fr;
-  }
-  .edit-fields label:nth-child(4) {
-    display: none;
-  }
-  .edit-toolbar label {
-    display: none;
-  }
+  /* 视频/音频/编辑区高度已由竖屏布局（宽高比 ≤9:10）的 dvh 相对值统一控制（小屏自动取下限） */
   .style-dialog {
     width: 100%;
   }
@@ -2970,7 +3087,9 @@ button:disabled {
 @media (pointer: coarse) {
   .visual-tool,
   .audio-tool {
-    min-height: 29px;
+    /* 触摸设备保留最低点按尺寸：图标 + 8px（比桌面 +11px 紧凑，仍留 4px/边） */
+    min-width: calc(var(--icon-size, 16px) + 8px);
+    min-height: calc(var(--icon-size, 16px) + 8px);
   }
   .subtitle-row {
     font-size: 12px;

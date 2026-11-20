@@ -694,13 +694,14 @@ export function App() {
     return value === 2 ? 'hide' : value === 0 ? 'show' : 'simplify'
   })
   const [displayMode, setDisplayMode] = useState<DisplayMode>('full')
-  // ≤900px 走移动端堆叠布局（styles.css @media），视频面板为固定高度预览，不应用挂靠锁定尺寸
-  const [isNarrowViewport, setIsNarrowViewport] = useState(
-    () => window.matchMedia('(max-width: 900px)').matches,
+  // 竖屏堆叠布局判定：视口宽:高 ≤ 9:10（宽高比 > 9:10 走普通桌面布局），
+  // 与 styles.css 的 @media (max-aspect-ratio: 9/10) 保持一致；视频面板为固定高度预览
+  const [isPortraitLayout, setIsPortraitLayout] = useState(
+    () => window.matchMedia('(max-aspect-ratio: 9/10)').matches,
   )
   useEffect(() => {
-    const query = window.matchMedia('(max-width: 900px)')
-    const onChange = (event: MediaQueryListEvent) => setIsNarrowViewport(event.matches)
+    const query = window.matchMedia('(max-aspect-ratio: 9/10)')
+    const onChange = (event: MediaQueryListEvent) => setIsPortraitLayout(event.matches)
     query.addEventListener('change', onChange)
     return () => query.removeEventListener('change', onChange)
   }, [])
@@ -3986,12 +3987,11 @@ export function App() {
   // 没有载入音频时 ToolsSizer->Show(audioBox, false, true)，AudioBox 连同底边 sash 一起隐藏，
   // 空间全给 EditBox
   const showAudioBox = !!audioMedia && (displayMode === 'full' || displayMode === 'audio_subs')
-  const rightWorkspaceRows = showAudioBox
-    ? isNarrowViewport
-      ? undefined // 移动端音频/编辑栏为固定高度块（styles.css @media），不设行高
-      : `${audioBoxHeight}px 4px minmax(0, 1fr)`
-    : isNarrowViewport
-      ? 'auto' // 只剩 EditPanel 一行：行高取其自身固定高度
+  // 竖屏布局（宽高比 ≤9:10）右栏是纵向 flex 栈、高度由内容决定（styles.css @media），不设网格行高
+  const rightWorkspaceRows = isPortraitLayout
+    ? undefined
+    : showAudioBox
+      ? `${audioBoxHeight}px 4px minmax(0, 1fr)`
       : 'minmax(0, 1fr)'
 
   if (!core)
@@ -4050,7 +4050,7 @@ export function App() {
                 // 多余空间全给 Grid（proportion 1）；窗口放不下时 wx 靠 frame 最小尺寸强制窗口变大
                 // （永不压缩视频栏），浏览器侧由 .workspace 的 overflow:auto 滚动到达（见 styles.css）。
                 // 未载入视频时占位面板已按 1080p 预留同一高度，故空/有视频共用同一行高
-                gridTemplateRows: isNarrowViewport
+                gridTemplateRows: isPortraitLayout
                   ? `min(${videoLayout.panelHeight}px, calc(100dvh - 194px)) minmax(120px, 1fr)`
                   : `minmax(${videoLayout.panelHeight}px, min-content) minmax(120px, 1fr)`,
               }
@@ -4143,7 +4143,7 @@ export function App() {
                   // 无视频的占位面板保持可收缩（basis 撑开、shrink 挤压）；移动端走 styles.css 的
                   // 固定高度预览布局（@media 覆盖），不传内联尺寸
                   style={
-                    videoDetached || isNarrowViewport
+                    videoDetached || isPortraitLayout
                       ? undefined
                       : videoMedia
                         ? { flexBasis: `${videoLayout.panelWidth}px`, flexShrink: 0 }
@@ -4190,7 +4190,7 @@ export function App() {
                 onPatchCue={(id, patch, label) => apply([{ type: 'updateCue', id, patch }], label)}
               />
             )}
-            {!isNarrowViewport && showAudioBox && (
+            {!isPortraitLayout && showAudioBox && (
               <div
                 className="audio-sash"
                 role="separator"
